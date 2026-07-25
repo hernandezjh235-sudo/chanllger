@@ -3253,16 +3253,26 @@ def _mlb_resolve_lineup_player_id(name, team_abbr=None):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def _mlb_batter_hand(player_id):
+    """Resolve official MLB L/R/S batting side.
+
+    MLB's /people/{id} payload already contains batSide for active players on most
+    responses. Some environments ignore/alter hydrate, so use the raw endpoint first,
+    then retry with hydrate. Never let a RotoWire/FantasyPros parser failure erase hand.
+    """
     if not player_id:
         return None
-    try:
-        data = safe_get_json(f"{MLB_BASE}/people/{player_id}", params={"hydrate": "batSide"}, timeout=10) or {}
-        people = data.get("people") or []
-        code = (((people[0] if people else {}).get("batSide") or {}).get("code"))
-        code = str(code or "").upper().strip()
-        return code if code in {"L", "R", "S"} else None
-    except Exception:
-        return None
+    for params in ({}, {"hydrate": "currentTeam,batSide"}):
+        try:
+            data = safe_get_json(f"{MLB_BASE}/people/{player_id}", params=params, timeout=10) or {}
+            people = data.get("people") or []
+            person = people[0] if people else {}
+            code = ((person.get("batSide") or {}).get("code"))
+            code = str(code or "").upper().strip()
+            if code in {"L", "R", "S"}:
+                return code
+        except Exception:
+            continue
+    return None
 
 
 def _enrich_lineup_row_identity(row, team_abbr=None):
@@ -11642,19 +11652,19 @@ def official_card_k_projection(p):
     try:
         row = official_card_k_row(p)
         # FINAL CARD LOCK: the player card must display the LAST/FULLY FINAL output.
-        # Do NOT let early/intermediate K PROJ or Official K PROJ override Line-Aware Smart.
-        for c in ["Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection"]:
+        # APP97 is the final current-data K source of truth. Legacy layers remain audit-only.
+        for c in ["APP97 True K Projection", "K PROJ", "Official K PROJ", "Final K Projection", "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection", "WRS Final K Projection", "TPS Final K Projection"]:
             if row and row.get(c) not in (None, "", "—"):
                 v = safe_float(row.get(c), None)
                 if v is not None:
-                    return round(float(v), 2), "Matchup Intel Final" if c == "Matchup Intelligence Final K Projection" else "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
+                    return round(float(v), 2), "APP97 Current K" if c == "APP97 True K Projection" else "Matchup Intel Final" if c == "Matchup Intelligence Final K Projection" else "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
 
         # Fallback if one-row table cannot be built.
         for c in ["Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection", "K PROJ", "WRS Final K Projection", "TPS Final K Projection", "projection"]:
             if isinstance(p, dict) and p.get(c) not in (None, "", "—"):
                 v = safe_float(p.get(c), None)
                 if v is not None:
-                    return round(float(v), 2), "Matchup Intel Final" if c == "Matchup Intelligence Final K Projection" else "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
+                    return round(float(v), 2), "APP97 Current K" if c == "APP97 True K Projection" else "Matchup Intel Final" if c == "Matchup Intelligence Final K Projection" else "Line-Aware Smart Final" if c == "Line-Aware Smart Final K Projection" else "Official K PROJ"
 
         return ("—", "Unavailable")
     except Exception:
@@ -14121,13 +14131,19 @@ def render_kproj_pitcher_card(p):
                 d["lean_side"] = card_row.get("Model Lean")
             if card_row.get("Confidence %") not in (None, "", "—"):
                 d["confidence"] = (safe_float(card_row.get("Confidence %"), 0) or 0) / 100.0
-            if card_row.get("Matchup Intelligence Final K Projection") not in (None, "", "—"):
+            if card_row.get("APP97 True K Projection") not in (None, "", "—"):
+                card_k_projection = round(float(safe_float(card_row.get("APP97 True K Projection"), card_k_projection)), 2)
+                card_k_projection_source = "APP97 Current K"
+            elif card_row.get("K PROJ") not in (None, "", "—"):
+                card_k_projection = round(float(safe_float(card_row.get("K PROJ"), card_k_projection)), 2)
+                card_k_projection_source = "APP97/K PROJ"
+            elif card_row.get("Matchup Intelligence Final K Projection") not in (None, "", "—"):
                 card_k_projection = round(float(safe_float(card_row.get("Matchup Intelligence Final K Projection"), card_k_projection)), 2)
-                card_k_projection_source = "Matchup Intel Final"
+                card_k_projection_source = "Legacy Matchup Intel"
             elif card_row.get("Line-Aware Smart Final K Projection") not in (None, "", "—"):
                 card_k_projection = round(float(safe_float(card_row.get("Line-Aware Smart Final K Projection"), card_k_projection)), 2)
-                card_k_projection_source = "Line-Aware Smart Final"
-            elif card_row.get("K PROJ") not in (None, "", "—"):
+                card_k_projection_source = "Legacy Line-Aware"
+            elif card_row.get("Official K PROJ") not in (None, "", "—"):
                 card_k_projection = round(float(safe_float(card_row.get("K PROJ"), card_k_projection)), 2)
             official_edge_value = None
             for ec in ["Line-Aware Smart Edge", "Edge Gap", "Official K Edge", "Final K Edge", "WRS Edge", "TPS Edge"]:
@@ -14263,6 +14279,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitcher K% Strength</div><div class="kpi-value" style="font-size:15px;">{pitcher_k_strength_display}</div><div class="kpi-sub">Pitcher K% {pk*100:.1f}% | Board Rank {pitcher_k_rank_display}<br>{pitcher_k_rank_source_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_overall_line}<br>{okr_overall_so_line}<br>{okr_l30_overall_line}<br>{okr_l30_so_line}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}<br>{team_k_read_display}<br>Source: {okr_official_source_line}<br>MI Nudge: {card_row.get("Matchup Intel K Nudge", "—") if isinstance(card_row, dict) else "—"} K | {card_row.get("Matchup Intel Label", "—") if isinstance(card_row, dict) else "—"}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">APP97 Current K Interaction</div><div class="kpi-value" style="font-size:15px;">{html.escape(str(card_row.get("APP97 K Interaction Label", "—") if isinstance(card_row, dict) else "—"))}</div><div class="kpi-sub">Live Pitcher K%: {_card_pct(card_row.get("APP97 Live Pitcher K%") if isinstance(card_row, dict) else None)}<br>Current Opp K Env: {_card_pct(card_row.get("APP97 Opponent K Environment") if isinstance(card_row, dict) else None)}<br>Lineup K%: {_card_pct(card_row.get("APP97 Lineup K%") if isinstance(card_row, dict) else None)} ({html.escape(str(card_row.get("APP97 Lineup Status","—") if isinstance(card_row, dict) else "—"))})<br>BF: {card_row.get("APP97 Model Expected BF","—") if isinstance(card_row, dict) else "—"} → {card_row.get("APP97 Reconciled Expected BF","—") if isinstance(card_row, dict) else "—"}<br>Implied K: {card_row.get("APP97 Matchup Implied K","—") if isinstance(card_row, dict) else "—"}<br>Final Shift: {card_row.get("APP97 Projection Shift","—") if isinstance(card_row, dict) else "—"} K<br>{html.escape(str(card_row.get("APP97 Data Freshness","—") if isinstance(card_row, dict) else "—"))}</div></div>
         <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Ace / Veteran / Rookie</div><div class="kpi-value" style="font-size:15px;">{html.escape(exp_label_display)}</div><div class="kpi-sub">Score {exp_score_display} | {exp_bf_factor_display}</div></div>
@@ -14313,7 +14330,18 @@ def render_kproj_pitcher_card(p):
     if lineup_rows:
         with st.expander(f"Batter-by-batter K matchup — {p.get('pitcher')}", expanded=False):
             rows = []
-            for i, r in enumerate(lineup_rows[:9], start=1):
+            enriched_lineup_rows = []
+            for _lr in lineup_rows[:9]:
+                try:
+                    _team_hint = (
+                        p.get("opponent_abbrev") or p.get("opp_abbrev") or
+                        p.get("Opponent") or p.get("opponent") or None
+                    )
+                    _er = _enrich_lineup_row_identity(_lr, _team_hint) if "_enrich_lineup_row_identity" in globals() else dict(_lr)
+                except Exception:
+                    _er = dict(_lr)
+                enriched_lineup_rows.append(_er)
+            for i, r in enumerate(enriched_lineup_rows, start=1):
                 k_val = r.get("Used K%")
                 if k_val is None:
                     k_val = r.get("K%") if r.get("K%") is not None else r.get("Raw_K_Rate")
@@ -14341,7 +14369,7 @@ def render_kproj_pitcher_card(p):
                 })
             src_counts = pd.Series([x.get("Lineup Source") for x in rows]).value_counts().to_dict() if rows else {}
             st.caption("Lineup source: " + (", ".join([f"{k} ({v})" for k, v in src_counts.items()]) or "—"))
-            st.info(_lineup_pressure_summary(lineup_rows))
+            st.info(_lineup_pressure_summary(enriched_lineup_rows))
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.caption("No batter-by-batter lineup available yet. The app uses MLB confirmed lineups when posted and MLB projected pre-lineups before lock.")
@@ -39289,6 +39317,11 @@ def _app97_apply(df, board=None):
         name = str(row.get("Pitcher") or "").strip()
         p = lookup.get(name.lower(), {})
         pid = _app97_pitcher_id(p)
+        if not pid and "_mlb_search_player_id_by_name" in globals():
+            try:
+                pid = _mlb_search_player_id_by_name(name)
+            except Exception:
+                pid = None
         live = _app97_live_pitcher_profile(pid, season) if pid else {"available":False}
 
         old_proj = _app97_num(row.get("APP88 Final K Projection"), None)
@@ -39384,6 +39417,17 @@ def _app97_apply(df, board=None):
             "APP97 Version": APP97_CURRENT_K_VERSION,
         })
 
+        # Synchronize the *display/audit* fields with the current APP97 source of truth.
+        # Keep historical baseline columns intact, but do not let the mobile card show
+        # a stale season/recent blend after APP97 successfully fetched current MLB data.
+        if live_pk is not None:
+            out.at[idx, "Pitcher K%"] = round(live_pk / 100.0, 4)
+            out.at[idx, "APP97 Pitcher K% Display Source"] = "CURRENT MLB SEASON"
+        else:
+            out.at[idx, "APP97 Pitcher K% Display Source"] = "MODEL FALLBACK"
+        out.at[idx, "Exp BF"] = round(bf, 2)
+        out.at[idx, "APP97 Current Matchup Read"] = interaction_label
+
     add = pd.DataFrame(records).set_index("_idx")
     for c in add.columns:
         out.loc[add.index, c] = add[c]
@@ -39394,6 +39438,15 @@ def _app97_apply(df, board=None):
         if c in out.columns:
             old = pd.to_numeric(out[c], errors="coerce")
             out[c] = final_series.where(final_series.notna(), old).round(2)
+
+    # Preserve old final-layer outputs for audit, then synchronize every public-facing
+    # final-projection alias to APP97. This prevents older UI code from surfacing stale numbers.
+    for _legacy_col in ["Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection"]:
+        if _legacy_col in out.columns:
+            _audit_col = "PRE_APP97 " + _legacy_col
+            if _audit_col not in out.columns:
+                out[_audit_col] = out[_legacy_col]
+            out[_legacy_col] = final_series.round(2)
 
     # Refresh edges/sides/decisions from the NEW final projection.
     line_col = next((c for c in ["UD/Line","Line","Underdog Line"] if c in out.columns), None)
@@ -39429,6 +39482,17 @@ def build_kproj_table(board):
         return pd.DataFrame()
     df = _pcx_add_single_pitcher_df(_PCX_PREV_BUILD_K(board))
     if isinstance(df,pd.DataFrame) and not df.empty:
+        if "APP97 True K Projection" in df.columns:
+            _app97_final = pd.to_numeric(df["APP97 True K Projection"], errors="coerce")
+            for _c in ["K PROJ","Official K PROJ","Final K Projection","Matchup Intelligence Final K Projection","Line-Aware Smart Final K Projection"]:
+                if _c in df.columns:
+                    _old = pd.to_numeric(df[_c], errors="coerce")
+                    df[_c] = _app97_final.where(_app97_final.notna(), _old).round(2)
+            df["APP97 Final Projection Guard"] = np.where(
+                _app97_final.notna(),
+                "LOCKED_APP97",
+                "APP97_MISSING_FALLBACK"
+            )
         conf_col = next((c for c in ["Confidence %","Win Probability %","K Sim Current Side Prob %","K Sim True Prob %"] if c in df.columns), None)
         if conf_col:
             base=pd.to_numeric(df[conf_col],errors="coerce")
