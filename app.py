@@ -2572,6 +2572,7 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 # =========================
 ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True  # expected-lineup consensus; MLB confirmed always overrides
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
+ROTOWIRE_WIDGETS_LINEUPS_URL = "https://www.widgets.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
 # Railway/cloud IPs can occasionally receive a thin/blocked page from RotoWire.
 # Direct RotoWire is ALWAYS attempted first. Jina Reader is only a transport fallback
@@ -2608,13 +2609,17 @@ def _rw_clean_name(name):
             name = name[: -len(token)].strip()
     return name
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def _rotowire_fetch_daily_lineups_payload():
-    """Fetch RotoWire expected lineups with explicit transport diagnostics.
+    """Fetch RotoWire lineups with redundant same-source transports.
 
-    Returns a dict so the board can prove whether RotoWire actually succeeded.
-    Direct RotoWire is attempted first. A Reader fallback is allowed only when the
-    direct response is blocked/thin; both represent the SAME RotoWire page/source.
+    Reliability order:
+      1) widgets.rotowire.com (server-rendered and usually easiest to parse)
+      2) canonical www.rotowire.com page
+      3) Reader mirror of canonical RotoWire page
+
+    All three are the same RotoWire daily-lineups product. Diagnostics preserve
+    which transport actually succeeded so Railway failures are visible.
     """
     payload = {
         "text": "", "transport": "NONE", "status": "DISABLED", "http_status": None,
@@ -2627,8 +2632,7 @@ def _rotowire_fetch_daily_lineups_payload():
         {
             "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
+            "Accept-Language": "en-US,en;q=0.9", "Cache-Control": "no-cache",
         },
         {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -2637,45 +2641,45 @@ def _rotowire_fetch_daily_lineups_payload():
         },
     ]
     errors = []
-    for headers in headers_pool:
-        try:
-            r = requests.get(ROTOWIRE_DAILY_LINEUPS_URL, timeout=18, headers=headers, allow_redirects=True)
-            txt = r.text or ""
-            payload["http_status"] = r.status_code
-            # A valid page should contain multiple Expected/Confirmed Lineup markers.
-            marker_count = txt.lower().count("expected lineup") + txt.lower().count("confirmed lineup")
-            if r.status_code < 400 and len(txt) >= 12000 and marker_count >= 2:
-                payload.update({
-                    "text": txt, "transport": "DIRECT_ROTOWIRE", "status": "SUCCESS",
-                    "bytes": len(txt), "error": "", "url": str(r.url),
-                })
-                return payload
-            errors.append(f"direct HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}")
-        except Exception as exc:
-            errors.append(f"direct error: {type(exc).__name__}: {exc}")
+    targets = [
+        (ROTOWIRE_WIDGETS_LINEUPS_URL, "ROTOWIRE_WIDGETS"),
+        (ROTOWIRE_DAILY_LINEUPS_URL, "DIRECT_ROTOWIRE"),
+    ]
+    for url, transport in targets:
+        for headers in headers_pool:
+            try:
+                r = requests.get(url, timeout=18, headers=headers, allow_redirects=True)
+                txt = r.text or ""
+                marker_count = txt.lower().count("expected lineup") + txt.lower().count("confirmed lineup")
+                if r.status_code < 400 and len(txt) >= 7000 and marker_count >= 2:
+                    payload.update({
+                        "text": txt, "transport": transport, "status": "SUCCESS",
+                        "http_status": r.status_code, "bytes": len(txt), "error": "; ".join(errors)[:700],
+                        "url": str(r.url),
+                    })
+                    return payload
+                errors.append(f"{transport} HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}")
+            except Exception as exc:
+                errors.append(f"{transport} error: {type(exc).__name__}: {exc}")
 
     if ROTOWIRE_READER_FALLBACK_ENABLED:
         try:
-            r = requests.get(
-                ROTOWIRE_READER_URL, timeout=22,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain,text/markdown,*/*"},
-            )
+            r = requests.get(ROTOWIRE_READER_URL, timeout=22, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain,text/markdown,*/*"})
             txt = r.text or ""
             marker_count = txt.lower().count("expected lineup") + txt.lower().count("confirmed lineup")
             if r.status_code < 400 and len(txt) >= 5000 and marker_count >= 2:
                 payload.update({
                     "text": txt, "transport": "ROTOWIRE_VIA_READER", "status": "SUCCESS",
-                    "http_status": r.status_code, "bytes": len(txt),
-                    "error": "; ".join(errors), "url": ROTOWIRE_READER_URL,
+                    "http_status": r.status_code, "bytes": len(txt), "error": "; ".join(errors)[:700],
+                    "url": ROTOWIRE_READER_URL,
                 })
                 return payload
             errors.append(f"reader HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}")
         except Exception as exc:
             errors.append(f"reader error: {type(exc).__name__}: {exc}")
 
-    payload.update({"status": "FAILED", "error": "; ".join(errors)[:700]})
+    payload.update({"status": "FAILED", "error": "; ".join(errors)[:900]})
     return payload
-
 
 def _rotowire_fetch_daily_lineups_html():
     # Backward-compatible helper used by older code paths.
@@ -3261,6 +3265,18 @@ def _mlb_batter_hand(player_id):
         return None
 
 
+def _enrich_lineup_row_identity(row, team_abbr=None):
+    """Guarantee a lineup row has MLB player id + L/R/S hand whenever MLB can resolve it."""
+    rr = dict(row or {})
+    name = _rw_clean_name(rr.get("Batter"))
+    pid = rr.get("Player ID") or _mlb_resolve_lineup_player_id(name, team_abbr)
+    hand = str(rr.get("Hand") or "").upper().strip()
+    if hand not in {"L", "R", "S"}:
+        hand = _mlb_batter_hand(pid)
+    rr["Player ID"] = pid
+    rr["Hand"] = hand if hand in {"L", "R", "S"} else None
+    return rr
+
 def build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand=None):
     """Convert Rotowire expected lineup names into the same row schema the K engine already uses."""
     team_abbr = _rw_norm_team_abbr(team_abbr)
@@ -3326,6 +3342,151 @@ def _try_rotowire_expected_lineup(game_pk, opp_side, pitcher_hand=None):
     return None, [], "Rotowire expected lineup unavailable", False
 
 
+
+# =========================
+# FANTASYPROS DAILY PROJECTED LINEUP LAYER (LINEUP ONLY)
+# =========================
+# Independent pre-lineup backup. FantasyPros publishes Projected/Confirmed MLB
+# lineups with batting order and Bats. MLB official lineups still override it.
+FANTASYPROS_LINEUPS_ENABLED = True
+FANTASYPROS_LINEUPS_URL = "https://www.fantasypros.com/mlb/lineups/"
+FANTASYPROS_LINEUP_MIN_VALID_HITTERS = 5
+
+FANTASYPROS_TEAM_NAMES = {
+    "Arizona Diamondbacks":"ARI", "Atlanta Braves":"ATL", "Baltimore Orioles":"BAL", "Boston Red Sox":"BOS",
+    "Chicago Cubs":"CHC", "Chicago White Sox":"CHW", "Cincinnati Reds":"CIN", "Cleveland Guardians":"CLE",
+    "Colorado Rockies":"COL", "Detroit Tigers":"DET", "Houston Astros":"HOU", "Kansas City Royals":"KC",
+    "Los Angeles Angels":"LAA", "Los Angeles Dodgers":"LAD", "Miami Marlins":"MIA", "Milwaukee Brewers":"MIL",
+    "Minnesota Twins":"MIN", "New York Mets":"NYM", "New York Yankees":"NYY", "Athletics":"ATH",
+    "Philadelphia Phillies":"PHI", "Pittsburgh Pirates":"PIT", "San Diego Padres":"SD", "San Francisco Giants":"SF",
+    "Seattle Mariners":"SEA", "St. Louis Cardinals":"STL", "Tampa Bay Rays":"TB", "Texas Rangers":"TEX",
+    "Toronto Blue Jays":"TOR", "Washington Nationals":"WSH",
+}
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_fantasypros_projected_lineups_bundle():
+    diag = {"status":"DISABLED", "http_status":None, "bytes":0, "error":"", "parsed_teams":0, "team_counts":{}}
+    if not FANTASYPROS_LINEUPS_ENABLED:
+        return {"lineups":{}, "diagnostics":diag}
+    try:
+        r = requests.get(FANTASYPROS_LINEUPS_URL, timeout=18, headers={
+            "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+            "Accept":"text/html,application/xhtml+xml,*/*", "Accept-Language":"en-US,en;q=0.9",
+        })
+        raw = r.text or ""
+        diag.update({"http_status":r.status_code, "bytes":len(raw)})
+        if r.status_code >= 400 or len(raw) < 5000:
+            diag.update({"status":"FAILED", "error":f"HTTP {r.status_code}; bytes={len(raw)}"})
+            return {"lineups":{}, "diagnostics":diag}
+        out = _fantasypros_parse_lineups(raw)
+        counts = {k:len(v or []) for k,v in out.items()}
+        diag.update({"status":"SUCCESS" if sum(v>=5 for v in counts.values())>=2 else "PARSE_FAILED",
+                     "parsed_teams":sum(v>=5 for v in counts.values()), "team_counts":counts})
+        if diag["status"] != "SUCCESS":
+            diag["error"] = "FantasyPros page fetched but parser found too few teams"
+        return {"lineups":out, "diagnostics":diag}
+    except Exception as exc:
+        diag.update({"status":"FAILED", "error":f"{type(exc).__name__}: {exc}"[:700]})
+        return {"lineups":{}, "diagnostics":diag}
+
+
+def _fantasypros_parse_lineups(raw_html):
+    """Defensive parser for FantasyPros MLB lineups page.
+
+    Uses tables first, then visible text. The page labels each team block as
+    'Team Name Lineup' followed by 'Team Name Projected/Confirmed Lineup'.
+    """
+    if not raw_html:
+        return {}
+    import re
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw_html, "html.parser")
+    except Exception:
+        return {}
+    out = {}
+    # Table-first: find any table with Player/Bats columns and infer team from nearby heading text.
+    for table in soup.find_all("table"):
+        headers = [h.get_text(" ", strip=True).lower() for h in table.find_all(["th"])]
+        if not any("player" in h for h in headers):
+            continue
+        prev_text = ""
+        node = table
+        for _ in range(10):
+            node = node.find_previous()
+            if not node: break
+            t = node.get_text(" ", strip=True)
+            if t:
+                prev_text = t + " " + prev_text
+            if "Lineup" in prev_text and len(prev_text) > 30:
+                break
+        team = None
+        for full, abbr in FANTASYPROS_TEAM_NAMES.items():
+            if full.lower() in prev_text.lower():
+                team = abbr; break
+        if not team:
+            continue
+        rows=[]
+        for tr in table.find_all("tr"):
+            cells=[c.get_text(" ", strip=True) for c in tr.find_all(["td","th"])]
+            if len(cells)<2 or not str(cells[0]).strip().isdigit():
+                continue
+            order=int(cells[0]); player_txt=cells[1]
+            name=re.sub(r"\s*\([^)]*\)\s*$", "", player_txt).strip()
+            hand=None
+            for c in cells[2:]:
+                cc=str(c).strip().upper()
+                if cc in {"L","R","B","S"}:
+                    hand="S" if cc=="B" else cc; break
+            if name and 1<=order<=9:
+                rows.append({"Order":order,"Batter":name,"Hand":hand,"Lineup Source":"FANTASYPROS_PROJECTED_LINEUP"})
+        if len(rows)>=5:
+            out[_rw_norm_team_abbr(team)] = sorted(rows,key=lambda x:x["Order"])[:9]
+
+    # Text fallback for responsive/mobile markup.
+    if len(out) < 2:
+        for bad in soup(["script","style","noscript"]):
+            bad.decompose()
+        text=soup.get_text("\n", strip=True)
+        for full, abbr in FANTASYPROS_TEAM_NAMES.items():
+            # capture from 'Team Lineup' through next Weather/team heading; numbered rows are stable in visible text.
+            pat=re.compile(re.escape(full)+r"\s+Lineup\s+"+re.escape(full)+r"\s+(?:Projected|Confirmed)\s+Lineup(?P<body>.*?)(?=Weather|####|$)", re.I|re.S)
+            m=pat.search(text)
+            if not m: continue
+            body=m.group("body")
+            rows=[]
+            row_pat=re.compile(r"(?:^|\n)\s*(\d)\s*\|?\s*([^\n|]+?)(?:\([^\n)]*\))?\s*\|?\s*([LRBS])(?:\s|\||$)", re.M)
+            for mm in row_pat.finditer(body):
+                order=int(mm.group(1)); name=_rw_clean_name(mm.group(2)); hand=mm.group(3).upper(); hand="S" if hand=="B" else hand
+                if name and 1<=order<=9:
+                    rows.append({"Order":order,"Batter":name,"Hand":hand,"Lineup Source":"FANTASYPROS_PROJECTED_LINEUP"})
+            if len(rows)>=5:
+                out[_rw_norm_team_abbr(abbr)] = sorted(rows,key=lambda x:x["Order"])[:9]
+    return out
+
+
+def build_fantasypros_lineup_rows(team_abbr, pitcher_hand=None):
+    ta=_rw_norm_team_abbr(team_abbr)
+    bundle=get_fantasypros_projected_lineups_bundle() or {}
+    base=((bundle.get("lineups") or {}).get(ta) or [])
+    if len(base)<FANTASYPROS_LINEUP_MIN_VALID_HITTERS:
+        return []
+    rows=[]
+    for idx, b0 in enumerate(base[:9], start=1):
+        b=_enrich_lineup_row_identity(b0, ta)
+        name=_rw_clean_name(b.get("Batter")); pid=b.get("Player ID")
+        season_k, season_so, season_pa = get_batter_season_k_rate(pid) if pid else (None,None,None)
+        split_k, split_so, split_pa, split_source = get_batter_k_rate_vs_pitcher_hand(pid,pitcher_hand) if (pid and pitcher_hand) else (None,None,None,"No split")
+        rolling=get_batter_rolling_k_rates(pid, days_list=(14,30)) if pid else {}; r14=rolling.get(14); r30=rolling.get(30)
+        used_k, used_source=blend_batter_k_inputs(season_k, split_k=split_k, season_pa=season_pa, split_pa=split_pa, rolling14=r14, rolling30=r30)
+        if used_k is None:
+            used_k=split_k if split_k is not None else season_k; used_source=split_source if split_k is not None else "Season batter K%"
+        rows.append({"Order":safe_int(b.get("Order"),idx),"Batter":name,"Player ID":pid,"Hand":b.get("Hand"),"Position":b.get("Position"),
+                     "Season K%":None if season_k is None else round(season_k*100,1),"Split K%":None if split_k is None else round(split_k*100,1),
+                     "Rolling 14d K%":None if r14 is None else round(r14*100,1),"Rolling 30d K%":None if r30 is None else round(r30*100,1),
+                     "Split PA/AB":split_pa,"Used K%":None if used_k is None else round(used_k*100,1),"K Source":f"FantasyPros projected + {used_source}",
+                     "SO":season_so,"PA/AB":season_pa,"Raw_K_Rate":used_k,"Lineup Source":"FANTASYPROS_PROJECTED_LINEUP"})
+    return rows[:9] if len([r for r in rows if r.get("Raw_K_Rate") is not None])>=5 else []
 
 # =========================
 # FANGRAPHS ROSTERRESOURCE PROJECTED LINEUP LAYER (LINEUP ONLY)
@@ -3629,6 +3790,12 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     except Exception:
         pass
     try:
+        fp = build_fantasypros_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
+        if fp:
+            source_rows.append(("FANTASYPROS", fp, 1.45))
+    except Exception:
+        pass
+    try:
         fg = build_fangraphs_roster_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
         if fg:
             source_rows.append(("FANGRAPHS", fg, 1.15))
@@ -3689,12 +3856,18 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     for batting_order, (_, avg_order, _, rec) in enumerate(selected, start=1):
         votes = len(rec["sources"])
         srcs = set(rec["sources"])
-        if "ROTOWIRE" in srcs and "FANGRAPHS" in srcs:
+        if "ROTOWIRE" in srcs and ("FANTASYPROS" in srcs or "FANGRAPHS" in srcs):
             starter_conf = 0.98
         elif "ROTOWIRE" in srcs and len(srcs) >= 2:
             starter_conf = 0.95
         elif "ROTOWIRE" in srcs:
-            starter_conf = 0.88
+            starter_conf = 0.89
+        elif "FANTASYPROS" in srcs and "FANGRAPHS" in srcs:
+            starter_conf = 0.95
+        elif "FANTASYPROS" in srcs and "MLB_RECENT" in srcs:
+            starter_conf = 0.92
+        elif "FANTASYPROS" in srcs:
+            starter_conf = 0.84
         elif "FANGRAPHS" in srcs and "MLB_RECENT" in srcs:
             starter_conf = 0.90
         elif "FANGRAPHS" in srcs:
@@ -3719,6 +3892,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
         rich["Expected Lineup Sources"] = "+".join(sorted(rec["sources"]))
         rich["Expected Lineup Source Count"] = votes
         rich["Lineup Source"] = "EXPECTED_LINEUP_CONSENSUS"
+        rich = _enrich_lineup_row_identity(rich, team_abbr)
         output.append(rich)
         if k_rate is not None:
             w = exposure[min(batting_order - 1, len(exposure) - 1)] * starter_conf
@@ -3733,7 +3907,11 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     multi = sum(1 for r in output if safe_int(r.get("Expected Lineup Source Count"), 0) >= 2)
     rw_diag = get_rotowire_lineup_diagnostics(team_abbr) if team_abbr else {}
     rw_txt = f"RW={rw_diag.get('team_status','UNKNOWN')}:{rw_diag.get('team_batter_count',0)} ({rw_diag.get('transport','NONE')})"
-    msg = f"Expected lineup consensus {len(output)}/9; {multi} hitters supported by 2+ sources; sources={'+'.join(source_set)}; {rw_txt}"
+    fp_bundle = get_fantasypros_projected_lineups_bundle() if team_abbr else {}
+    fp_diag = (fp_bundle or {}).get("diagnostics") or {}
+    fp_count = len((((fp_bundle or {}).get("lineups") or {}).get(_rw_norm_team_abbr(team_abbr)) or [])) if team_abbr else 0
+    fp_txt = f"FP={fp_diag.get('status','UNKNOWN')}:{fp_count}"
+    msg = f"Expected lineup consensus {len(output)}/9; {multi} hitters supported by 2+ sources; sources={'+'.join(source_set)}; {rw_txt}; {fp_txt}"
     return float(lineup_k), output[:9], msg, False
 
 
@@ -3771,6 +3949,7 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
             used_source = split_source if split_k is not None else "Season batter K%"
         rows.append({
             "Order": int(str(order)[:3]), "Batter": name, "Player ID": player_id,
+            "Hand": _mlb_batter_hand(player_id),
             "Season K%": None if season_k is None else round(season_k * 100, 1),
             "Split K%": None if split_k is None else round(split_k * 100, 1),
             "Rolling 14d K%": None if rolling14 is None else round(rolling14 * 100, 1),
@@ -3844,6 +4023,8 @@ def projection_source_label(lineup_msg, lineup_locked, lineup_rows):
         return "CACHED LINEUP"
     if "expected lineup consensus" in msg or any((r.get("Lineup Source") == "EXPECTED_LINEUP_CONSENSUS") for r in (lineup_rows or []) if isinstance(r, dict)):
         return "EXPECTED CONSENSUS"
+    if "fantasypros" in msg or any("FANTASYPROS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "FANTASYPROS PROJECTED"
     if "fangraphs" in msg or any("FANGRAPHS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
         return "FANGRAPHS ROSTER"
     if "rotowire" in msg or any((r.get("Lineup Source") == "ROTOWIRE_EXPECTED_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
@@ -3861,6 +4042,8 @@ def confirmed_lineup_status(source_label, lineup_rows):
         return "CACHED"
     if source_label == "EXPECTED CONSENSUS" or any((r.get("Lineup Source") == "EXPECTED_LINEUP_CONSENSUS") for r in (lineup_rows or []) if isinstance(r, dict)):
         return "EXPECTED CONSENSUS"
+    if source_label == "FANTASYPROS PROJECTED" or any("FANTASYPROS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "FANTASYPROS PROJECTED"
     if source_label == "FANGRAPHS ROSTER" or any("FANGRAPHS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
         return "FANGRAPHS ROSTER"
     if source_label == "ROTOWIRE EXPECTED" or any((r.get("Lineup Source") == "ROTOWIRE_EXPECTED_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
@@ -33351,7 +33534,7 @@ import time as _a86_time
 import numpy as _a86_np
 import pandas as _a86_pd
 
-APP86_VERSION = "APP86_ROTOWIRE_CURRENT_DOM_PARSER_v3"
+APP86_VERSION = "APP86_PRELINEUP_RELIABILITY_v4_ROTOWIRE_WIDGETS_FANTASYPROS_HAND"
 
 def _a86_num(v):
     try:
@@ -38797,6 +38980,445 @@ def _pcx_add_single_pitcher_df(df, name_col="Pitcher"):
             row["Pitcher Context Error"]=str(e)[:100]
         out.append(row)
     return pd.DataFrame(out)
+
+
+
+# =============================================================================
+# APP97 — CURRENT PITCHER × OPPONENT K INTERACTION + WORKLOAD RECONCILIATION
+# Version: APP97_CURRENT_K_INTERACTION_2026_07_25
+#
+# PURPOSE
+#   * Global K-projection correction for EVERY pitcher.
+#   * Uses current MLB season pitcher K%, K/9, recent game logs/BF/IP/pitches.
+#   * Uses opponent K% versus the pitcher's ACTUAL hand.
+#   * Uses L3/L5/L10/L15/L30 only when those split windows pass sanity checks.
+#   * Blends expected/confirmed batter-lineup K% separately.
+#   * Reconciles clearly-too-low BF projections against actual recent starter workload.
+#
+# SAFETY
+#   * Pitching Outs Beta is NOT touched.
+#   * APP88 remains preserved as an audit baseline.
+#   * One recent hot/cold window cannot dominate.
+#   * Suspect recent handedness splits are detected and downweighted.
+#   * Opener/bulk/pitch-limit/short-leash roles do not get automatic BF inflation.
+# =============================================================================
+APP97_CURRENT_K_VERSION = "APP97_CURRENT_K_INTERACTION_2026_07_25"
+APP97_LEAGUE_K_PCT = 22.5
+
+def _app97_num(v, default=None):
+    try:
+        if v in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        x = float(v)
+        if np.isfinite(x):
+            return x
+    except Exception:
+        pass
+    return default
+
+def _app97_pct(v, default=None):
+    x = _app97_num(v, default)
+    if x is None:
+        return default
+    return x * 100.0 if abs(x) <= 1.0 else x
+
+def _app97_pitcher_id(p):
+    if not isinstance(p, dict):
+        return None
+    for k in ("pitcher_id","Pitcher ID","player_id","playerId","mlb_id","MLB ID","id"):
+        v = p.get(k)
+        try:
+            if v not in (None, "", "—"):
+                return int(float(v))
+        except Exception:
+            continue
+    return None
+
+def _app97_parse_ip(v):
+    """MLB innings strings use .1/.2 as outs, not decimal tenths."""
+    if v in (None, "", "—"):
+        return None
+    try:
+        s = str(v).strip()
+        if "." not in s:
+            return float(s)
+        whole, frac = s.split(".", 1)
+        w = int(whole or 0)
+        f = frac[:1]
+        if f == "1":
+            return w + 1.0/3.0
+        if f == "2":
+            return w + 2.0/3.0
+        return float(s)
+    except Exception:
+        return _app97_num(v, None)
+
+try:
+    @st.cache_data(ttl=60*60, show_spinner=False)
+    def _app97_live_pitcher_profile(player_id, season):
+        """Current MLB StatsAPI season + game-log pitcher profile."""
+        profile = {
+            "available": False, "season_k_pct": None, "season_k9": None,
+            "season_bf": None, "season_ip": None, "season_so": None,
+            "l3_k_avg": None, "l5_k_avg": None, "l10_k_avg": None,
+            "l3_bf_avg": None, "l5_bf_median": None, "l10_bf_median": None,
+            "l5_ip_avg": None, "l10_ip_avg": None,
+            "l5_pitch_median": None, "l10_pitch_median": None,
+            "recent_games": 0, "source": "MLB StatsAPI"
+        }
+        if not player_id:
+            return profile
+        try:
+            u = f"{MLB_BASE}/people/{int(player_id)}/stats"
+            payload = safe_get_json(
+                u,
+                params={"stats":"season,gameLog","group":"pitching","season":int(season)}
+            ) or {}
+            splits_by_type = {}
+            for block in payload.get("stats", []) or []:
+                typ = str(((block.get("type") or {}).get("displayName") or "")).lower()
+                splits_by_type[typ] = block.get("splits") or []
+
+            # Season block
+            season_splits = []
+            for k, vals in splits_by_type.items():
+                if "season" in k and "game" not in k:
+                    season_splits.extend(vals)
+            if season_splits:
+                stt = (season_splits[-1].get("stat") or {})
+                so = _app97_num(stt.get("strikeOuts"), None)
+                bf = _app97_num(stt.get("battersFaced"), None)
+                ip = _app97_parse_ip(stt.get("inningsPitched"))
+                profile["season_so"] = so
+                profile["season_bf"] = bf
+                profile["season_ip"] = ip
+                if so is not None and bf and bf > 0:
+                    profile["season_k_pct"] = 100.0 * so / bf
+                if so is not None and ip and ip > 0:
+                    profile["season_k9"] = 9.0 * so / ip
+
+            # Game logs, newest first after sorting by date.
+            game_splits = []
+            for k, vals in splits_by_type.items():
+                if "game" in k:
+                    game_splits.extend(vals)
+            games = []
+            for sp in game_splits:
+                stat = sp.get("stat") or {}
+                date = str(sp.get("date") or "")
+                # Use actual starts when gameStarted is supplied; otherwise accept meaningful BF.
+                gs = _app97_num(stat.get("gamesStarted"), None)
+                bf = _app97_num(stat.get("battersFaced"), None)
+                if gs is not None and gs < 1 and (bf is None or bf < 9):
+                    continue
+                games.append({
+                    "date": date,
+                    "k": _app97_num(stat.get("strikeOuts"), None),
+                    "bf": bf,
+                    "ip": _app97_parse_ip(stat.get("inningsPitched")),
+                    "pitches": _app97_num(stat.get("numberOfPitches"), None),
+                })
+            games = sorted(games, key=lambda x: x.get("date",""), reverse=True)
+            profile["recent_games"] = len(games)
+
+            def vals(key, n):
+                return [float(g[key]) for g in games[:n] if g.get(key) is not None]
+            def avg(a):
+                return (sum(a)/len(a)) if a else None
+            def med(a):
+                if not a: return None
+                aa = sorted(a)
+                m = len(aa)//2
+                return aa[m] if len(aa)%2 else (aa[m-1]+aa[m])/2.0
+
+            profile["l3_k_avg"] = avg(vals("k",3))
+            profile["l5_k_avg"] = avg(vals("k",5))
+            profile["l10_k_avg"] = avg(vals("k",10))
+            profile["l3_bf_avg"] = avg(vals("bf",3))
+            profile["l5_bf_median"] = med(vals("bf",5))
+            profile["l10_bf_median"] = med(vals("bf",10))
+            profile["l5_ip_avg"] = avg(vals("ip",5))
+            profile["l10_ip_avg"] = avg(vals("ip",10))
+            profile["l5_pitch_median"] = med(vals("pitches",5))
+            profile["l10_pitch_median"] = med(vals("pitches",10))
+            profile["available"] = bool(profile["season_k_pct"] or games)
+        except Exception as e:
+            profile["error"] = str(e)[:160]
+        return profile
+except Exception:
+    def _app97_live_pitcher_profile(player_id, season):
+        return {"available": False, "source": "MLB StatsAPI unavailable"}
+
+def _app97_recent_split_columns(hand):
+    h = "RHP" if str(hand).upper().startswith("R") else "LHP"
+    return {
+        "L3": f"Opp L3 K% vs {h} Official",
+        "L5": f"Opp L5 K% vs {h} Official",
+        "L10": f"Opp L10 K% vs {h} Official",
+        "L15": f"Opp L15 K% vs {h} Official",
+        "L30": f"Opp L30 K% vs {h} Official",
+    }
+
+def _app97_recent_hand_profile(row):
+    """Return a stable current opponent K environment in percent units.
+
+    Some MLB backend responses ignore the handedness filter on date-range requests.
+    If RHP and LHP values are suspiciously identical across recent windows, recent
+    values are treated as overall-team form, while SEASON vs-hand remains the anchor.
+    """
+    hand = str(row.get("Pitcher Hand") or "").upper()
+    season_hand = _app97_pct(row.get("Opponent K% vs Pitcher Hand"), None)
+    if season_hand is None:
+        season_hand = _app97_pct(row.get("Opp K%"), APP97_LEAGUE_K_PCT)
+
+    cols = _app97_recent_split_columns(hand)
+    recent = {w: _app97_pct(row.get(c), None) for w,c in cols.items()}
+
+    # Detect "fake split" symptom: RHP/LHP recent values identical in >=3 windows.
+    identical = 0
+    for w in ("L3","L5","L10","L15","L30"):
+        r = _app97_pct(row.get(f"Opp {w} K% vs RHP Official"), None)
+        l = _app97_pct(row.get(f"Opp {w} K% vs LHP Official"), None)
+        if r is not None and l is not None and abs(r-l) < 0.05:
+            identical += 1
+    split_suspect = identical >= 3
+
+    if split_suspect:
+        # Do NOT pretend the recent values are true handedness splits.
+        recent30_overall = _app97_pct(row.get("Team Batter K% L30 Overall Official"), None)
+        if recent30_overall is None:
+            recent30_overall = recent.get("L30")
+        if recent30_overall is None:
+            env = season_hand
+            detail = "season_vs_hand_only; recent handedness split failed sanity check"
+        else:
+            env = 0.65*season_hand + 0.35*recent30_overall
+            detail = f"65% season_vs_hand {season_hand:.1f} + 35% recent_overall {recent30_overall:.1f}; recent hand split SUSPECT"
+        return env, True, detail
+
+    # Stable recency mix. L3 is intentionally tiny.
+    weights = {"L3":0.05,"L5":0.10,"L10":0.17,"L15":0.18,"L30":0.20}
+    used = [(season_hand,0.30,"SEASON")]
+    for w,wt in weights.items():
+        if recent.get(w) is not None:
+            used.append((recent[w],wt,w))
+        else:
+            used[0] = (used[0][0], used[0][1]+wt, "SEASON")
+    total = sum(w for _,w,_ in used)
+    env = sum(v*w for v,w,_ in used)/max(total,1e-9)
+    detail = " + ".join(f"{w*100:.0f}% {name} {v:.1f}" for v,w,name in used)
+    return env, False, detail
+
+def _app97_role_limited(row):
+    txt = " | ".join(str(row.get(c) or "") for c in [
+        "Open/Bulk Role Signal 2.1","Hook/Role Signal","Experience Gate",
+        "Experience Risk Flags","Leash Label","Deep Leash Risk",
+        "APP82 Role Validation","Pitch Count Label","Pull Label"
+    ]).upper()
+    hard = any(x in txt for x in [
+        "OPENER","BULK","TANDEM","PITCH_LIMIT","STRICT_HOOK",
+        "RETURN_FROM_IL_LIMIT","SHORT_SAMPLE_RISK"
+    ])
+    # EARLY_PULL_HIGH by itself is not a hard role limit; live workload must confirm it.
+    return hard, txt
+
+def _app97_reconcile_bf(row, live, pitcher_k_pct):
+    base = _app97_num(row.get("Exp BF"), None)
+    if base is None:
+        base = _app97_num(row.get("APP85 Expected BF"), 22.0)
+    hard_limited, role_txt = _app97_role_limited(row)
+    l5 = _app97_num(live.get("l5_bf_median"), None) if isinstance(live,dict) else None
+    l10 = _app97_num(live.get("l10_bf_median"), None) if isinstance(live,dict) else None
+    p5 = _app97_num(live.get("l5_pitch_median"), None) if isinstance(live,dict) else None
+
+    if l5 is None and l10 is None:
+        return base, "NO_LIVE_BF_LOG; keep model BF"
+
+    target = l5 if l5 is not None else l10
+    if l5 is not None and l10 is not None:
+        target = 0.65*l5 + 0.35*l10
+
+    if hard_limited:
+        return base, f"HARD_ROLE_LIMIT; model BF {base:.1f}; recent target {target:.1f}"
+
+    # If recent pitches truly support a short leash, recovery is intentionally small.
+    max_recovery = 1.25 if (p5 is not None and p5 < 76) else 3.25
+    if pitcher_k_pct is not None and pitcher_k_pct >= 27.0 and not (p5 is not None and p5 < 76):
+        max_recovery = 3.75
+
+    desired_floor = max(16.0, target - 1.0)
+    reconciled = base
+    if base < desired_floor:
+        reconciled = min(desired_floor, base + max_recovery)
+
+    # Never inflate beyond actual recent central workload.
+    reconciled = min(reconciled, target + 0.25)
+    return max(12.0, reconciled), (
+        f"model {base:.1f} | recent BF target {target:.1f} | "
+        f"L5 med {l5 if l5 is not None else '—'} | L10 med {l10 if l10 is not None else '—'} | "
+        f"L5 pitch med {p5 if p5 is not None else '—'}"
+    )
+
+def _app97_lineup_status(row):
+    s = " ".join(str(row.get(c) or "") for c in ["Lineup","Projection Source","Lineup Note"]).upper()
+    if "CONFIRMED" in s:
+        return "CONFIRMED"
+    if "EXPECTED" in s or "PROJECTED" in s:
+        return "EXPECTED"
+    return "UNKNOWN"
+
+def _app97_apply(df, board=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+
+    # Name -> board item gives access to MLB player id without exposing it in the table.
+    lookup = {}
+    for p in board or []:
+        try:
+            nm = str(p.get("pitcher") or p.get("Pitcher") or "").strip().lower()
+            if nm:
+                lookup[nm] = p
+        except Exception:
+            pass
+
+    season = _okr_mlb_season() if "_okr_mlb_season" in globals() else datetime.now().year
+    records = []
+    for idx, rr in out.iterrows():
+        row = rr.to_dict()
+        name = str(row.get("Pitcher") or "").strip()
+        p = lookup.get(name.lower(), {})
+        pid = _app97_pitcher_id(p)
+        live = _app97_live_pitcher_profile(pid, season) if pid else {"available":False}
+
+        old_proj = _app97_num(row.get("APP88 Final K Projection"), None)
+        if old_proj is None:
+            old_proj = _app97_num(row.get("Final K Projection"), _app97_num(row.get("K PROJ"), 0.0))
+
+        # Current pitcher talent: live MLB season first, existing model second.
+        model_pk = _app97_pct(row.get("Pitcher K%"), None)
+        live_pk = _app97_pct(live.get("season_k_pct"), None)
+        pitcher_k = live_pk if live_pk is not None else model_pk
+        if pitcher_k is None:
+            pitcher_k = APP97_LEAGUE_K_PCT
+
+        team_env, split_suspect, team_detail = _app97_recent_hand_profile(row)
+
+        lineup_k = _app97_pct(row.get("APP88 Batter Lineup K%"), None)
+        if lineup_k is None:
+            lineup_k = _app97_pct(row.get("Lineup K%"), None)
+        lineup_status = _app97_lineup_status(row)
+        if lineup_k is not None:
+            lw = 0.55 if lineup_status == "CONFIRMED" else 0.35 if lineup_status == "EXPECTED" else 0.20
+            opp_env = (1.0-lw)*team_env + lw*lineup_k
+        else:
+            lw = 0.0
+            opp_env = team_env
+
+        bf, bf_note = _app97_reconcile_bf(row, live, pitcher_k)
+
+        # Multiplicative pitcher × opponent interaction. Exponent is deliberately
+        # sub-linear so a hot L3/L5 team cannot create a huge artificial boost.
+        ratio = max(0.72, min(1.35, opp_env / APP97_LEAGUE_K_PCT))
+        interaction_k_pct = pitcher_k * (ratio ** 0.58)
+        interaction_k_pct = max(10.0, min(42.0, interaction_k_pct))
+        implied_k = bf * interaction_k_pct / 100.0
+
+        l10_k = _app97_num(live.get("l10_k_avg"), None)
+        if l10_k is None:
+            l10_k = _app97_num(row.get("L10 Avg"), None)
+
+        favorable = opp_env >= 23.5
+        elite = pitcher_k >= 27.0
+        if elite and favorable and bf >= 19.0:
+            w_old, w_imp, w_recent = 0.34, 0.51, 0.15
+        else:
+            w_old, w_imp, w_recent = 0.43, 0.47, 0.10
+
+        if l10_k is None:
+            w_old += w_recent
+            w_recent = 0.0
+            l10_k = old_proj
+
+        target = w_old*old_proj + w_imp*implied_k + w_recent*l10_k
+
+        # Confidence-aware shift caps.
+        max_up = 1.45 if lineup_status == "CONFIRMED" else 1.15
+        max_dn = 1.15 if lineup_status == "CONFIRMED" else 0.95
+        shift = max(-max_dn, min(max_up, target-old_proj))
+        final = max(0.0, old_proj + shift)
+
+        if interaction_k_pct >= pitcher_k + 1.2:
+            interaction_label = "🟢 FAVORABLE K INTERACTION"
+        elif interaction_k_pct <= pitcher_k - 1.2:
+            interaction_label = "🟠 CONTACT-SUPPRESSION RISK"
+        else:
+            interaction_label = "🟡 NEUTRAL K INTERACTION"
+
+        records.append({
+            "_idx": idx,
+            "APP97 Baseline K Projection": round(old_proj,2),
+            "APP97 Live Pitcher K%": round(pitcher_k,1),
+            "APP97 Live Pitcher K/9": round(_app97_num(live.get("season_k9"),0.0),2) if _app97_num(live.get("season_k9"),None) is not None else np.nan,
+            "APP97 Team K% Current Blend": round(team_env,2),
+            "APP97 Recent Hand Split Suspect": bool(split_suspect),
+            "APP97 Team K Blend Detail": team_detail,
+            "APP97 Lineup K%": round(lineup_k,2) if lineup_k is not None else np.nan,
+            "APP97 Lineup Status": lineup_status,
+            "APP97 Lineup Weight": round(lw,2),
+            "APP97 Opponent K Environment": round(opp_env,2),
+            "APP97 K Interaction %": round(interaction_k_pct,2),
+            "APP97 K Interaction Label": interaction_label,
+            "APP97 Model Expected BF": round(_app97_num(row.get("Exp BF"),bf),2),
+            "APP97 Reconciled Expected BF": round(bf,2),
+            "APP97 BF Reconciliation": bf_note,
+            "APP97 Live L5 BF Median": live.get("l5_bf_median"),
+            "APP97 Live L10 BF Median": live.get("l10_bf_median"),
+            "APP97 Live L5 Pitch Median": live.get("l5_pitch_median"),
+            "APP97 Live L5 IP Avg": live.get("l5_ip_avg"),
+            "APP97 Live L10 K Avg": l10_k,
+            "APP97 Matchup Implied K": round(implied_k,2),
+            "APP97 Projection Shift": round(shift,2),
+            "APP97 True K Projection": round(final,2),
+            "APP97 Data Freshness": "CURRENT MLB API + CURRENT LINEUP/TEAM SPLITS",
+            "APP97 Version": APP97_CURRENT_K_VERSION,
+        })
+
+    add = pd.DataFrame(records).set_index("_idx")
+    for c in add.columns:
+        out.loc[add.index, c] = add[c]
+
+    # Promote APP97 as the public K projection. Preserve APP88 as audit baseline.
+    final_series = pd.to_numeric(out["APP97 True K Projection"], errors="coerce")
+    for c in ["K PROJ","Final K Projection","Official K PROJ"]:
+        if c in out.columns:
+            old = pd.to_numeric(out[c], errors="coerce")
+            out[c] = final_series.where(final_series.notna(), old).round(2)
+
+    # Refresh edges/sides/decisions from the NEW final projection.
+    line_col = next((c for c in ["UD/Line","Line","Underdog Line"] if c in out.columns), None)
+    if line_col:
+        line = pd.to_numeric(out[line_col], errors="coerce")
+        edge = (final_series-line).round(2)
+        for c in ["Edge","Edge Gap","Official K Edge","Final K Edge","Line-Aware Smart Edge"]:
+            if c in out.columns:
+                out[c] = edge
+        side = np.where(edge > 0, "OVER", np.where(edge < 0, "UNDER", "PUSH"))
+        out["APP97 Final Side"] = side
+        if "Decision" in out.columns:
+            out["Decision"] = [
+                _okr_mi_decision_from_proj(p,l,o) if "_okr_mi_decision_from_proj" in globals() else o
+                for p,l,o in zip(final_series.tolist(), line.tolist(), out["Decision"].tolist())
+            ]
+
+    return out
+
+_APP97_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+def build_kproj_table(board):
+    if _APP97_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _app97_apply(_APP97_PREV_BUILD_K(board), board)
+
 
 
 # ---- K board: enrich and add an official-confidence guardrail without touching K projection ----
