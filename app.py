@@ -24,7 +24,8 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ v12.0 + APP78 FINAL PIPELINE CLEANUP"
+APP_VERSION = "ONE WAY PICKZ v12.0 + VERIFIED DEEP K CLEANUP 2026-07-25"
+FULL_APP_UPDATE_MARKER = "FULL_APP_85_VERIFIED_DEEP_FIX_2026_07_25"
 # =========================
 # STABLE PROJECTION SEEDING
 # =========================
@@ -2569,7 +2570,7 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 # - Used only when MLB confirmed lineup is not available yet
 # - Falls back safely to the internal MLB projected lineup engine
 # =========================
-ROTOWIRE_EXPECTED_LINEUPS_ENABLED = False  # disabled: using original MLB confirmed + MLB pre-lineup engine
+ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True  # expected-lineup consensus; MLB confirmed always overrides
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
 
@@ -2979,7 +2980,7 @@ def _try_rotowire_expected_lineup(game_pk, opp_side, pitcher_hand=None):
 # - This layer only affects batter lineup / matchup K% logic. It does NOT touch Underdog lines,
 #   PrizePicks, sportsbook odds, or any market line pulls.
 # =========================
-FANGRAPHS_ROSTER_LINEUPS_ENABLED = False
+FANGRAPHS_ROSTER_LINEUPS_ENABLED = True
 FANGRAPHS_LINEUP_MIN_VALID_HITTERS = 5
 FANGRAPHS_BASE_URL = "https://www.fangraphs.com/roster-resource"
 
@@ -3254,33 +3255,125 @@ def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
     cache[lineup_cache_key(game_pk, opp_side, pitcher_hand)] = {"saved_at": now_iso(), "rows": rows[:9]}
     save_json(LINEUP_CACHE_FILE, cache)
 
+def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
+    """Best pre-lineup estimate from independent sources.
+
+    Source priority is not a blind overwrite: we aggregate RotoWire expected,
+    FanGraphs/RosterResource projected, and MLB recent-start behavior. Hitters
+    appearing in 2-3 sources receive substantially more starter confidence.
+    Official MLB battingOrder always bypasses this helper once posted.
+    """
+    team_abbr = _game_team_abbr_from_box_or_live(game_pk, opp_side)
+    team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
+    source_rows = []
+    try:
+        rw = build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
+        if rw:
+            source_rows.append(("ROTOWIRE", rw, 1.00))
+    except Exception:
+        pass
+    try:
+        fg = build_fangraphs_roster_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
+        if fg:
+            source_rows.append(("FANGRAPHS", fg, 1.00))
+    except Exception:
+        pass
+    try:
+        mlb = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None) if team_id else []
+        if mlb:
+            source_rows.append(("MLB_RECENT", mlb, 0.82))
+    except Exception:
+        pass
+
+    agg = {}
+    for src, rows, src_weight in source_rows:
+        for pos, rr in enumerate((rows or [])[:9], start=1):
+            name = str(rr.get("Batter") or "").strip()
+            if not name:
+                continue
+            key = normalize_name(name)
+            if not key:
+                continue
+            rec = agg.setdefault(key, {
+                "Batter": name, "orders": [], "sources": set(), "source_weight": 0.0,
+                "rows": [], "start_score": 0.0,
+            })
+            order = safe_float(rr.get("Order"), None)
+            if order is None:
+                order = safe_float(rr.get("Projected Order"), pos) or pos
+            rec["orders"].append(float(order))
+            rec["sources"].add(src)
+            rec["source_weight"] += src_weight
+            rec["rows"].append(rr)
+            rec["start_score"] = max(rec["start_score"], safe_float(rr.get("Start Score"), 0.0) or 0.0)
+
+    if not agg:
+        return None, [], "Expected lineup consensus unavailable", False
+
+    candidates = []
+    for key, rec in agg.items():
+        votes = len(rec["sources"])
+        avg_order = float(np.mean(rec["orders"])) if rec["orders"] else 9.0
+        # Agreement dominates; recent MLB start score breaks one-source ties.
+        selection_score = votes * 10.0 + rec["source_weight"] + min(rec["start_score"], 4.0) * 0.25 - avg_order * 0.015
+        candidates.append((selection_score, avg_order, key, rec))
+    candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+    selected = candidates[:9]
+    selected.sort(key=lambda x: (x[1], -x[0]))
+
+    exposure = [1.08, 1.07, 1.06, 1.04, 1.02, 1.00, 0.97, 0.94, 0.92]
+    output = []
+    weighted_num = 0.0
+    weighted_den = 0.0
+    for batting_order, (_, avg_order, _, rec) in enumerate(selected, start=1):
+        votes = len(rec["sources"])
+        starter_conf = 0.96 if votes >= 3 else 0.86 if votes == 2 else 0.68
+        # Prefer the richest row; Raw_K_Rate itself comes from MLB player stats/splits.
+        rich = sorted(rec["rows"], key=lambda r: (
+            r.get("Raw_K_Rate") is not None,
+            r.get("Split K%") is not None,
+            r.get("Player ID") is not None,
+        ), reverse=True)[0].copy()
+        k_vals = [safe_float(r.get("Raw_K_Rate"), None) for r in rec["rows"]]
+        k_vals = [v for v in k_vals if v is not None and 0.03 <= v <= 0.65]
+        k_rate = float(np.mean(k_vals)) if k_vals else safe_float(rich.get("Raw_K_Rate"), None)
+        rich["Order"] = batting_order
+        rich["Projected Order"] = round(avg_order, 2)
+        rich["Batter"] = rec["Batter"]
+        rich["Raw_K_Rate"] = k_rate
+        rich["Used K%"] = None if k_rate is None else round(k_rate * 100, 1)
+        rich["Expected Starter Confidence"] = round(starter_conf * 100, 0)
+        rich["Expected Lineup Sources"] = "+".join(sorted(rec["sources"]))
+        rich["Expected Lineup Source Count"] = votes
+        rich["Lineup Source"] = "EXPECTED_LINEUP_CONSENSUS"
+        output.append(rich)
+        if k_rate is not None:
+            w = exposure[min(batting_order - 1, len(exposure) - 1)] * starter_conf
+            weighted_num += float(k_rate) * w
+            weighted_den += w
+
+    valid = [r for r in output if r.get("Raw_K_Rate") is not None]
+    if len(valid) < 5 or weighted_den <= 0:
+        return None, output, f"Expected consensus thin ({len(valid)} usable hitters)", False
+    lineup_k = weighted_num / weighted_den
+    source_set = sorted({x for r in output for x in str(r.get("Expected Lineup Sources") or "").split("+") if x})
+    multi = sum(1 for r in output if safe_int(r.get("Expected Lineup Source Count"), 0) >= 2)
+    msg = f"Expected lineup consensus {len(output)}/9; {multi} hitters supported by 2+ sources; sources={'+'.join(source_set)}"
+    return float(lineup_k), output[:9], msg, False
+
+
 def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
-    """Resolve opponent lineup K-rate using the stable original lineup stack:
+    """Resolve opponent lineup K-rate.
 
-    1) MLB official/confirmed lineup once battingOrder exists in the MLB boxscore
-    2) Internal MLB pre-lineup/projected recent-lineup engine before official lineups post
-    3) Cached locked lineup only as a backup
-
-    This intentionally does NOT use Rotowire or FanGraphs. Underdog/PrizePicks/sportsbook
-    prop-line pulling is untouched and remains separate from batter lineup resolution.
+    1) MLB official batting order (highest priority, exact 1-9)
+    2) Pre-lineup consensus: RotoWire + FanGraphs/RosterResource + MLB recent starts
+    3) Cached locked official lineup as emergency fallback
+    4) Team K-rate fallback happens outside this function
     """
     box = safe_get_json(f"{MLB_BASE}/game/{game_pk}/boxscore")
 
-    # If official boxscore lineups are not available yet, use the app's original MLB pre-lineup engine.
-    if not box:
-        team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
-        proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
-        valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
-        if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
-            return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
-
-        cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
-        valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
-        if len(valid_cached) >= 5:
-            return float(np.mean(valid_cached)), cached_rows[:9], "Using cached locked lineup", True
-        return None, [], "Boxscore not available; MLB projected lineup unavailable", False
-
-    players = box.get("teams", {}).get(opp_side, {}).get("players", {})
+    # Official lineup: only rows with battingOrder are treated as confirmed.
+    players = (box or {}).get("teams", {}).get(opp_side, {}).get("players", {}) if box else {}
     rows = []
     for _, pdata in players.items():
         order = pdata.get("battingOrder")
@@ -3295,54 +3388,57 @@ def calculate_lineup_k_rate(game_pk, opp_side, pitcher_hand=None):
         rolling14 = rolling.get(14)
         rolling30 = rolling.get(30)
         used_k, used_source = blend_batter_k_inputs(
-            season_k,
-            split_k=split_k,
-            season_pa=season_pa,
-            split_pa=split_pa,
-            rolling14=rolling14,
-            rolling30=rolling30,
+            season_k, split_k=split_k, season_pa=season_pa, split_pa=split_pa,
+            rolling14=rolling14, rolling30=rolling30,
         )
         if used_k is None:
             used_k = split_k if split_k is not None else season_k
             used_source = split_source if split_k is not None else "Season batter K%"
         rows.append({
-            "Order": int(str(order)[:3]),
-            "Batter": name,
-            "Player ID": player_id,
+            "Order": int(str(order)[:3]), "Batter": name, "Player ID": player_id,
             "Season K%": None if season_k is None else round(season_k * 100, 1),
             "Split K%": None if split_k is None else round(split_k * 100, 1),
             "Rolling 14d K%": None if rolling14 is None else round(rolling14 * 100, 1),
             "Rolling 30d K%": None if rolling30 is None else round(rolling30 * 100, 1),
             "Split PA/AB": split_pa,
             "Used K%": None if used_k is None else round(used_k * 100, 1),
-            "K Source": used_source,
-            "SO": season_so,
-            "PA/AB": season_pa,
-            "Raw_K_Rate": used_k,
-            "Lineup Source": "MLB_CONFIRMED_LINEUP",
+            "K Source": used_source, "SO": season_so, "PA/AB": season_pa,
+            "Raw_K_Rate": used_k, "Lineup Source": "MLB_CONFIRMED_LINEUP",
+            "Expected Starter Confidence": 100,
+            "Expected Lineup Sources": "MLB_OFFICIAL",
+            "Expected Lineup Source Count": 1,
         })
 
     rows = sorted(rows, key=lambda x: x["Order"])
     valid = [r["Raw_K_Rate"] for r in rows[:9] if r.get("Raw_K_Rate") is not None]
-    if len(valid) >= 5:
+    if len(rows) >= 8 and len(valid) >= 5:
         set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows[:9])
-        lineup_k = float(np.mean(valid))
+        exposure = [1.08, 1.07, 1.06, 1.04, 1.02, 1.00, 0.97, 0.94, 0.92]
+        num = den = 0.0
+        for i, rr in enumerate(rows[:9]):
+            kr = safe_float(rr.get("Raw_K_Rate"), None)
+            if kr is not None:
+                w = exposure[min(i, 8)]
+                num += kr * w; den += w
+        lineup_k = num / den if den else float(np.mean(valid))
         split_count = sum(1 for r in rows[:9] if r.get("Split K%") is not None)
-        msg = f"Posted lineup K%; splits for {split_count}/9 hitters"
-        return lineup_k, rows[:9], msg, len(rows[:9]) >= 8
+        return float(lineup_k), rows[:9], f"MLB confirmed lineup; splits for {split_count}/{len(rows[:9])} hitters", True
 
-    # If boxscore exists but official lineup is still thin/not posted, use original MLB pre-lineup engine.
-    team_id = _proj_lu_team_id_from_game(game_pk, opp_side)
-    proj_rows = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None)
-    valid_proj = [r.get("Raw_K_Rate") for r in proj_rows[:9] if r.get("Raw_K_Rate") is not None]
-    if len(valid_proj) >= MLB_PROJECTED_LINEUP_MIN_VALID_HITTERS:
-        return float(np.mean(valid_proj)), proj_rows[:9], "MLB projected recent lineup K%", False
+    # Before official lineups: independent expected-lineup consensus.
+    try:
+        ck, cr, cm, _ = _expected_lineup_consensus(game_pk, opp_side, pitcher_hand)
+        if ck is not None and len(cr) >= 5:
+            return ck, cr, cm, False
+    except Exception:
+        pass
 
+    # Emergency backup: previously locked official lineup.
     cached_rows = get_cached_lineup_rows(game_pk, opp_side, pitcher_hand)
     valid_cached = [r.get("Raw_K_Rate") for r in cached_rows[:9] if r.get("Raw_K_Rate") is not None]
     if len(valid_cached) >= 5:
-        return float(np.mean(valid_cached)), cached_rows[:9], "Current lineup thin; using cached locked lineup", True
-    return None, rows, "Lineup not posted or not enough hitter K data", False
+        return float(np.mean(valid_cached)), cached_rows[:9], "Using cached locked official lineup", True
+
+    return None, rows, "No usable confirmed or expected lineup", False
 
 def team_k_vs_hand(team_id, hand):
     data = safe_get_json(f"{MLB_BASE}/teams/{team_id}/stats", params={"stats": "season", "group": "hitting"})
@@ -3371,6 +3467,8 @@ def projection_source_label(lineup_msg, lineup_locked, lineup_rows):
     row_count = len(lineup_rows or [])
     if "cached" in msg:
         return "CACHED LINEUP"
+    if "expected lineup consensus" in msg or any((r.get("Lineup Source") == "EXPECTED_LINEUP_CONSENSUS") for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "EXPECTED CONSENSUS"
     if "fangraphs" in msg or any("FANGRAPHS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
         return "FANGRAPHS ROSTER"
     if "rotowire" in msg or any((r.get("Lineup Source") == "ROTOWIRE_EXPECTED_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
@@ -3386,6 +3484,8 @@ def confirmed_lineup_status(source_label, lineup_rows):
         return "CONFIRMED"
     if source_label == "CACHED LINEUP":
         return "CACHED"
+    if source_label == "EXPECTED CONSENSUS" or any((r.get("Lineup Source") == "EXPECTED_LINEUP_CONSENSUS") for r in (lineup_rows or []) if isinstance(r, dict)):
+        return "EXPECTED CONSENSUS"
     if source_label == "FANGRAPHS ROSTER" or any("FANGRAPHS" in str(r.get("Lineup Source", "")).upper() for r in (lineup_rows or []) if isinstance(r, dict)):
         return "FANGRAPHS ROSTER"
     if source_label == "ROTOWIRE EXPECTED" or any((r.get("Lineup Source") == "ROTOWIRE_EXPECTED_LINEUP") for r in (lineup_rows or []) if isinstance(r, dict)):
@@ -8490,10 +8590,26 @@ def build_pitcher_experience_stability_layer(player_id, profile=None, recent_row
         notes.append("low season IP sample")
 
     score = float(clamp(score, 25, 92))
+    # A recent MLB debut does not always mean developmental rookie (e.g. experienced
+    # NPB/KBO/international veterans). Age 28+ late debuts are treated as mature pros
+    # with limited MLB sample rather than rookie-volatility arms.
+    age = None
+    try:
+        birth = str((meta or {}).get("birthDate") or "")[:10]
+        if birth:
+            bdt = datetime.strptime(birth, "%Y-%m-%d").date()
+            today = california_now().date() if "california_now" in globals() else datetime.now().date()
+            age = today.year - bdt.year - ((today.month, today.day) < (bdt.month, bdt.day))
+    except Exception:
+        age = None
+
     if (k_pct is not None and k_pct >= 0.285) and (avg_ip is None or avg_ip >= 5.0):
         label = "ELITE_ACE_PROFILE"
     elif (years is not None and years >= 5) and ((avg_ip or 0) >= 5.5 or (avg_pitches or 0) >= 90):
         label = "VETERAN_WORKHORSE"
+    elif (years is not None and years <= 1) and (age is not None and age >= 28):
+        label = "MATURE_LATE_DEBUT"
+        notes.append(f"mature late MLB debut age {age}")
     elif (years is not None and years <= 1) and ((avg_ip or 5.0) < 5.4 or (season_ip is not None and season_ip < 70)):
         label = "ROOKIE_VOLATILITY"
     elif (k_pct is not None and k_pct >= 0.275) and (years is not None and years <= 2):
@@ -8521,6 +8637,7 @@ def build_pitcher_experience_stability_layer(player_id, profile=None, recent_row
         "score": round(score, 1),
         "bf_factor": round(bf_factor, 4),
         "years_mlb": years,
+        "age": age,
         "avg_ip": None if avg_ip is None else round(float(avg_ip), 2),
         "avg_pitches": None if avg_pitches is None else round(float(avg_pitches), 1),
         "note": note,
@@ -8633,7 +8750,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
     # v9.6 upgrade: prefer true batter-vs-pitch-type matchup when lineup is available.
     matchup_profile = build_pitch_type_matchup_profile(
         statcast_profile,
-        lineup_rows if lineup_locked else [],
+        lineup_rows if len(lineup_rows or []) >= 5 else [],
         enabled=use_pitch_type,
         min_batters=5,
         pitcher_hand=hand,
@@ -8878,6 +8995,35 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         bullpen_note = f"{bullpen_note}; bullpen learning skipped: {_bp_learn_e}"
     bf = float(clamp(bf * bullpen_factor, 14, 31))
 
+    # K-only BF reconciliation governor. Multiple independent risk layers can otherwise
+    # stack into an unrealistically low workload. Reconcile against the pitcher
+    # actual recent BF distribution, while keeping genuine short-workload pitchers low.
+    try:
+        recent_bf_vals = []
+        for _rr in (recent_rows or [])[:8]:
+            _bfv = safe_float(_rr.get("BF", _rr.get("battersFaced")), None)
+            if _bfv is not None and _bfv > 0:
+                recent_bf_vals.append(float(_bfv))
+        bf_before_reconcile = float(bf)
+        if len(recent_bf_vals) >= 3:
+            recent_bf_median = float(np.median(recent_bf_vals[:6]))
+            recent_bf_floor = float(np.percentile(recent_bf_vals[:6], 25))
+            # Only correct obvious stacked underestimates. Never force a full median.
+            if recent_bf_median >= 20.0 and bf < recent_bf_floor - 1.5:
+                recovery_target = min(recent_bf_median - 1.25, bf + 2.75)
+                bf = float(clamp(max(bf, recovery_target), 14, 31))
+                leash["bf_reconciliation_reason"] = f"STACKED_CUT_RECOVERY recent median {recent_bf_median:.1f}, Q1 {recent_bf_floor:.1f}"
+            else:
+                leash["bf_reconciliation_reason"] = "NO_RECOVERY_NEEDED"
+            leash["bf_recent_median"] = round(recent_bf_median, 2)
+            leash["bf_recent_q1"] = round(recent_bf_floor, 2)
+        else:
+            leash["bf_reconciliation_reason"] = "THIN_RECENT_BF_SAMPLE"
+        leash["bf_before_reconciliation"] = round(bf_before_reconcile, 2)
+        leash["bf_after_reconciliation"] = round(float(bf), 2)
+    except Exception as _bf_rec_e:
+        leash["bf_reconciliation_reason"] = f"BF_RECONCILIATION_ERROR:{str(_bf_rec_e)[:80]}"
+
     # Innings Outcome Module: final BF + pitch count/leash context -> projected IP, projected pitches, early-pull risk.
     try:
         innings_outcome = build_innings_outcome_module(
@@ -8898,7 +9044,7 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
             "note": f"Innings outcome skipped: {_ip_e}",
         }
 
-    batter_rates, simulation_source = build_pa_sequence(lineup_rows if lineup_locked else [], bf, lineup_k)
+    batter_rates, simulation_source = build_pa_sequence(lineup_rows if len(lineup_rows or []) >= 5 else [], bf, lineup_k)
 
     # v10.7: safer Bayesian + Markov Monte Carlo built around expected BF, not generic 27 outs.
     preliminary_score = data_lock_score(
@@ -9354,6 +9500,13 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "weather_precip_prob": weather_details.get("precip_prob") if isinstance(weather_details, dict) else None,
         "environment_factor": round(env_mult, 3),
         "expected_bf": round(bf, 1),
+        "bf_before_reconciliation": leash.get("bf_before_reconciliation"),
+        "bf_after_reconciliation": leash.get("bf_after_reconciliation"),
+        "bf_recent_median": leash.get("bf_recent_median"),
+        "bf_recent_q1": leash.get("bf_recent_q1"),
+        "bf_reconciliation_reason": leash.get("bf_reconciliation_reason"),
+        "expected_lineup_batter_count": len(lineup_rows or []),
+        "expected_lineup_multi_source_count": sum(1 for _lr in (lineup_rows or []) if safe_int(_lr.get("Expected Lineup Source Count"), 0) >= 2),
         "ip_bf_patch_label": leash.get("ip_bf_patch_label"),
         "ip_bf_patch_note": leash.get("ip_bf_patch_note"),
         "pitcher_experience_label": pitcher_experience_profile.get("label") if "pitcher_experience_profile" in locals() else None,
@@ -27992,9 +28145,15 @@ def _okr_cache_fetch_table(season=None):
         "Overall": _okr_fetch_bdfed_split(season, None, False),
         "vs RHP": _okr_fetch_bdfed_split(season, "vr", False),
         "vs LHP": _okr_fetch_bdfed_split(season, "vl", False),
+        "L3 Overall": _okr_fetch_bdfed_split(season, None, lookback_days=3),
+        "L3 vs RHP": _okr_fetch_bdfed_split(season, "vr", lookback_days=3),
+        "L3 vs LHP": _okr_fetch_bdfed_split(season, "vl", lookback_days=3),
         "L5 Overall": _okr_fetch_bdfed_split(season, None, lookback_days=5),
         "L5 vs RHP": _okr_fetch_bdfed_split(season, "vr", lookback_days=5),
         "L5 vs LHP": _okr_fetch_bdfed_split(season, "vl", lookback_days=5),
+        "L10 Overall": _okr_fetch_bdfed_split(season, None, lookback_days=10),
+        "L10 vs RHP": _okr_fetch_bdfed_split(season, "vr", lookback_days=10),
+        "L10 vs LHP": _okr_fetch_bdfed_split(season, "vl", lookback_days=10),
         "L15 Overall": _okr_fetch_bdfed_split(season, None, lookback_days=15),
         "L15 vs RHP": _okr_fetch_bdfed_split(season, "vr", lookback_days=15),
         "L15 vs LHP": _okr_fetch_bdfed_split(season, "vl", lookback_days=15),
@@ -28198,15 +28357,11 @@ def _owp_overlay_full_board_pitcher_k_rank(card_row):
         return card_row
 
 def _okr_mi_adaptive_weight_profile(rec, hand):
-    """Return adaptive recency weights for opponent K% versus pitcher hand.
+    """Sample-aware team K% trend versus the pitcher's handedness.
 
-    The profile reacts to sample quality and trend agreement:
-      * L5 can rise to 55% when L5 and L15 agree and both samples are reliable.
-      * L5 falls toward 25-35% when the sample is thin or conflicts sharply with L15.
-      * Unsupported recent weight automatically returns to the season split.
-
-    This prevents a noisy five-game stretch from dominating while still allowing
-    genuine current lineup trends to matter more than a stale season average.
+    Uses official MLB team hitting splits for L3/L5/L10/L15/L30 plus season.
+    Very short windows are deliberately low weight and every recent window is
+    shrunk by its PA reliability so one noisy series cannot hijack the model.
     """
     try:
         rec = rec or {}
@@ -28214,86 +28369,43 @@ def _okr_mi_adaptive_weight_profile(rec, hand):
         split = 'vs LHP' if hand == 'LHP' else 'vs RHP' if hand == 'RHP' else None
         if not split:
             return None
-
-        vals = {}
-        pas = {}
-        full_pa = {'L5': 150.0, 'L15': 400.0, 'L30': 750.0}
-        for name in ('L5', 'L15', 'L30'):
-            vals[name] = _okr_num(rec.get(f'K% {name} {split}'), None)
-            pas[name] = _okr_num(rec.get(f'PA {name} {split}'), None)
-
+        windows = ('L3','L5','L10','L15','L30')
+        vals = {w: _okr_num(rec.get(f'K% {w} {split}'), None) for w in windows}
+        pas = {w: _okr_num(rec.get(f'PA {w} {split}'), None) for w in windows}
         season_v = _okr_num(rec.get(f'K% {split}'), None)
         if season_v is None:
             season_v = _okr_num(rec.get('K% Overall'), None)
         if season_v is None:
             return None
 
+        # Intentionally conservative: L3 is a trend flag, not a major driver.
+        targets = {'L3':0.05,'L5':0.15,'L10':0.20,'L15':0.20,'L30':0.15,'SEASON':0.25}
+        full_pa = {'L3':90.0,'L5':150.0,'L10':280.0,'L15':400.0,'L30':750.0}
         rel = {}
-        for name in ('L5', 'L15', 'L30'):
-            pa = pas[name]
-            rel[name] = 0.0 if pa is None or pa <= 0 else max(0.0, min(1.0, float(pa) / full_pa[name]))
-
-        # Default balanced profile.
-        mode = 'BALANCED_45_30_15_10'
-        targets = {'L5': 0.45, 'L15': 0.30, 'L30': 0.15, 'SEASON': 0.10}
-
-        v5, v15 = vals.get('L5'), vals.get('L15')
-        r5, r15 = rel.get('L5', 0.0), rel.get('L15', 0.0)
-
-        if v5 is None or r5 < 0.35:
-            targets = {'L5': 0.25, 'L15': 0.35, 'L30': 0.20, 'SEASON': 0.20}
-            mode = 'LOW_L5_RELIABILITY_25_35_20_20'
-        elif v15 is None or r15 < 0.35:
-            targets = {'L5': 0.35, 'L15': 0.20, 'L30': 0.20, 'SEASON': 0.25}
-            mode = 'LOW_L15_SUPPORT_35_20_20_25'
-        else:
-            diff_5_15 = abs(float(v5) - float(v15))
-            same_direction = ((float(v5) - float(season_v)) * (float(v15) - float(season_v))) >= 0
-            if r5 >= 0.90 and r15 >= 0.75 and same_direction and diff_5_15 <= 2.5:
-                targets = {'L5': 0.55, 'L15': 0.25, 'L30': 0.10, 'SEASON': 0.10}
-                mode = 'CONFIRMED_CURRENT_TREND_55_25_10_10'
-            elif r5 >= 0.70 and r15 >= 0.60 and same_direction and diff_5_15 <= 4.0:
-                targets = {'L5': 0.50, 'L15': 0.27, 'L30': 0.13, 'SEASON': 0.10}
-                mode = 'SUPPORTED_CURRENT_TREND_50_27_13_10'
-            elif diff_5_15 >= 6.0 or not same_direction:
-                targets = {'L5': 0.30, 'L15': 0.35, 'L30': 0.20, 'SEASON': 0.15}
-                mode = 'CONFLICTING_RECENCY_30_35_20_15'
-            elif r5 < 0.60:
-                targets = {'L5': 0.35, 'L15': 0.35, 'L30': 0.20, 'SEASON': 0.10}
-                mode = 'MODERATE_L5_RELIABILITY_35_35_20_10'
-
-        # Reliability-shrink each recent target; missing weight returns to season.
-        effective = {'SEASON': float(targets['SEASON'])}
-        shrink_to_season = 0.0
-        for name in ('L5', 'L15', 'L30'):
-            if vals[name] is None or rel[name] <= 0:
-                effective[name] = 0.0
-                shrink_to_season += float(targets[name])
+        effective = {'SEASON': targets['SEASON']}
+        shrink = 0.0
+        for w in windows:
+            pa = pas.get(w)
+            rel[w] = 0.0 if pa is None or pa <= 0 else max(0.0, min(1.0, float(pa)/full_pa[w]))
+            if vals.get(w) is None or rel[w] <= 0:
+                effective[w] = 0.0
+                shrink += targets[w]
             else:
-                effective[name] = float(targets[name]) * float(rel[name])
-                shrink_to_season += float(targets[name]) - effective[name]
-        effective['SEASON'] += shrink_to_season
-
-        # Floating-point guard: normalize to exactly 1.0.
-        total = sum(effective.values())
+                effective[w] = targets[w] * rel[w]
+                shrink += targets[w] - effective[w]
+        effective['SEASON'] += shrink
+        total=sum(effective.values())
         if total <= 0:
-            effective = {'L5': 0.0, 'L15': 0.0, 'L30': 0.0, 'SEASON': 1.0}
+            effective={w:0.0 for w in windows}; effective['SEASON']=1.0
         else:
-            effective = {k: float(v) / total for k, v in effective.items()}
-
+            effective={k:float(v)/total for k,v in effective.items()}
         return {
-            'split': split,
-            'season': float(season_v),
-            'values': vals,
-            'pa': pas,
-            'reliability': rel,
-            'targets': targets,
-            'effective': effective,
-            'mode': mode,
+            'split':split,'season':float(season_v),'values':vals,'pa':pas,
+            'reliability':rel,'targets':targets,'effective':effective,
+            'mode':'L3_L5_L10_L15_L30_SEASON_PA_SHRINK'
         }
     except Exception:
         return None
-
 
 def _okr_mi_blended_k_pct(rec, hand):
     """Adaptive, sample-aware opponent K% blend in percent units."""
@@ -28309,7 +28421,7 @@ def _okr_mi_blended_k_pct(rec, hand):
 
         blend = float(season_v) * float(eff['SEASON'])
         details = [f"mode={profile['mode']}"]
-        for name in ('L5', 'L15', 'L30'):
+        for name in ('L3', 'L5', 'L10', 'L15', 'L30'):
             val = vals.get(name)
             w = float(eff.get(name, 0.0))
             pa = profile['pa'].get(name)
@@ -28318,8 +28430,8 @@ def _okr_mi_blended_k_pct(rec, hand):
                 details.append(f"{w*100:.1f}% {name} {split}={float(val):.2f}% (PA {int(pa) if pa else 0})")
         details.append(f"{float(eff['SEASON'])*100:.1f}% season {split}={float(season_v):.2f}%")
 
-        target_text = '/'.join(f"{profile['targets'][k]*100:.0f}" for k in ('L5','L15','L30','SEASON'))
-        details.append(f"target L5/L15/L30/season={target_text}")
+        target_text = '/'.join(f"{profile['targets'][k]*100:.0f}" for k in ('L3','L5','L10','L15','L30','SEASON'))
+        details.append(f"target L3/L5/L10/L15/L30/season={target_text}")
         return round(float(blend), 2), ' | '.join(details)
     except Exception:
         return None, 'K_RECENCY_BLEND_ERROR'
@@ -28328,7 +28440,7 @@ def _okr_mi_projection_nudge(row, rec, hand):
     """Small capped K-environment projection nudge from official MLB team K%.
 
     The verified K environment uses a sample-size-aware recency blend:
-      L5 + L15 + L30 vs pitcher hand, anchored by season vs-hand K%.
+      L3 + L5 + L10 + L15 + L30 vs pitcher hand, anchored by season vs-hand K%.
 
     It then compares verified team K% to the model's existing opponent K%.
     ORIGINAL-ANCHOR TESTER: the adjustment is intentionally tiny and capped
@@ -28445,7 +28557,9 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     opp_teams, p_teams, hands = [], [], []
     k_hand, rank_hand, label_hand, source_hand = [], [], [], []
     k_rhp, r_rhp, k_lhp, r_lhp = [], [], [], []
+    k_l3_rhp, r_l3_rhp, k_l3_lhp, r_l3_lhp = [], [], [], []
     k_l5_rhp, r_l5_rhp, k_l5_lhp, r_l5_lhp = [], [], [], []
+    k_l10_rhp, r_l10_rhp, k_l10_lhp, r_l10_lhp = [], [], [], []
     k_l15_rhp, r_l15_rhp, k_l15_lhp, r_l15_lhp = [], [], [], []
     k_l30_rhp, r_l30_rhp, k_l30_lhp, r_l30_lhp = [], [], [], []
     k_overall, r_overall, so_overall, so_rank_overall, pa_overall = [], [], [], [], []
@@ -28491,8 +28605,12 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         source_hand.append(src_used or "")
         k_rhp.append(rec.get("K% vs RHP", "")); r_rhp.append(rec.get("K Rank vs RHP", ""))
         k_lhp.append(rec.get("K% vs LHP", "")); r_lhp.append(rec.get("K Rank vs LHP", ""))
+        k_l3_rhp.append(rec.get("K% L3 vs RHP", "")); r_l3_rhp.append(rec.get("K Rank L3 vs RHP", ""))
+        k_l3_lhp.append(rec.get("K% L3 vs LHP", "")); r_l3_lhp.append(rec.get("K Rank L3 vs LHP", ""))
         k_l5_rhp.append(rec.get("K% L5 vs RHP", "")); r_l5_rhp.append(rec.get("K Rank L5 vs RHP", ""))
         k_l5_lhp.append(rec.get("K% L5 vs LHP", "")); r_l5_lhp.append(rec.get("K Rank L5 vs LHP", ""))
+        k_l10_rhp.append(rec.get("K% L10 vs RHP", "")); r_l10_rhp.append(rec.get("K Rank L10 vs RHP", ""))
+        k_l10_lhp.append(rec.get("K% L10 vs LHP", "")); r_l10_lhp.append(rec.get("K Rank L10 vs LHP", ""))
         k_l15_rhp.append(rec.get("K% L15 vs RHP", "")); r_l15_rhp.append(rec.get("K Rank L15 vs RHP", ""))
         k_l15_lhp.append(rec.get("K% L15 vs LHP", "")); r_l15_lhp.append(rec.get("K Rank L15 vs LHP", ""))
         k_l30_rhp.append(rec.get("K% L30 vs RHP", "")); r_l30_rhp.append(rec.get("K Rank L30 vs RHP", ""))
@@ -28514,10 +28632,18 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     d["Opp K Rank vs RHP Official"] = r_rhp
     d["Opp K% vs LHP Official"] = k_lhp
     d["Opp K Rank vs LHP Official"] = r_lhp
+    d["Opp L3 K% vs RHP Official"] = k_l3_rhp
+    d["Opp L3 K Rank vs RHP Official"] = r_l3_rhp
+    d["Opp L3 K% vs LHP Official"] = k_l3_lhp
+    d["Opp L3 K Rank vs LHP Official"] = r_l3_lhp
     d["Opp L5 K% vs RHP Official"] = k_l5_rhp
     d["Opp L5 K Rank vs RHP Official"] = r_l5_rhp
     d["Opp L5 K% vs LHP Official"] = k_l5_lhp
     d["Opp L5 K Rank vs LHP Official"] = r_l5_lhp
+    d["Opp L10 K% vs RHP Official"] = k_l10_rhp
+    d["Opp L10 K Rank vs RHP Official"] = r_l10_rhp
+    d["Opp L10 K% vs LHP Official"] = k_l10_lhp
+    d["Opp L10 K Rank vs LHP Official"] = r_l10_lhp
     d["Opp L15 K% vs RHP Official"] = k_l15_rhp
     d["Opp L15 K Rank vs RHP Official"] = r_l15_rhp
     d["Opp L15 K% vs LHP Official"] = k_l15_lhp
@@ -28565,7 +28691,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Team K Read"] = ""
 
     # Matchup Intelligence Projection Nudge — original-anchor light weight only.
-    # Uses PA-shrunk L5/L15/L30 vs-hand K% plus season anchor; caps at +/-0.20 K.
+    # Uses PA-shrunk L3/L5/L10/L15/L30 vs-hand K% plus season anchor; caps at +/-0.20 K.
     try:
         mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified, mi_blend_detail = [], [], [], [], [], [], []
         for idx, row in d.iterrows():
@@ -28587,7 +28713,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Matchup Intel Reason"] = mi_reason
         d["Matchup Intel Verified Team K%"] = mi_verified
         d["Recency Team K Blend Detail"] = mi_blend_detail
-        d["Recency Team K Blend Method"] = "Adaptive L5/L15/L30/season vs hand: L5 25-55% based on PA reliability and L5-L15 trend agreement; unsupported recent weight shrinks to season"
+        d["Recency Team K Blend Method"] = "PA-shrunk L3/L5/L10/L15/L30/season vs hand; short windows are low weight and unsupported recent weight shrinks to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
         d["Matchup Intelligence Version"] = "MATCHUP_INTEL_ADAPTIVE_RECENCY_L5_25_55_L15_L30_SEASON_PA_TREND_SHRINK_WEIGHT_0_12_CAP_0_20_2026_07_11"
         # Promote this as the final display/export projection, but record the pre-value above.
@@ -32854,6 +32980,10 @@ def _a86_lineup_k_values(row):
     overall, vs_r, vs_l = [], [], []
     for c in row.index:
         cl = str(c).lower()
+        # Never re-ingest derived APP/team summary columns as if they were individual hitters.
+        # This prevents recursive 30-40% lineup K readings from prior pipeline outputs.
+        if any(tag in cl for tag in ["app85", "app86", "app87", "app88", "app89", "app95", "file33", "team batter", "team k", "opponent k", "matchup intel", "daily lineup team"]):
+            continue
         if "k%" not in cl or not any(t in cl for t in ["lineup", "batter", "hitter"]):
             continue
         x = _a86_pct(row.get(c))
@@ -33771,29 +33901,12 @@ def _file33_match_apply(df):
     out["File33 Projection Source"] = matched_source
     out["File33 Match Version"] = FILE33_PROJECTION_MATCH_VERSION
 
-    for column in [
-        "K PROJ",
-        "Final K Projection",
-        "Official K PROJ",
-        "Matchup Intelligence Final K Projection",
-        "Line-Aware Smart Final K Projection",
-    ]:
-        if column in out.columns or column in ["K PROJ", "Final K Projection", "Official K PROJ"]:
-            out[column] = out["File33 Matched K Projection"]
-
-    edge_series = pd.Series(matched_edge, index=out.index)
-    for column in ["Official K Edge", "Edge Gap", "Final K Edge", "Line-Aware Smart Edge"]:
-        if column in out.columns:
-            out[column] = edge_series
-
-    for column in ["Decision", "Main Engine Action", "Line-Aware Smart Decision", "Final Decision"]:
-        if column in out.columns:
-            out[column] = matched_decision
-
-    if "APP88 Final Side" in out.columns:
-        out["APP88 Final Side"] = matched_side
-
-    out["Active K Pipeline"] = "FILE33_MATCHED_WITH_APP32_OUTS"
+    # File33/legacy projection is now REFERENCE ONLY.  It must never overwrite the
+    # active APP88/current matchup projection, edges, or decisions.
+    out["File33 Reference Edge"] = pd.Series(matched_edge, index=out.index)
+    out["File33 Reference Side"] = matched_side
+    out["File33 Reference Decision"] = matched_decision
+    out["Active K Pipeline"] = "CURRENT_MATCHUP_PIPELINE_WITH_FILE33_REFERENCE_ONLY"
     return out
 
 
@@ -36838,8 +36951,7 @@ def _og_apply_to_kdf(df):
         imported.append(round(float(og_proj), 2))
         deltas.append("" if old_proj is None else round(float(og_proj) - float(old_proj), 2))
         sources.append(og.get("OG Source") or "OG")
-        for col in ["K PROJ", "Final K Projection", "Official K PROJ", "Line-Aware Smart Final K Projection", "Matchup Intelligence Final K Projection"]:
-            out.at[idx, col] = round(float(og_proj), 2)
+        # OG slate is diagnostic/reference only. Never replace the current projection.
         out.at[idx, "OG Imported Side"] = og.get("OG Side", "")
         out.at[idx, "OG Imported Line"] = og.get("OG Line", "")
         out.at[idx, "OG Imported IP"] = og.get("OG IP Projection", "")
@@ -36849,10 +36961,8 @@ def _og_apply_to_kdf(df):
         if line is not None:
             edge = round(float(og_proj) - float(line), 2)
             side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PASS"
-            for col in ["Official K Edge", "Line-Aware Smart Edge", "Edge Gap"]:
-                out.at[idx, col] = edge
-            for col in ["Decision", "Line-Aware Smart Decision", "Final Decision"]:
-                out.at[idx, col] = side if abs(edge) >= 0.35 else "PASS"
+            out.at[idx, "OG Reference Edge"] = edge
+            out.at[idx, "OG Reference Side"] = side
     out["Imported OG K Projection"] = imported
     out["OG Projection Delta"] = deltas
     out["OG Projection Source"] = sources
@@ -36951,7 +37061,7 @@ _OG_PO_PREV_RENDER_KPROJ = render_kproj_tab if "render_kproj_tab" in globals() e
 
 def render_kproj_tab(board):
     st.markdown("### OG Projection Import")
-    st.caption("Paste the separate OG slate here when it is outperforming. Saved rows become the active K projection source in this file and show OG delta columns.")
+    st.caption("Paste the separate OG slate here when it is outperforming. Saved rows are reference-only and show OG delta columns; they do not overwrite the active K model.")
     og_text = st.text_area("Paste OG K slate", height=130, key="og_k_slate_import_text")
     parsed = _og_parse_slate_text(og_text, "OG_PASTE") if og_text.strip() else pd.DataFrame()
     if not parsed.empty:
@@ -38225,13 +38335,16 @@ def _pcx_context(row, name=None, player_id=None):
     elif label == "VETERAN_WORKHORSE": adj = 5
     elif label == "STABLE_STARTER": adj = 2
     elif label == "YOUNG_POWER_ARM": adj = -3
+    elif label == "MATURE_LATE_DEBUT": adj = -2
     elif label == "ROOKIE_VOLATILITY": adj = -8
     elif label == "SHORT_SAMPLE_RISK": adj = -10
     if hard_risk:
         adj -= 7
 
     years = ctx.get("years_mlb")
-    if label in ["ROOKIE_VOLATILITY", "SHORT_SAMPLE_RISK"] or (years is not None and years <= 1):
+    if label == "MATURE_LATE_DEBUT":
+        sample = "MATURE PRO / LIMITED MLB SAMPLE"
+    elif label in ["ROOKIE_VOLATILITY", "SHORT_SAMPLE_RISK"] or (years is not None and years <= 1):
         sample = "ROOKIE / LIMITED MLB SAMPLE"
     elif label == "YOUNG_POWER_ARM":
         sample = "YOUNG / DEVELOPING SAMPLE"
@@ -38241,6 +38354,7 @@ def _pcx_context(row, name=None, player_id=None):
         sample = "NORMAL MLB SAMPLE"
 
     if hard_risk or label == "SHORT_SAMPLE_RISK": gate = "⚠️ STRONG GUARDRAIL"
+    elif label == "MATURE_LATE_DEBUT": gate = "ℹ️ MATURE PRO / MLB SAMPLE GUARDRAIL"
     elif label == "ROOKIE_VOLATILITY": gate = "⚠️ ROOKIE GUARDRAIL"
     elif label == "YOUNG_POWER_ARM": gate = "ℹ️ YOUNG ARM"
     elif label in ["ELITE_ACE_PROFILE", "VETERAN_WORKHORSE"]: gate = "✅ ESTABLISHED"
