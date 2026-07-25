@@ -2771,6 +2771,15 @@ def _rotowire_extract_lineups_from_html(raw_html):
     except Exception:
         pass
 
+    # Marker/DOM parser for RotoWire's current responsive daily-lineups layout.
+    try:
+        marker_lineups = _rotowire_extract_lineups_from_marker_dom(raw_html)
+        for t_abbr, t_rows in (marker_lineups or {}).items():
+            if len(t_rows or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS and len(lineups.get(t_abbr, [])) < len(t_rows):
+                lineups[t_abbr] = t_rows[:9]
+    except Exception:
+        pass
+
     # Text fallback parser: works when Rotowire's visible page text is available but CSS classes changed.
     try:
         text_lineups = _rotowire_extract_lineups_from_visible_text(raw_html)
@@ -2781,6 +2790,180 @@ def _rotowire_extract_lineups_from_html(raw_html):
         pass
 
     return lineups
+
+
+def _rotowire_extract_lineups_from_marker_dom(raw_html):
+    """Parse the current RotoWire daily-lineups DOM around lineup status markers.
+
+    RotoWire's markup changes often, but the page consistently exposes two lineup
+    status labels per game and 9 position/player rows per team. This parser finds
+    each Expected/Confirmed Lineup marker, identifies its game card and team side,
+    then reads that side's position/player rows. It does not depend on one brittle
+    CSS class name.
+    """
+    if not raw_html:
+        return {}
+    try:
+        import re
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw_html, "html.parser")
+    except Exception:
+        return {}
+
+    valid_teams = set("ARI ATL BAL BOS CHC CHW CIN CLE COL DET HOU KC LAA LAD MIA MIL MIN NYM NYY ATH OAK PHI PIT SD SEA SF STL TB TEX TOR WSH WAS".split())
+    pos_tokens = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
+
+    def _team_tokens(node):
+        vals = []
+        # Images on the page have team abbreviation alts and/or filenames.
+        for img in node.find_all("img"):
+            for raw in (img.get("alt"), img.get("title"), img.get("src")):
+                txt = str(raw or "")
+                for tok in re.findall(r"(?:^|[/_\-])([A-Z]{2,3})(?:[._/\-]|$)", txt.upper()):
+                    nt = _rw_norm_team_abbr(tok)
+                    if tok in valid_teams or nt in {_rw_norm_team_abbr(x) for x in valid_teams}:
+                        if nt not in vals:
+                            vals.append(nt)
+        # Explicit abbreviation/data attributes are preferred when available.
+        for el in node.find_all(True):
+            attrs = " ".join(str(el.get(k, "")) for k in ("data-team", "data-abbr", "data-team-abbr", "aria-label"))
+            txt = " ".join([attrs, el.get_text(" ", strip=True) if any(x in " ".join(el.get("class", [])) for x in ("abbr", "team") ) else ""])
+            for tok in re.findall(r"\b[A-Z]{2,3}\b", txt.upper()):
+                nt = _rw_norm_team_abbr(tok)
+                if tok in valid_teams or nt in {_rw_norm_team_abbr(x) for x in valid_teams}:
+                    if nt not in vals:
+                        vals.append(nt)
+        if len(vals) < 2:
+            txt = node.get_text("\n", strip=True)
+            for tok in re.findall(r"(?m)^\s*(ARI|ATL|BAL|BOS|CHC|CHW|CIN|CLE|COL|DET|HOU|KC|LAA|LAD|MIA|MIL|MIN|NYM|NYY|ATH|OAK|PHI|PIT|SD|SEA|SF|STL|TB|TEX|TOR|WSH|WAS)\s*$", txt):
+                nt = _rw_norm_team_abbr(tok)
+                if nt not in vals:
+                    vals.append(nt)
+        return vals[:2]
+
+    def _plausible_name(text):
+        t = _rw_clean_name(text)
+        t = re.sub(r"^[\s*•+\-]+", "", t).strip()
+        t = re.sub(r"^\d+\s+", "", t).strip()
+        m = re.match(r"^(.+?)\s+([LRS])$", t)
+        hand = None
+        if m:
+            t, hand = m.group(1).strip(), m.group(2).upper()
+        if not (3 <= len(t) <= 38) or len(t.split()) < 2:
+            return None, None
+        low = t.lower()
+        if any(x in low for x in ("expected lineup", "confirmed lineup", "starting pitcher", "home run odds", "not announced", "watch now", "tickets")):
+            return None, None
+        if re.search(r"\bERA\b|\b\d+-\d+\b", t, re.I):
+            return None, None
+        return t, hand
+
+    def _parse_team_scope(scope, source):
+        rows = []
+        seen = set()
+        # First try semantic row containers (li/tr), which preserve position-name pairing.
+        candidates = scope.find_all(["li", "tr"])
+        for node in candidates:
+            txt = node.get_text(" ", strip=True)
+            pm = re.search(r"(?:^|\s)(C|1B|2B|3B|SS|LF|CF|RF|DH)(?:\s|$)", txt)
+            if not pm:
+                continue
+            pos = pm.group(1).upper()
+            a = node.find("a")
+            name, hand = _plausible_name(a.get_text(" ", strip=True) if a else re.sub(r"^.*?\b" + re.escape(pos) + r"\b", "", txt, count=1))
+            if not name:
+                continue
+            key = normalize_name(name)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not hand:
+                hm = re.search(r"\b([LRS])\s*$", txt)
+                hand = hm.group(1).upper() if hm else None
+            rows.append({"Order": len(rows)+1, "Batter": name, "Position": pos, "Hand": hand, "Lineup Source": source})
+            if len(rows) == 9:
+                return rows
+
+        # Generic descendant-order fallback for div/span based layouts.
+        tokens = []
+        for el in scope.find_all(["div", "span", "a", "strong"]):
+            t = _rw_clean_name(el.get_text(" ", strip=True))
+            if t and len(t) <= 60 and (not tokens or t != tokens[-1]):
+                tokens.append(t)
+        i = 0
+        while i < len(tokens) and len(rows) < 9:
+            cur = tokens[i].upper().strip()
+            if cur in pos_tokens:
+                for j in range(i+1, min(i+6, len(tokens))):
+                    if tokens[j].upper().strip() in pos_tokens:
+                        break
+                    name, hand = _plausible_name(tokens[j])
+                    if name:
+                        key = normalize_name(name)
+                        if key not in seen:
+                            seen.add(key)
+                            rows.append({"Order": len(rows)+1, "Batter": name, "Position": cur, "Hand": hand, "Lineup Source": source})
+                        i = j
+                        break
+            i += 1
+        return rows[:9]
+
+    out = {}
+    marker_nodes = []
+    for text in soup.find_all(string=re.compile(r"^\s*(Expected|Confirmed) Lineup\s*$", re.I)):
+        marker_nodes.append(text.parent)
+
+    for marker in marker_nodes:
+        label = marker.get_text(" ", strip=True)
+        source = "ROTOWIRE_CONFIRMED_LINEUP" if "confirmed" in label.lower() else "ROTOWIRE_EXPECTED_LINEUP"
+        # Find the smallest ancestor containing both team lineup markers: the game card.
+        game = None
+        anc = marker
+        for _ in range(9):
+            anc = getattr(anc, "parent", None)
+            if anc is None:
+                break
+            count = len(anc.find_all(string=re.compile(r"^\s*(Expected|Confirmed) Lineup\s*$", re.I)))
+            teams = _team_tokens(anc)
+            if count >= 2 and len(teams) >= 2:
+                game = anc
+                break
+        if game is None:
+            continue
+        teams = _team_tokens(game)
+        if len(teams) < 2:
+            continue
+        game_markers = [x.parent for x in game.find_all(string=re.compile(r"^\s*(Expected|Confirmed) Lineup\s*$", re.I))]
+        try:
+            side_idx = game_markers.index(marker)
+        except ValueError:
+            side_idx = 0
+        if side_idx > 1:
+            continue
+        team = teams[side_idx]
+
+        # Find the smallest ancestor representing only this team side and containing >=5 positions.
+        scope = marker.parent
+        best = None
+        for _ in range(8):
+            scope = getattr(scope, "parent", None)
+            if scope is None or scope == game.parent:
+                break
+            txt = scope.get_text(" ", strip=True)
+            pos_count = len(re.findall(r"(?:^|\s)(?:C|1B|2B|3B|SS|LF|CF|RF|DH)(?:\s|$)", txt))
+            marker_count = len(scope.find_all(string=re.compile(r"^\s*(Expected|Confirmed) Lineup\s*$", re.I)))
+            if pos_count >= 5 and marker_count <= 1:
+                best = scope
+                break
+        if best is None:
+            # Fallback: use the game card but isolate content from this marker to the next marker.
+            best = marker.parent
+            while getattr(best, "parent", None) is not None and best.parent != game:
+                best = best.parent
+        rows = _parse_team_scope(best, source)
+        if len(rows) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
+            out[team] = rows[:9]
+    return out
 
 def _rotowire_extract_lineups_from_visible_text(raw_html):
     """Fallback Rotowire parser using visible text order.
@@ -2893,7 +3076,7 @@ def _rotowire_extract_lineups_from_visible_text(raw_html):
             i += 1
             continue
         pair_j = None
-        for j in range(i + 1, min(i + 10, n)):
+        for j in range(i + 1, min(i + 40, n)):
             nxt = _rw_norm_team_abbr(lines[j])
             if is_team_token(nxt) and nxt != cur:
                 pair_j = j
@@ -2906,7 +3089,7 @@ def _rotowire_extract_lineups_from_visible_text(raw_html):
         end = min(pair_j + 360, n)
         for k in range(pair_j + 1, min(pair_j + 360, n - 1)):
             if k > pair_j + 40 and is_team_token(lines[k]):
-                for kk in range(k + 1, min(k + 10, n)):
+                for kk in range(k + 1, min(k + 40, n)):
                     if is_team_token(lines[kk]) and _rw_norm_team_abbr(lines[kk]) != _rw_norm_team_abbr(lines[k]):
                         end = k
                         break
@@ -33168,7 +33351,7 @@ import time as _a86_time
 import numpy as _a86_np
 import pandas as _a86_pd
 
-APP86_VERSION = "APP86_ROTOWIRE_PRIMARY_LINEUP_REFRESH_v2"
+APP86_VERSION = "APP86_ROTOWIRE_CURRENT_DOM_PARSER_v3"
 
 def _a86_num(v):
     try:
