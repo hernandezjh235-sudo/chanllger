@@ -2573,6 +2573,11 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True  # expected-lineup consensus; MLB confirmed always overrides
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
+# Railway/cloud IPs can occasionally receive a thin/blocked page from RotoWire.
+# Direct RotoWire is ALWAYS attempted first. Jina Reader is only a transport fallback
+# for the same public RotoWire page; it is never treated as an independent lineup source.
+ROTOWIRE_READER_FALLBACK_ENABLED = True
+ROTOWIRE_READER_URL = "https://r.jina.ai/http://www.rotowire.com/baseball/daily-lineups.php"
 
 ROTOWIRE_TEAM_ALIASES = {
     "AZ": "ARI", "ARZ": "ARI",
@@ -2603,24 +2608,78 @@ def _rw_clean_name(name):
             name = name[: -len(token)].strip()
     return name
 
-@st.cache_data(ttl=900, show_spinner=False)
-def _rotowire_fetch_daily_lineups_html():
+@st.cache_data(ttl=600, show_spinner=False)
+def _rotowire_fetch_daily_lineups_payload():
+    """Fetch RotoWire expected lineups with explicit transport diagnostics.
+
+    Returns a dict so the board can prove whether RotoWire actually succeeded.
+    Direct RotoWire is attempted first. A Reader fallback is allowed only when the
+    direct response is blocked/thin; both represent the SAME RotoWire page/source.
+    """
+    payload = {
+        "text": "", "transport": "NONE", "status": "DISABLED", "http_status": None,
+        "bytes": 0, "error": "", "url": ROTOWIRE_DAILY_LINEUPS_URL,
+    }
     if not ROTOWIRE_EXPECTED_LINEUPS_ENABLED:
-        return ""
-    try:
-        r = requests.get(
-            ROTOWIRE_DAILY_LINEUPS_URL,
-            timeout=16,
-            headers={
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-        )
-        if r.status_code >= 400:
-            return ""
-        return r.text or ""
-    except Exception:
-        return ""
+        return payload
+
+    headers_pool = [
+        {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        },
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    ]
+    errors = []
+    for headers in headers_pool:
+        try:
+            r = requests.get(ROTOWIRE_DAILY_LINEUPS_URL, timeout=18, headers=headers, allow_redirects=True)
+            txt = r.text or ""
+            payload["http_status"] = r.status_code
+            # A valid page should contain multiple Expected/Confirmed Lineup markers.
+            marker_count = txt.lower().count("expected lineup") + txt.lower().count("confirmed lineup")
+            if r.status_code < 400 and len(txt) >= 12000 and marker_count >= 2:
+                payload.update({
+                    "text": txt, "transport": "DIRECT_ROTOWIRE", "status": "SUCCESS",
+                    "bytes": len(txt), "error": "", "url": str(r.url),
+                })
+                return payload
+            errors.append(f"direct HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}")
+        except Exception as exc:
+            errors.append(f"direct error: {type(exc).__name__}: {exc}")
+
+    if ROTOWIRE_READER_FALLBACK_ENABLED:
+        try:
+            r = requests.get(
+                ROTOWIRE_READER_URL, timeout=22,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain,text/markdown,*/*"},
+            )
+            txt = r.text or ""
+            marker_count = txt.lower().count("expected lineup") + txt.lower().count("confirmed lineup")
+            if r.status_code < 400 and len(txt) >= 5000 and marker_count >= 2:
+                payload.update({
+                    "text": txt, "transport": "ROTOWIRE_VIA_READER", "status": "SUCCESS",
+                    "http_status": r.status_code, "bytes": len(txt),
+                    "error": "; ".join(errors), "url": ROTOWIRE_READER_URL,
+                })
+                return payload
+            errors.append(f"reader HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}")
+        except Exception as exc:
+            errors.append(f"reader error: {type(exc).__name__}: {exc}")
+
+    payload.update({"status": "FAILED", "error": "; ".join(errors)[:700]})
+    return payload
+
+
+def _rotowire_fetch_daily_lineups_html():
+    # Backward-compatible helper used by older code paths.
+    return (_rotowire_fetch_daily_lineups_payload() or {}).get("text", "")
 
 def _rotowire_extract_lineups_from_html(raw_html):
     """Best-effort Rotowire parser. Returns {TEAM_ABBR: [lineup rows]}.
@@ -2738,8 +2797,12 @@ def _rotowire_extract_lineups_from_visible_text(raw_html):
         for bad in soup(["script", "style", "noscript"]):
             bad.decompose()
         lines = []
+        import re
         for x in soup.get_text("\n", strip=True).split("\n"):
             t = _rw_clean_name(x)
+            # Reader/markdown fallbacks may preserve bullets and markdown links.
+            t = re.sub(r"^[\s*•+-]+", "", t).strip()
+            t = re.sub(r"!?(?:\[([^\]]+)\])\([^)]*\)", r"\1", t).strip()
             if t:
                 lines.append(t)
     except Exception:
@@ -2865,10 +2928,40 @@ def _rotowire_extract_lineups_from_visible_text(raw_html):
             i += 1
     return out
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
+def get_rotowire_expected_lineups_bundle():
+    payload = _rotowire_fetch_daily_lineups_payload() or {}
+    raw = payload.get("text", "") or ""
+    lineups = _rotowire_extract_lineups_from_html(raw) if raw else {}
+    team_counts = {str(k): len(v or []) for k, v in (lineups or {}).items()}
+    parsed_teams = sum(1 for v in team_counts.values() if v >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS)
+    status = dict(payload)
+    status.pop("text", None)
+    status["parsed_teams"] = parsed_teams
+    status["team_counts"] = team_counts
+    if payload.get("status") == "SUCCESS" and parsed_teams < 2:
+        status["status"] = "PARSE_FAILED"
+        status["error"] = ((status.get("error") or "") + "; RotoWire page fetched but lineup parser found too few teams").strip("; ")
+    return {"lineups": lineups, "diagnostics": status}
+
+
 def get_rotowire_expected_lineups():
-    raw = _rotowire_fetch_daily_lineups_html()
-    return _rotowire_extract_lineups_from_html(raw)
+    return (get_rotowire_expected_lineups_bundle() or {}).get("lineups", {})
+
+
+def get_rotowire_lineup_diagnostics(team_abbr=None):
+    bundle = get_rotowire_expected_lineups_bundle() or {}
+    diag = dict(bundle.get("diagnostics") or {})
+    if team_abbr:
+        ta = _rw_norm_team_abbr(team_abbr)
+        rows = ((bundle.get("lineups") or {}).get(ta) or [])
+        diag["team"] = ta
+        diag["team_batter_count"] = len(rows)
+        if len(rows) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS and diag.get("status") in {"SUCCESS", "PARSE_FAILED"}:
+            diag["team_status"] = "SUCCESS"
+        else:
+            diag["team_status"] = "UNAVAILABLE"
+    return diag
 
 def _game_team_abbr_from_box_or_live(game_pk, opp_side):
     try:
@@ -2907,6 +3000,84 @@ def _mlb_search_player_id_by_name(name):
         return None
     return None
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def _mlb_active_team_roster_by_abbr(team_abbr):
+    """Active MLB roster used to resolve RotoWire abbreviated names (e.g. C. Jensen)."""
+    ta = _rw_norm_team_abbr(team_abbr)
+    if not ta:
+        return []
+    try:
+        teams = safe_get_json(f"{MLB_BASE}/teams", params={"sportId": 1}, timeout=12) or {}
+        team_id = None
+        for t in teams.get("teams") or []:
+            aliases = {
+                _rw_norm_team_abbr(t.get("abbreviation")), _rw_norm_team_abbr(t.get("teamCode")),
+                _rw_norm_team_abbr(t.get("fileCode")),
+            }
+            if ta in aliases:
+                team_id = t.get("id"); break
+        if not team_id:
+            return []
+        data = safe_get_json(f"{MLB_BASE}/teams/{team_id}/roster", params={"rosterType": "active"}, timeout=12) or {}
+        out = []
+        for rr in data.get("roster") or []:
+            person = rr.get("person") or {}
+            if person.get("id") and person.get("fullName"):
+                out.append({"id": person.get("id"), "name": person.get("fullName")})
+        return out
+    except Exception:
+        return []
+
+
+def _mlb_resolve_lineup_player_id(name, team_abbr=None):
+    """Resolve full or abbreviated lineup names, preferring the expected player's own team roster."""
+    nm = _rw_clean_name(name)
+    if not nm:
+        return None
+    # Exact/global MLB search works best for full names.
+    if not (len(nm.split()) == 2 and nm.split()[0].rstrip('.').isalpha() and len(nm.split()[0].rstrip('.')) <= 2):
+        pid = _mlb_search_player_id_by_name(nm)
+        if pid:
+            return pid
+    roster = _mlb_active_team_roster_by_abbr(team_abbr) if team_abbr else []
+    target = normalize_name(nm)
+    parts = nm.replace('.', '').split()
+    first_initial = parts[0][0].lower() if parts else ''
+    surname = normalize_name(parts[-1]) if parts else ''
+    best_id, best_score = None, 0.0
+    for player in roster:
+        full = str(player.get("name") or "")
+        fp = full.replace('.', '').split()
+        if not fp:
+            continue
+        full_norm = normalize_name(full)
+        score = difflib.SequenceMatcher(None, target, full_norm).ratio()
+        full_surname = normalize_name(fp[-1])
+        if surname and full_surname == surname:
+            score += 0.45
+            if first_initial and fp[0] and fp[0][0].lower() == first_initial:
+                score += 0.35
+        if score > best_score:
+            best_score, best_id = score, player.get("id")
+    if best_id and best_score >= 0.82:
+        return best_id
+    return _mlb_search_player_id_by_name(nm)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _mlb_batter_hand(player_id):
+    if not player_id:
+        return None
+    try:
+        data = safe_get_json(f"{MLB_BASE}/people/{player_id}", params={"hydrate": "batSide"}, timeout=10) or {}
+        people = data.get("people") or []
+        code = (((people[0] if people else {}).get("batSide") or {}).get("code"))
+        code = str(code or "").upper().strip()
+        return code if code in {"L", "R", "S"} else None
+    except Exception:
+        return None
+
+
 def build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand=None):
     """Convert Rotowire expected lineup names into the same row schema the K engine already uses."""
     team_abbr = _rw_norm_team_abbr(team_abbr)
@@ -2920,7 +3091,7 @@ def build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand=None):
     rows = []
     for idx, base in enumerate(base_rows[:9], start=1):
         name = _rw_clean_name(base.get("Batter"))
-        player_id = _mlb_search_player_id_by_name(name)
+        player_id = _mlb_resolve_lineup_player_id(name, team_abbr)
         season_k, season_so, season_pa = get_batter_season_k_rate(player_id) if player_id else (None, None, None)
         split_k, split_so, split_pa, split_source = get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand) if (player_id and pitcher_hand) else (None, None, None, "No split")
         rolling = get_batter_rolling_k_rates(player_id, days_list=(14, 30)) if player_id else {}
@@ -2942,7 +3113,7 @@ def build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand=None):
             "Batter": name,
             "Player ID": player_id,
             "Position": base.get("Position"),
-            "Hand": base.get("Hand"),
+            "Hand": base.get("Hand") or _mlb_batter_hand(player_id),
             "Season K%": None if season_k is None else round(season_k * 100, 1),
             "Split K%": None if split_k is None else round(split_k * 100, 1),
             "Rolling 14d K%": None if rolling14 is None else round(rolling14 * 100, 1),
@@ -2954,6 +3125,8 @@ def build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand=None):
             "PA/AB": season_pa,
             "Raw_K_Rate": used_k,
             "Lineup Source": base.get("Lineup Source") or "ROTOWIRE_EXPECTED_LINEUP",
+            "RotoWire Transport": (get_rotowire_lineup_diagnostics(team_abbr) or {}).get("transport"),
+            "RotoWire Status": (get_rotowire_lineup_diagnostics(team_abbr) or {}).get("team_status"),
         })
     valid = [r.get("Raw_K_Rate") for r in rows if r.get("Raw_K_Rate") is not None]
     if len(valid) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
@@ -3269,19 +3442,19 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     try:
         rw = build_rotowire_expected_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
         if rw:
-            source_rows.append(("ROTOWIRE", rw, 1.00))
+            source_rows.append(("ROTOWIRE", rw, 1.80))
     except Exception:
         pass
     try:
         fg = build_fangraphs_roster_lineup_rows(team_abbr, pitcher_hand) if team_abbr else []
         if fg:
-            source_rows.append(("FANGRAPHS", fg, 1.00))
+            source_rows.append(("FANGRAPHS", fg, 1.15))
     except Exception:
         pass
     try:
         mlb = build_mlb_projected_lineup_rows(team_id, pitcher_hand, before_date=None) if team_id else []
         if mlb:
-            source_rows.append(("MLB_RECENT", mlb, 0.82))
+            source_rows.append(("MLB_RECENT", mlb, 0.72))
     except Exception:
         pass
 
@@ -3301,7 +3474,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
             order = safe_float(rr.get("Order"), None)
             if order is None:
                 order = safe_float(rr.get("Projected Order"), pos) or pos
-            rec["orders"].append(float(order))
+            rec["orders"].append((float(order), float(src_weight)))
             rec["sources"].add(src)
             rec["source_weight"] += src_weight
             rec["rows"].append(rr)
@@ -3313,9 +3486,14 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     candidates = []
     for key, rec in agg.items():
         votes = len(rec["sources"])
-        avg_order = float(np.mean(rec["orders"])) if rec["orders"] else 9.0
-        # Agreement dominates; recent MLB start score breaks one-source ties.
-        selection_score = votes * 10.0 + rec["source_weight"] + min(rec["start_score"], 4.0) * 0.25 - avg_order * 0.015
+        if rec["orders"]:
+            ow = sum(w for _, w in rec["orders"]) or 1.0
+            avg_order = sum(o*w for o, w in rec["orders"]) / ow
+        else:
+            avg_order = 9.0
+        # Current expected-lineup sources dominate old batting-order behavior.
+        # RotoWire current expected lineup has the strongest pre-lineup membership weight.
+        selection_score = rec["source_weight"] * 10.0 + votes * 2.0 + min(rec["start_score"], 4.0) * 0.20 - avg_order * 0.015
         candidates.append((selection_score, avg_order, key, rec))
     candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
     selected = candidates[:9]
@@ -3327,7 +3505,19 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     weighted_den = 0.0
     for batting_order, (_, avg_order, _, rec) in enumerate(selected, start=1):
         votes = len(rec["sources"])
-        starter_conf = 0.96 if votes >= 3 else 0.86 if votes == 2 else 0.68
+        srcs = set(rec["sources"])
+        if "ROTOWIRE" in srcs and "FANGRAPHS" in srcs:
+            starter_conf = 0.98
+        elif "ROTOWIRE" in srcs and len(srcs) >= 2:
+            starter_conf = 0.95
+        elif "ROTOWIRE" in srcs:
+            starter_conf = 0.88
+        elif "FANGRAPHS" in srcs and "MLB_RECENT" in srcs:
+            starter_conf = 0.90
+        elif "FANGRAPHS" in srcs:
+            starter_conf = 0.78
+        else:
+            starter_conf = 0.64
         # Prefer the richest row; Raw_K_Rate itself comes from MLB player stats/splits.
         rich = sorted(rec["rows"], key=lambda r: (
             r.get("Raw_K_Rate") is not None,
@@ -3358,7 +3548,9 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     lineup_k = weighted_num / weighted_den
     source_set = sorted({x for r in output for x in str(r.get("Expected Lineup Sources") or "").split("+") if x})
     multi = sum(1 for r in output if safe_int(r.get("Expected Lineup Source Count"), 0) >= 2)
-    msg = f"Expected lineup consensus {len(output)}/9; {multi} hitters supported by 2+ sources; sources={'+'.join(source_set)}"
+    rw_diag = get_rotowire_lineup_diagnostics(team_abbr) if team_abbr else {}
+    rw_txt = f"RW={rw_diag.get('team_status','UNKNOWN')}:{rw_diag.get('team_batter_count',0)} ({rw_diag.get('transport','NONE')})"
+    msg = f"Expected lineup consensus {len(output)}/9; {multi} hitters supported by 2+ sources; sources={'+'.join(source_set)}; {rw_txt}"
     return float(lineup_k), output[:9], msg, False
 
 
@@ -9505,6 +9697,12 @@ def make_projection(row, bankroll, default_odds, use_statcast, use_pitch_type, u
         "bf_recent_median": leash.get("bf_recent_median"),
         "bf_recent_q1": leash.get("bf_recent_q1"),
         "bf_reconciliation_reason": leash.get("bf_reconciliation_reason"),
+        "lineup_k_pct": round((safe_float(lineup_k, 0.0) or 0.0) * 100, 2),
+        "lineup_source_detail": "+".join(sorted({str(_lr.get("Expected Lineup Sources") or _lr.get("Lineup Source") or "") for _lr in (lineup_rows or []) if isinstance(_lr, dict) and (_lr.get("Expected Lineup Sources") or _lr.get("Lineup Source"))})),
+        "rotowire_status": (get_rotowire_lineup_diagnostics(_game_team_abbr_from_box_or_live(row["game_pk"], row["opp_side"])) or {}).get("team_status"),
+        "rotowire_transport": (get_rotowire_lineup_diagnostics(_game_team_abbr_from_box_or_live(row["game_pk"], row["opp_side"])) or {}).get("transport"),
+        "rotowire_batter_count": (get_rotowire_lineup_diagnostics(_game_team_abbr_from_box_or_live(row["game_pk"], row["opp_side"])) or {}).get("team_batter_count"),
+        "rotowire_error": (get_rotowire_lineup_diagnostics(_game_team_abbr_from_box_or_live(row["game_pk"], row["opp_side"])) or {}).get("error"),
         "expected_lineup_batter_count": len(lineup_rows or []),
         "expected_lineup_multi_source_count": sum(1 for _lr in (lineup_rows or []) if safe_int(_lr.get("Expected Lineup Source Count"), 0) >= 2),
         "ip_bf_patch_label": leash.get("ip_bf_patch_label"),
@@ -13886,6 +14084,15 @@ def build_kproj_table(board):
             "Exp BF": p.get("expected_bf"),
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
             "Lineup": p.get("lineup_status"),
+            "Projection Source": p.get("projection_source"),
+            "Lineup Note": p.get("lineup_note"),
+            "Lineup K%": p.get("lineup_k_pct") if p.get("lineup_k_pct") is not None else (round((safe_float(p.get("opp_k"),0) or 0)*100,1)),
+            "Lineup Batter Count": p.get("expected_lineup_batter_count"),
+            "Lineup Multi-Source Count": p.get("expected_lineup_multi_source_count"),
+            "RotoWire Status": p.get("rotowire_status"),
+            "RotoWire Transport": p.get("rotowire_transport"),
+            "RotoWire Batter Count": p.get("rotowire_batter_count"),
+            "RotoWire Error": p.get("rotowire_error"),
             "Reliability": p.get("reliability_score"),
             "Reliability Label": p.get("reliability_label"),
             "Official Filter": p.get("official_play_filter"),
@@ -32961,7 +33168,7 @@ import time as _a86_time
 import numpy as _a86_np
 import pandas as _a86_pd
 
-APP86_VERSION = "APP86_ORIGINAL_K_DAILY_LINEUP_K_REFRESH_v1"
+APP86_VERSION = "APP86_ROTOWIRE_PRIMARY_LINEUP_REFRESH_v2"
 
 def _a86_num(v):
     try:
@@ -33008,30 +33215,49 @@ def _a86_apply(df):
         hand = str(row.get("Pitcher Hand", row.get("Throws", row.get("Pitcher Throws","")))).upper()
         overall_avg = sum(overall)/len(overall) if overall else _a86_np.nan
 
-        if hand.startswith("L") and vs_l:
-            hand_avg, n = sum(vs_l)/len(vs_l), len(vs_l)
-        elif hand.startswith("R") and vs_r:
-            hand_avg, n = sum(vs_r)/len(vs_r), len(vs_r)
+        # Primary engine now exports the resolved batter-level lineup K% and hitter count.
+        # APP86 must consume that directly instead of trying to rediscover nested lineup rows
+        # from flattened dataframe columns. This was the cause of false TEAM_RATE_FALLBACK.
+        primary_lineup_k = _a86_pct(row.get("Lineup K%"))
+        primary_n = int(_a86_num(row.get("Lineup Batter Count"))) if _a86_np.isfinite(_a86_num(row.get("Lineup Batter Count"))) else 0
+        primary_source = str(row.get("Projection Source", row.get("Lineup", "")) or "").upper()
+        rw_status = str(row.get("RotoWire Status") or "").upper()
+
+        if _a86_np.isfinite(primary_lineup_k) and primary_n >= 5 and "TEAM FALLBACK" not in primary_source:
+            hand_avg = primary_lineup_k
+            overall_avg = primary_lineup_k
+            n = primary_n
+            if "TRUE LINEUP" in primary_source or "CONFIRMED" in str(row.get("Lineup", "")).upper():
+                status, source = f"CONFIRMED_LINEUP_{n}", "PRIMARY_BATTER_LEVEL_LINEUP"
+            elif "EXPECTED" in primary_source or "ROTOWIRE" in primary_source or "FANGRAPHS" in primary_source:
+                status, source = f"EXPECTED_LINEUP_{n}", ("ROTOWIRE_EXPECTED_CONSENSUS" if rw_status == "SUCCESS" else "EXPECTED_LINEUP_CONSENSUS")
+            else:
+                status, source = f"BATTER_LINEUP_{n}", "PRIMARY_BATTER_LEVEL_LINEUP"
         else:
-            hand_avg, n = overall_avg, len(overall)
+            if hand.startswith("L") and vs_l:
+                hand_avg, n = sum(vs_l)/len(vs_l), len(vs_l)
+            elif hand.startswith("R") and vs_r:
+                hand_avg, n = sum(vs_r)/len(vs_r), len(vs_r)
+            else:
+                hand_avg, n = overall_avg, len(overall)
 
-        if not _a86_np.isfinite(hand_avg):
-            if hand.startswith("L"):
-                hand_avg = _a86_pct(row.get("Opp K% vs LHP Official"))
-            elif hand.startswith("R"):
-                hand_avg = _a86_pct(row.get("Opp K% vs RHP Official"))
+            if not _a86_np.isfinite(hand_avg):
+                if hand.startswith("L"):
+                    hand_avg = _a86_pct(row.get("Opp K% vs LHP Official"))
+                elif hand.startswith("R"):
+                    hand_avg = _a86_pct(row.get("Opp K% vs RHP Official"))
 
-        if not _a86_np.isfinite(overall_avg):
-            overall_avg = _a86_pct(row.get("Team Batter K% Overall Official"))
+            if not _a86_np.isfinite(overall_avg):
+                overall_avg = _a86_pct(row.get("Team Batter K% Overall Official"))
 
-        if n >= 9:
-            status, source = "CONFIRMED/COMPLETE_9", "BATTER_LEVEL_LINEUP"
-        elif n >= 7:
-            status, source = "NEAR_COMPLETE_7_8", "BATTER_LEVEL_LINEUP"
-        elif n > 0:
-            status, source = f"PARTIAL_LINEUP_{n}", "BATTER_LEVEL_LINEUP"
-        else:
-            status, source = "TEAM_RATE_FALLBACK", "OFFICIAL_TEAM_K_RATE_FALLBACK"
+            if n >= 9:
+                status, source = "COMPLETE_9", "BATTER_LEVEL_LINEUP"
+            elif n >= 7:
+                status, source = "NEAR_COMPLETE_7_8", "BATTER_LEVEL_LINEUP"
+            elif n > 0:
+                status, source = f"PARTIAL_LINEUP_{n}", "BATTER_LEVEL_LINEUP"
+            else:
+                status, source = "TEAM_RATE_FALLBACK", "OFFICIAL_TEAM_K_RATE_FALLBACK"
 
         team_vals.append(overall_avg*100 if _a86_np.isfinite(overall_avg) else _a86_np.nan)
         hand_vals.append(hand_avg*100 if _a86_np.isfinite(hand_avg) else _a86_np.nan)
