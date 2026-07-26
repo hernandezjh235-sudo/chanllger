@@ -41052,6 +41052,230 @@ def build_kproj_table(board):
     return _savant_apply_official_inputs(_SAVANT_PREV_BUILD_K(board))
 
 
+# =============================================================================
+# BASEBALL SAVANT CUSTOM PITCHER LEADERBOARD
+# Uses the official custom leaderboard URL for season-level pitcher K%, BB%,
+# whiff, xwOBA, barrel, hard-hit, and swing context.
+# =============================================================================
+SAVANT_CUSTOM_PITCHER_VERSION = "SAVANT_CUSTOM_PITCHER_LEADERBOARD_2026_07_26"
+SAVANT_CUSTOM_PITCHER_URL = (
+    "https://baseballsavant.mlb.com/leaderboard/custom?"
+    "year={year}&type=pitcher&filter=&min={min_filter}&"
+    "selections=pa%2Ck_percent%2Cbb_percent%2Cwoba%2Cxwoba%2Csweet_spot_percent%2C"
+    "barrel_batted_rate%2Chard_hit_percent%2Cavg_best_speed%2Cavg_hyper_speed%2C"
+    "whiff_percent%2Cswing_percent&chart=false&x=pa&y=pa&r=no&chartType=beeswarm&"
+    "sort=xwoba&sortDir=asc"
+)
+
+
+def _svcustom_season_year():
+    try:
+        y = int(datetime.now().year)
+        return max(2026, y)
+    except Exception:
+        return 2026
+
+
+def _svcustom_norm_col(col):
+    return str(col or "").strip().lower().replace(" ", "_").replace("-", "_").replace(".", "").replace("%", "_percent")
+
+
+def _svcustom_norm_name(name):
+    try:
+        return normalize_name(name)
+    except Exception:
+        return str(name or "").lower().strip()
+
+
+def _svcustom_first_col(df, candidates):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    norm_map = {_svcustom_norm_col(c): c for c in df.columns}
+    for c in candidates:
+        if _svcustom_norm_col(c) in norm_map:
+            return norm_map[_svcustom_norm_col(c)]
+    for c in df.columns:
+        nc = _svcustom_norm_col(c)
+        if any(_svcustom_norm_col(x) in nc for x in candidates):
+            return c
+    return None
+
+
+def _svcustom_csv_from_url(url):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 MLBKPropEngine SavantCustom",
+            "Accept": "text/csv,text/plain,*/*",
+            "Referer": "https://baseballsavant.mlb.com/leaderboard/custom",
+        }
+        for suffix in ["&csv=true", "&csv=1", ""]:
+            r = requests.get(url + suffix, headers=headers, timeout=22)
+            if r.status_code != 200:
+                continue
+            text = str(r.text or "").strip()
+            if not text or "<html" in text[:250].lower():
+                continue
+            try:
+                parsed = pd.read_csv(io.StringIO(text))
+            except Exception:
+                continue
+            if isinstance(parsed, pd.DataFrame) and not parsed.empty and len(parsed.columns) >= 4:
+                return parsed
+    except Exception as e:
+        try:
+            log_source_request(url, "SAVANT_CUSTOM_ERROR", str(e)[:220])
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_savant_custom_pitcher_leaderboard(year=None):
+    """Official Baseball Savant custom leaderboard, with a wider low-min fallback."""
+    year = int(year or _svcustom_season_year())
+    frames = []
+    for min_filter in ["q", "0"]:
+        url = SAVANT_CUSTOM_PITCHER_URL.format(year=year, min_filter=min_filter)
+        df = _svcustom_csv_from_url(url)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df = df.copy()
+            df["Savant Custom Min Filter"] = min_filter
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    id_col = _svcustom_first_col(out, ["player_id", "mlb_id", "entity_id", "pitcher_id"])
+    name_col = _svcustom_first_col(out, ["player_name", "name", "last_name, first_name", "last_name_first_name"])
+    if name_col:
+        out["_svcustom_name_norm"] = out[name_col].map(_svcustom_norm_name)
+    if id_col:
+        out["_svcustom_player_id"] = pd.to_numeric(out[id_col], errors="coerce")
+        out = out.sort_values("Savant Custom Min Filter").drop_duplicates("_svcustom_player_id", keep="first")
+    elif name_col:
+        out = out.sort_values("Savant Custom Min Filter").drop_duplicates("_svcustom_name_norm", keep="first")
+    return out
+
+
+def _svcustom_match_pitcher(row, table):
+    if table is None or not isinstance(table, pd.DataFrame) or table.empty:
+        return None
+    pid = _savant_pitcher_id_from_row(row)
+    if pid is not None and "_svcustom_player_id" in table.columns:
+        matches = table[pd.to_numeric(table["_svcustom_player_id"], errors="coerce").eq(float(pid))]
+        if not matches.empty:
+            return matches.iloc[0].to_dict()
+    name = str(row.get("Pitcher") or row.get("pitcher") or row.get("Player") or "").strip()
+    n = _svcustom_norm_name(name)
+    if n and "_svcustom_name_norm" in table.columns:
+        exact = table[table["_svcustom_name_norm"].astype(str).eq(n)]
+        if not exact.empty:
+            return exact.iloc[0].to_dict()
+        scores = []
+        for idx, val in table["_svcustom_name_norm"].astype(str).items():
+            try:
+                scores.append((name_score(n, val), idx))
+            except Exception:
+                scores.append((0, idx))
+        if scores:
+            best_score, best_idx = max(scores, key=lambda x: x[0])
+            if best_score >= 0.90:
+                return table.loc[best_idx].to_dict()
+    return None
+
+
+def _svcustom_get_stat(rec, candidates):
+    if not isinstance(rec, dict):
+        return np.nan
+    norm_lookup = {_svcustom_norm_col(k): k for k in rec.keys()}
+    for c in candidates:
+        key = norm_lookup.get(_svcustom_norm_col(c))
+        if key is not None:
+            v = _savant_num(rec.get(key), np.nan)
+            if np.isfinite(v):
+                return v * 100.0 if abs(v) <= 1 and "percent" in _svcustom_norm_col(c) else v
+    return np.nan
+
+
+def _svcustom_set_if_real(row, key, value):
+    if np.isfinite(_savant_num(value, np.nan)):
+        row[key] = round(float(value), 3)
+
+
+def _svcustom_blank(value):
+    return value in (None, "", "—", "nan", "NaN") or (isinstance(value, float) and not np.isfinite(value))
+
+
+def _svcustom_apply_pitcher_leaderboard(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    table = get_savant_custom_pitcher_leaderboard(_svcustom_season_year())
+    out_rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        rec = _svcustom_match_pitcher(row, table)
+        row["Savant Custom Version"] = SAVANT_CUSTOM_PITCHER_VERSION
+        if not rec:
+            row["Savant Custom Status"] = "NO_MATCH"
+            row["Savant Custom Source"] = "Baseball Savant Custom Leaderboard"
+            out_rows.append(row)
+            continue
+
+        stats = {
+            "Savant Custom PA": _svcustom_get_stat(rec, ["pa"]),
+            "Savant Custom K%": _svcustom_get_stat(rec, ["k_percent", "k%"]),
+            "Savant Custom BB%": _svcustom_get_stat(rec, ["bb_percent", "bb%"]),
+            "Savant Custom wOBA": _svcustom_get_stat(rec, ["woba"]),
+            "Savant Custom xwOBA": _svcustom_get_stat(rec, ["xwoba"]),
+            "Savant Custom SweetSpot%": _svcustom_get_stat(rec, ["sweet_spot_percent", "sweet_spot%"]),
+            "Savant Custom Barrel%": _svcustom_get_stat(rec, ["barrel_batted_rate", "barrel_percent", "barrel%"]),
+            "Savant Custom HardHit%": _svcustom_get_stat(rec, ["hard_hit_percent", "hard_hit%"]),
+            "Savant Custom Avg Best Speed": _svcustom_get_stat(rec, ["avg_best_speed"]),
+            "Savant Custom Avg Hyper Speed": _svcustom_get_stat(rec, ["avg_hyper_speed"]),
+            "Savant Custom Whiff%": _svcustom_get_stat(rec, ["whiff_percent", "whiff%"]),
+            "Savant Custom Swing%": _svcustom_get_stat(rec, ["swing_percent", "swing%"]),
+        }
+        row["Savant Custom Status"] = "SUCCESS"
+        row["Savant Custom Source"] = "Baseball Savant Custom Leaderboard"
+        row["Savant Custom Min Filter"] = rec.get("Savant Custom Min Filter", "")
+        for key, val in stats.items():
+            _svcustom_set_if_real(row, key, val)
+
+        official_k = _savant_num(row.get("Savant Custom K%"), np.nan)
+        current_k = _savant_num(row.get("APP97 Raw MLB Season Pitcher K%"), np.nan)
+        if np.isfinite(official_k) and (not np.isfinite(current_k) or abs(current_k - official_k) >= 1.5 or _svcustom_blank(row.get("APP97 Pitcher K Source"))):
+            row["APP97 Raw MLB Season Pitcher K%"] = round(float(official_k), 1)
+            row["APP97 Pitcher K Source"] = "SAVANT_CUSTOM_LEADERBOARD"
+            row["APP97 Pitcher K% Warning"] = "OK"
+        if _svcustom_blank(row.get("Pitcher K% Used")) and np.isfinite(official_k):
+            row["Pitcher K% Used"] = round(float(official_k), 1)
+        for generic, custom in [
+            ("Official Savant K%", "Savant Custom K%"),
+            ("Official Savant BB%", "Savant Custom BB%"),
+            ("Official Savant Whiff%", "Savant Custom Whiff%"),
+            ("Official Savant Swing%", "Savant Custom Swing%"),
+            ("Official Savant HardHit%", "Savant Custom HardHit%"),
+            ("Official Savant Barrel%", "Savant Custom Barrel%"),
+            ("Official Savant SweetSpot%", "Savant Custom SweetSpot%"),
+            ("Official Savant xwOBA", "Savant Custom xwOBA"),
+            ("Official Savant wOBA", "Savant Custom wOBA"),
+        ]:
+            if _svcustom_blank(row.get(generic)) and not _svcustom_blank(row.get(custom)):
+                row[generic] = row.get(custom)
+        if _svcustom_blank(row.get("Whiff%")) and not _svcustom_blank(row.get("Savant Custom Whiff%")):
+            row["Whiff%"] = row.get("Savant Custom Whiff%")
+        out_rows.append(row)
+    return pd.DataFrame(out_rows)
+
+
+_SVCUSTOM_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _SVCUSTOM_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _svcustom_apply_pitcher_leaderboard(_SVCUSTOM_PREV_BUILD_K(board))
+
+
 def _kreal_render_panel():
     st.markdown("#### K / PO Real Data Overrides")
     st.caption("Optional daily feed for umpire, pitch mix, leash, role/injury, damage risk, and bullpen context. Used by APP99; copy/paste slate stays clean.")
@@ -41510,6 +41734,334 @@ def build_kproj_table(board):
 
 
 # =============================================================================
+# EXTERNAL K INPUT OVERRIDES + RE-SIM
+#
+# Manual/Outlier-style correction layer for the exact fields that can wreck K
+# projections when stale: pitcher K%, opponent/team K% vs hand, BF/IP, and whiff.
+# It is OFF by default and only updates projection math when the UI toggle is on.
+# =============================================================================
+EXTERNAL_K_INPUT_VERSION = "EXTERNAL_K_INPUT_OVERRIDE_RESIM_2026_07_26"
+EXTERNAL_K_INPUT_FILE = os.path.join(STORAGE_DIR, "external_k_input_overrides.csv")
+
+EXTERNAL_K_TEMPLATE_COLUMNS = [
+    "Pitcher", "Matchup", "Hand", "Pitcher K%", "Opponent K% vs Hand",
+    "Expected BF", "IP Projection", "Whiff%", "CSW%", "Source", "Notes"
+]
+
+
+def _xk_norm_name(value):
+    try:
+        return normalize_name(value)
+    except Exception:
+        return str(value or "").strip().lower()
+
+
+def _xk_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _xk_pct_decimal(value, default=np.nan):
+    v = _xk_num(value, default)
+    if not np.isfinite(v):
+        return default
+    return v / 100.0 if abs(v) > 1.0 else v
+
+
+def _xk_pct_display(value, default=np.nan):
+    v = _xk_pct_decimal(value, default)
+    if not np.isfinite(v):
+        return default
+    return round(float(v * 100.0), 2)
+
+
+def _xk_load_overrides():
+    try:
+        if os.path.exists(EXTERNAL_K_INPUT_FILE):
+            return pd.read_csv(EXTERNAL_K_INPUT_FILE)
+    except Exception:
+        pass
+    return pd.DataFrame(columns=EXTERNAL_K_TEMPLATE_COLUMNS)
+
+
+def _xk_save_overrides(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return {"saved": 0, "path": EXTERNAL_K_INPUT_FILE}
+        out = df.copy()
+        for c in EXTERNAL_K_TEMPLATE_COLUMNS:
+            if c not in out.columns:
+                out[c] = ""
+        out = out[EXTERNAL_K_TEMPLATE_COLUMNS]
+        out = out[out["Pitcher"].astype(str).str.strip().ne("")]
+        out["_key"] = out["Pitcher"].astype(str).map(_xk_norm_name) + "|" + out["Matchup"].astype(str).str.upper().str.strip()
+        out = out.drop_duplicates("_key", keep="last").drop(columns=["_key"], errors="ignore")
+        out.to_csv(EXTERNAL_K_INPUT_FILE, index=False)
+        return {"saved": len(out), "path": EXTERNAL_K_INPUT_FILE, "version": EXTERNAL_K_INPUT_VERSION}
+    except Exception as e:
+        return {"saved": 0, "error": str(e)[:160], "path": EXTERNAL_K_INPUT_FILE}
+
+
+def _xk_parse_csv_upload(uploaded_file=None, text=""):
+    frames = []
+    try:
+        if uploaded_file is not None:
+            frames.append(pd.read_csv(uploaded_file))
+    except Exception:
+        pass
+    try:
+        if text and str(text).strip():
+            from io import StringIO
+            frames.append(pd.read_csv(StringIO(str(text).strip())))
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame(columns=EXTERNAL_K_TEMPLATE_COLUMNS)
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    for c in EXTERNAL_K_TEMPLATE_COLUMNS:
+        if c not in out.columns:
+            out[c] = ""
+    return out[EXTERNAL_K_TEMPLATE_COLUMNS]
+
+
+def _xk_override_for_row(row, overrides):
+    if overrides is None or not isinstance(overrides, pd.DataFrame) or overrides.empty:
+        return {}
+    pitcher = _xk_norm_name(row.get("Pitcher") or row.get("pitcher") or row.get("Player"))
+    matchup = str(row.get("Matchup") or row.get("matchup") or "").upper().strip()
+    if not pitcher:
+        return {}
+    try:
+        d = overrides.copy()
+        if "Pitcher" not in d.columns:
+            return {}
+        if "Matchup" not in d.columns:
+            d["Matchup"] = ""
+        d["_pitcher"] = d["Pitcher"].astype(str).map(_xk_norm_name)
+        d["_matchup"] = d["Matchup"].astype(str).str.upper().str.strip()
+        exact = d[(d["_pitcher"] == pitcher) & (d["_matchup"] == matchup)]
+        if not exact.empty:
+            return exact.tail(1).iloc[0].drop(labels=["_pitcher", "_matchup"], errors="ignore").to_dict()
+        loose = d[d["_pitcher"] == pitcher]
+        if not loose.empty:
+            return loose.tail(1).iloc[0].drop(labels=["_pitcher", "_matchup"], errors="ignore").to_dict()
+    except Exception:
+        return {}
+    return {}
+
+
+def _xk_side_from_proj(proj, line):
+    if not np.isfinite(proj) or not np.isfinite(line):
+        return "NO LINE"
+    if proj > line:
+        return "OVER"
+    if proj < line:
+        return "UNDER"
+    return "PUSH"
+
+
+def _xk_decision(proj, line):
+    side = _xk_side_from_proj(proj, line)
+    if side in {"NO LINE", "PUSH"}:
+        return "PASS"
+    edge = abs(proj - line)
+    if edge >= 1.00:
+        return f"🔥 {side}"
+    if edge >= 0.55:
+        return f"⚠️ {side} LEAN"
+    return f"TRACK {side}"
+
+
+def _xk_resim_row(row, override):
+    out = dict(row)
+    if not override:
+        out["External K Override"] = "NO"
+        out["External K Version"] = EXTERNAL_K_INPUT_VERSION
+        return out
+
+    line = _xk_num(out.get("UD/Line", out.get("Line")), np.nan)
+    old_proj = _xk_num(out.get("K PROJ", out.get("Final K Projection")), np.nan)
+    old_bf = _xk_num(out.get("APP97 Reconciled Expected BF", out.get("Exp BF", out.get("Projected BF"))), np.nan)
+    old_pitcher_k = _xk_pct_decimal(out.get("APP97 Raw MLB Season Pitcher K%", out.get("APP97 Live Pitcher K%", out.get("Pitcher K%"))), np.nan)
+    old_opp_k = _xk_pct_decimal(out.get("Opponent K% vs Pitcher Hand", out.get("APP97 Opponent K Environment")), np.nan)
+
+    new_pitcher_k = _xk_pct_decimal(override.get("Pitcher K%"), old_pitcher_k)
+    new_opp_k = _xk_pct_decimal(override.get("Opponent K% vs Hand"), old_opp_k)
+    new_bf = _xk_num(override.get("Expected BF"), old_bf)
+    new_ip = _xk_num(override.get("IP Projection"), np.nan)
+    whiff = _xk_pct_display(override.get("Whiff%"), np.nan)
+    csw = _xk_pct_display(override.get("CSW%"), np.nan)
+
+    if not np.isfinite(new_pitcher_k) or not np.isfinite(new_opp_k) or not np.isfinite(new_bf):
+        out["External K Override"] = "YES - INCOMPLETE"
+        out["External K Note"] = "missing pitcher K%, opponent K%, or expected BF"
+        out["External K Version"] = EXTERNAL_K_INPUT_VERSION
+        return out
+
+    try:
+        matchup_k = calculate_log5_k_rate(new_pitcher_k, new_opp_k, LEAGUE_AVG_K)
+    except Exception:
+        matchup_k = max(0.08, min(0.50, (new_pitcher_k + new_opp_k) / 2.0))
+    resim_proj = float(max(0.0, min(14.0, new_bf * matchup_k)))
+
+    # Keep a light anchor to the existing winning-file projection so one manual
+    # field cannot create a wild move unless BF/K inputs clearly support it.
+    if np.isfinite(old_proj):
+        resim_proj = (0.72 * resim_proj) + (0.28 * old_proj)
+    resim_proj = round(float(resim_proj), 2)
+
+    out["Pre-External K PROJ"] = old_proj if np.isfinite(old_proj) else ""
+    out["External Pitcher K%"] = _xk_pct_display(new_pitcher_k)
+    out["External Opp K% vs Hand"] = _xk_pct_display(new_opp_k)
+    out["External Expected BF"] = round(float(new_bf), 2)
+    out["External K Projection"] = resim_proj
+    out["External K Source"] = override.get("Source", "External manual/Outlier CSV")
+    out["External K Notes"] = override.get("Notes", "")
+    out["External K Override"] = "YES"
+    out["External K Version"] = EXTERNAL_K_INPUT_VERSION
+
+    for c in ["K PROJ", "Final K Projection", "Official K PROJ", "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection"]:
+        if c in out:
+            out[c] = resim_proj
+    if np.isfinite(line):
+        edge = round(resim_proj - line, 2)
+        for c in ["Edge", "Edge Gap", "Official K Edge", "Final K Edge", "Line-Aware Smart Edge", "Winning File K Edge"]:
+            if c in out:
+                out[c] = edge
+        side = _xk_side_from_proj(resim_proj, line)
+        out["External K Side"] = side
+        out["Winning File K Side"] = side
+        decision = _xk_decision(resim_proj, line)
+        for c in ["Decision", "Main Engine Action", "Line-Aware Smart Decision", "Winning File K Decision"]:
+            if c in out:
+                out[c] = decision
+        try:
+            prob_over = poisson_over_probability(resim_proj, line)
+            current_prob = prob_over if side == "OVER" else (1.0 - prob_over if side == "UNDER" else np.nan)
+            if np.isfinite(current_prob):
+                out["External K Sim Side Prob %"] = round(current_prob * 100.0, 1)
+                out["K Sim Current Side Prob %"] = round(current_prob * 100.0, 1)
+        except Exception:
+            pass
+
+    out["Pitcher K%"] = round(float(new_pitcher_k), 4)
+    out["Pitcher K% Used"] = _xk_pct_display(new_pitcher_k)
+    out["APP97 Raw MLB Season Pitcher K%"] = _xk_pct_display(new_pitcher_k)
+    out["APP97 Pitcher K Source"] = "EXTERNAL_OVERRIDE"
+    out["Opponent K% vs Pitcher Hand"] = _xk_pct_display(new_opp_k)
+    out["Opponent K% vs Pitcher Hand Source"] = "EXTERNAL_OVERRIDE"
+    out["APP97 Opponent K Environment"] = _xk_pct_display(new_opp_k)
+    out["APP97 Reconciled Expected BF"] = round(float(new_bf), 2)
+    out["Exp BF"] = round(float(new_bf), 2)
+    if np.isfinite(new_ip):
+        for c in ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"]:
+            if c in out:
+                out[c] = round(float(new_ip), 2)
+    if np.isfinite(whiff):
+        out["Whiff%"] = whiff
+        out["Official Savant Whiff%"] = out.get("Official Savant Whiff%", whiff)
+    if np.isfinite(csw):
+        out["Recent CSW%"] = csw
+        out["Official Savant CSW%"] = out.get("Official Savant CSW%", csw)
+    out["Projection Data Gate"] = "GREEN - EXTERNAL VERIFIED"
+    out["Projection Data Issues"] = "none"
+    return out
+
+
+def _xk_apply_overrides(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    enabled = bool(st.session_state.get("enable_external_k_resim", False)) if "st" in globals() else False
+    out = df.copy()
+    if not enabled:
+        out["External K Override"] = "OFF"
+        out["External K Version"] = EXTERNAL_K_INPUT_VERSION
+        return out
+    overrides = _xk_load_overrides()
+    rows = []
+    for _, rr in out.iterrows():
+        row = rr.to_dict()
+        rows.append(_xk_resim_row(row, _xk_override_for_row(row, overrides)))
+    return pd.DataFrame(rows)
+
+
+_XK_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _XK_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _xk_apply_overrides(_XK_PREV_BUILD_K(board))
+
+
+def _xk_render_override_panel(current_df=None):
+    st.markdown("#### External K Inputs / Re-Sim")
+    st.caption("Optional. Use this for Outlier/manual corrections to pitcher K%, opponent K% vs hand, BF, IP, whiff, and CSW. When enabled, K PROJ is re-simmed from those inputs.")
+    st.toggle(
+        "Use external K inputs to re-sim projections",
+        value=bool(st.session_state.get("enable_external_k_resim", False)),
+        key="enable_external_k_resim",
+    )
+
+    current = _xk_load_overrides()
+    if current is None or current.empty:
+        seed_rows = []
+        if isinstance(current_df, pd.DataFrame) and not current_df.empty:
+            for _, rr in current_df.head(30).iterrows():
+                row = rr.to_dict()
+                seed_rows.append({
+                    "Pitcher": row.get("Pitcher", ""),
+                    "Matchup": row.get("Matchup", ""),
+                    "Hand": row.get("Pitcher Hand", ""),
+                    "Pitcher K%": _xk_pct_display(row.get("APP97 Raw MLB Season Pitcher K%", row.get("APP97 Live Pitcher K%", row.get("Pitcher K%"))), ""),
+                    "Opponent K% vs Hand": _xk_pct_display(row.get("Opponent K% vs Pitcher Hand", row.get("APP97 Opponent K Environment")), ""),
+                    "Expected BF": row.get("APP97 Reconciled Expected BF", row.get("Exp BF", "")),
+                    "IP Projection": row.get("IP Floor", row.get("IP Projection", "")),
+                    "Whiff%": row.get("Official Savant Whiff%", row.get("Whiff%", "")),
+                    "CSW%": row.get("Official Savant CSW%", row.get("Recent CSW%", "")),
+                    "Source": "",
+                    "Notes": "",
+                })
+        current = pd.DataFrame(seed_rows or [{c: "" for c in EXTERNAL_K_TEMPLATE_COLUMNS}])
+    for c in EXTERNAL_K_TEMPLATE_COLUMNS:
+        if c not in current.columns:
+            current[c] = ""
+    current = current[EXTERNAL_K_TEMPLATE_COLUMNS]
+
+    edited = st.data_editor(
+        current,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        key="external_k_override_editor",
+    )
+    c1, c2 = st.columns(2)
+    if c1.button("Save external K inputs", use_container_width=True, key="save_external_k_inputs"):
+        st.write(_xk_save_overrides(edited))
+    template = pd.DataFrame([{c: "" for c in EXTERNAL_K_TEMPLATE_COLUMNS}])
+    c2.download_button(
+        "Download external K template",
+        template.to_csv(index=False),
+        file_name="external_k_input_template.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="download_external_k_template",
+    )
+    uploaded = st.file_uploader("Upload external K CSV", type=["csv"], key="external_k_upload")
+    pasted = st.text_area("Or paste external K CSV", height=100, key="external_k_paste")
+    parsed = _xk_parse_csv_upload(uploaded, pasted)
+    if isinstance(parsed, pd.DataFrame) and not parsed.empty and parsed["Pitcher"].astype(str).str.strip().ne("").any():
+        st.dataframe(parsed, use_container_width=True, hide_index=True)
+        if st.button("Save uploaded/pasted external K CSV", use_container_width=True, key="save_external_k_uploaded"):
+            st.write(_xk_save_overrides(parsed))
+
+
+# =============================================================================
 # APP99 RIGHT-WINS DATA GATE
 # Final audit layer for missing inputs that usually cause losses.
 # It does not overwrite K PROJ. It flags Fire/Lean/Track readiness using:
@@ -41564,7 +42116,7 @@ def _app99_right_wins_row(row):
     whiff = _app99_num(_app99_text(row, ["Official Savant Whiff%", "APP85 PutAway Rate", "Putaway/Whiff", "Atlas Putaway Used", "Whiff%", "Recent SwStr%"]), np.nan)
     csw = _app99_num(_app99_text(row, ["Official Savant CSW%", "Recent CSW%", "CSW%"]), np.nan)
     chase = _app99_num(_app99_text(row, ["Official Savant Chase%", "Recent Chase%", "Chase%"]), np.nan)
-    official_k_pct = _app99_num(_app99_text(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"]), np.nan)
+    official_k_pct = _app99_num(_app99_text(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"]), np.nan)
     hand_warning = _app99_text(row, ["Handedness Split Warning"]).upper()
     data_gate = _app99_text(row, ["Projection Data Gate"]).upper()
     data_issues = _app99_text(row, ["Projection Data Issues"]).upper()
@@ -41805,9 +42357,9 @@ def _kclean_main_df(df):
     rows = []
     for _, rr in df.iterrows():
         row = rr.to_dict()
-        pitcher_k_raw = _kclean_pick(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"], "")
+        pitcher_k_raw = _kclean_pick(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"], "")
         pitcher_k_display = _kclean_pct_display(pitcher_k_raw)
-        pitcher_k_source = _kclean_pick(row, ["APP97 Pitcher K Source", "APP97 Pitcher K% Display Source", "Official Savant Source"], "")
+        pitcher_k_source = _kclean_pick(row, ["APP97 Pitcher K Source", "APP97 Pitcher K% Display Source", "Savant Custom Source", "Official Savant Source"], "")
         rows.append({
             "Pitcher": _kclean_pick(row, ["Pitcher", "pitcher", "Player"], ""),
             "Matchup": _kclean_pick(row, ["Matchup", "matchup"], ""),
@@ -41816,6 +42368,7 @@ def _kclean_main_df(df):
             "Edge": _kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], ""),
             "Pick": _kclean_display_decision(row),
             "K Source": _kclean_pick(row, ["Winning File K Source", "Active K Pipeline", "File33 Projection Source"], ""),
+            "External": _kclean_pick(row, ["External K Override"], ""),
             "Sim Side %": _kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], ""),
             "Lineup": _kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], ""),
             "Hand": _kclean_pick(row, ["Pitcher Hand", "Hand", "Throws"], ""),
@@ -41823,8 +42376,8 @@ def _kclean_main_df(df):
             "Opp K Source": _kclean_pick(row, ["Opponent K% vs Pitcher Hand Source", "Handedness Source"], ""),
             "Pitcher K%": pitcher_k_display,
             "Pitcher K Source": pitcher_k_source,
-            "Whiff": _kclean_pick(row, ["Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate", "Recent SwStr%"], ""),
-            "Savant": _kclean_pick(row, ["Official Savant K Skill Signal", "Official Savant Status"], ""),
+            "Whiff": _kclean_pick(row, ["Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate", "Recent SwStr%"], ""),
+            "Savant": _kclean_pick(row, ["Savant Custom Status", "Official Savant K Skill Signal", "Official Savant Status"], ""),
             "Win Gate": _kclean_pick(row, ["APP99 Right Wins Gate"], ""),
             "Win Score": _kclean_pick(row, ["APP99 Right Wins Score"], ""),
             "Data Gate": _kclean_pick(row, ["Projection Data Gate"], ""),
@@ -41925,7 +42478,156 @@ def _kclean_card_decision(row):
     return side, edge, prob, tier
 
 
-def _kclean_render_player_cards(df, limit=18):
+def _kcard_split_matchup(matchup):
+    try:
+        text = str(matchup or "").upper().replace(" VS ", " @ ")
+        if "@" in text:
+            a, h = [x.strip() for x in text.split("@", 1)]
+            return _rw_norm_team_abbr(a), _rw_norm_team_abbr(h)
+    except Exception:
+        pass
+    return "", ""
+
+
+def _kcard_board_lookup(board):
+    lookup = {}
+    for p in board or []:
+        try:
+            nm = str(p.get("pitcher") or p.get("Pitcher") or "").strip()
+            if nm:
+                lookup[normalize_name(nm)] = p
+        except Exception:
+            continue
+    return lookup
+
+
+def _kcard_team_logo(abbr):
+    try:
+        if "_ml_ui_logo" in globals():
+            url = _ml_ui_logo(abbr)
+            if url:
+                return url
+        if "ml_team_logo_url" in globals():
+            url = ml_team_logo_url(abbr)
+            if url:
+                return url
+    except Exception:
+        pass
+    tid = _ML_TEAM_IDS.get(str(abbr or "").upper().strip()) if "_ML_TEAM_IDS" in globals() else None
+    return f"https://www.mlbstatic.com/team-logos/{tid}.svg" if tid else ""
+
+
+def _kcard_pitcher_team(row, p):
+    for src in [p or {}, row or {}]:
+        for key in ["team", "Team", "Pitcher Team", "pitcher_team"]:
+            val = str(src.get(key) or "").upper().strip()
+            if val:
+                return _rw_norm_team_abbr(val)
+    away, home = _kcard_split_matchup((row or {}).get("Matchup") or (p or {}).get("matchup"))
+    return away
+
+
+def _kcard_opp_team(row, p):
+    for src in [p or {}, row or {}]:
+        for key in ["opponent", "Opponent", "Opp", "Opp Team", "opp_team"]:
+            val = str(src.get(key) or "").upper().strip()
+            if val:
+                return _rw_norm_team_abbr(val)
+    away, home = _kcard_split_matchup((row or {}).get("Matchup") or (p or {}).get("matchup"))
+    team = _kcard_pitcher_team(row, p)
+    if away and home and team:
+        return home if team == away else away if team == home else home
+    return home or away
+
+
+def _kcard_lineup_rows(row, p):
+    rows = []
+    try:
+        rows = [r for r in ((p or {}).get("lineup_rows") or []) if isinstance(r, dict)]
+    except Exception:
+        rows = []
+    if len(rows) >= 5:
+        return rows[:9], str((p or {}).get("lineup_source_detail") or (p or {}).get("lineup_note") or "Saved matchup lineup")
+
+    opp_id = None
+    try:
+        opp_id = (p or {}).get("opp_team_id") or (row or {}).get("opp_team_id") or (row or {}).get("Opponent Team ID")
+        opp_id = int(float(opp_id)) if opp_id not in (None, "", "nan") else None
+    except Exception:
+        opp_id = None
+    opp_abbr = _kcard_opp_team(row, p)
+    if not opp_id and "_ML_TEAM_IDS" in globals():
+        opp_id = _ML_TEAM_IDS.get(str(opp_abbr or "").upper())
+    hand = str(_kclean_pick(row or {}, ["Pitcher Hand", "Hand", "Throws"], (p or {}).get("hand", "")) or "").upper()
+    if opp_id and "build_mlb_projected_lineup_rows" in globals():
+        try:
+            built = build_mlb_projected_lineup_rows(opp_id, pitcher_hand=hand, before_date=None) or []
+            if len(built) >= 5:
+                return built[:9], f"MLB projected recent lineup ({opp_abbr})"
+        except Exception:
+            pass
+    return [], "Lineup rows not loaded yet"
+
+
+def _kcard_pct_val(row, keys, default="—"):
+    val = _kclean_pick(row, keys, "")
+    text = str(_kclean_pct_display(val, blank="")).strip()
+    return text if text else str(default)
+
+
+def _kcard_lineup_html(rows):
+    if not rows:
+        return '<div class="kc-empty">No batter-by-batter lineup loaded yet. Refresh/load projected or confirmed lineups to fill this section.</div>'
+    trs = []
+    for idx, r in enumerate(rows[:9], start=1):
+        batter = html.escape(str(r.get("Batter") or r.get("Player") or r.get("Name") or ""))
+        hand = html.escape(str(r.get("Hand") or r.get("Bats") or ""))
+        used = _kclean_fmt(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), 1)
+        split = _kclean_fmt(r.get("Split K%") if r.get("Split K%") is not None else r.get("K% vs Hand"), 1)
+        season = _kclean_fmt(r.get("Season K%") if r.get("Season K%") is not None else r.get("K%"), 1)
+        src = html.escape(str(r.get("K Source") or r.get("Lineup Source") or "")[:34])
+        val = _kclean_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan)
+        flag = "★" if np.isfinite(val) and val >= 25 else "△" if np.isfinite(val) and val <= 16 else ""
+        cls = "hi" if np.isfinite(val) and val >= 25 else "lo" if np.isfinite(val) and val <= 16 else ""
+        trs.append(f"<tr><td>{idx}</td><td>{batter} <b class='{cls}'>{flag}</b></td><td>{hand}</td><td class='{cls}'>{used}</td><td>{split}</td><td>{season}</td><td>{src}</td></tr>")
+    return "<table class='kc-lineup'><thead><tr><th>#</th><th>Batter</th><th>Hand</th><th>K% Used</th><th>vs Hand</th><th>Season</th><th>Source</th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>"
+
+
+def _kclean_render_app88_audit_helpers(df, board):
+    """Bring the useful APP88 UI audits into the final clean K tab."""
+    try:
+        board_names = []
+        seen = set()
+        for p in board or []:
+            nm = str((p or {}).get("pitcher") or (p or {}).get("Pitcher") or "").strip()
+            key = normalize_name(nm)
+            if nm and key not in seen:
+                seen.add(key)
+                board_names.append(nm)
+        row_names = []
+        if isinstance(df, pd.DataFrame) and not df.empty and "Pitcher" in df.columns:
+            row_names = [str(x).strip() for x in df["Pitcher"].dropna().astype(str).tolist() if str(x).strip()]
+        card_count = len(set(normalize_name(x) for x in board_names))
+        row_count = len(set(normalize_name(x) for x in row_names))
+        st.caption(f"Player-card coverage check: {card_count} available board cards for {row_count} final projection rows.")
+        if row_count and card_count < row_count:
+            st.warning(f"Card count mismatch: board cards={card_count}, projection rows={row_count}. Check pitcher-name/team mapping.")
+    except Exception:
+        pass
+
+    try:
+        with st.expander("Opponent Team K Rank Audit — Top 5 by split", expanded=False):
+            st.caption("Audit only. Uses the same official team K split pull as the matchup/rank boxes. Rank #1 = highest team K%.")
+            ktop = _okr_top5_test_table() if "_okr_top5_test_table" in globals() else pd.DataFrame()
+            if isinstance(ktop, pd.DataFrame) and not ktop.empty:
+                st.dataframe(ktop, use_container_width=True, hide_index=True)
+            else:
+                st.info("No verified Top-5 K rank table returned yet. If this is blank, the MLB endpoint/cache did not populate.")
+    except Exception:
+        pass
+
+
+def _kclean_render_player_cards(df, board=None, limit=None):
     try:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             return
@@ -41938,73 +42640,106 @@ def _kclean_render_player_cards(df, limit=18):
             abs(_kclean_num(_kclean_pick(r.to_dict(), ["Official K Edge", "Edge Gap", "Final K Edge", "Winning File K Edge"], ""), 0.0) or 0.0)
             for _, r in d.iterrows()
         ]
-        d = d.sort_values("_edge_abs", ascending=False).head(limit)
+        d = d.sort_values("_edge_abs", ascending=False)
+        if limit is not None:
+            d = d.head(int(limit))
+        board_lookup = _kcard_board_lookup(board)
         css = """
         <style>
-        .kcard-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(285px,1fr));gap:14px;margin:14px 0 8px;}
-        .kcard{background:linear-gradient(180deg,#101520 0%,#0b0d13 100%);border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:15px 15px 13px;box-shadow:0 10px 24px rgba(0,0,0,.22);}
-        .kcard-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:10px;}
-        .kcard-name{font-size:18px;font-weight:850;color:#f5f7fb;line-height:1.15;}
-        .kcard-sub{font-size:12px;color:#9da6b7;margin-top:4px;}
-        .kcard-badge{border:1px solid rgba(255,205,80,.55);background:rgba(255,190,60,.10);color:#ffd66b;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:800;white-space:nowrap;}
-        .kcard-call{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;background:#141a27;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:11px 12px;margin-bottom:11px;}
-        .kcard-proj{font-size:32px;font-weight:950;color:#ff4778;letter-spacing:0;}
-        .kcard-side{font-size:18px;font-weight:950;text-align:right;}
-        .kcard-over{color:#33e36f}.kcard-under{color:#ffc247}.kcard-track{color:#a7b0c0}
-        .kcard-bar{height:5px;border-radius:999px;background:#242b3a;overflow:hidden;margin-top:8px;}
-        .kcard-fill{height:100%;background:linear-gradient(90deg,#2fa7ff,#49f07a);}
-        .kcard-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:10px 0;}
-        .kstat{background:#111722;border:1px solid rgba(255,255,255,.07);border-radius:9px;padding:8px;}
-        .kstat-label{font-size:10px;color:#8e98aa;text-transform:uppercase;font-weight:800;}
-        .kstat-val{font-size:15px;color:#f7f8fb;font-weight:850;margin-top:2px;}
-        .kcard-note{font-size:12px;color:#c7cfdd;border-top:1px solid rgba(255,255,255,.08);padding-top:9px;line-height:1.35;}
-        .kcard-good{color:#42e878}.kcard-warn{color:#ffc247}.kcard-bad{color:#ff6b6b}
+        *{box-sizing:border-box}body{margin:0;background:#05070b;color:#f5f7fb;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        .kcard-stack{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px;padding:4px 0 14px}
+        .kcard{background:linear-gradient(180deg,#101622 0%,#090b11 100%);border:1px solid rgba(95,124,171,.38);border-radius:16px;padding:15px;box-shadow:0 12px 30px rgba(0,0,0,.32)}
+        .kc-top{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;margin-bottom:12px}
+        .kc-logo{width:38px;height:38px;object-fit:contain;background:#121a29;border:1px solid rgba(255,255,255,.10);border-radius:999px;padding:4px}
+        .kc-name{font-size:21px;font-weight:900;line-height:1.05}.kc-sub{font-size:12px;color:#9da7b9;margin-top:4px}
+        .kc-badge{border:1px solid rgba(255,211,83,.72);background:rgba(255,194,62,.11);border-radius:999px;color:#ffd760;font-weight:900;font-size:12px;padding:5px 9px;white-space:nowrap}
+        .kc-main{background:radial-gradient(circle at top right,rgba(46,101,169,.24),transparent 55%),#121927;border:1px solid rgba(173,199,237,.18);border-radius:13px;padding:13px;margin-bottom:10px}
+        .kc-prow{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.kc-label{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#929db0;font-weight:900}
+        .kc-proj{font-size:40px;line-height:.95;color:#ff4778;font-weight:950}.kc-side{text-align:right;font-size:22px;font-weight:950}.kc-side.over{color:#38e56d}.kc-side.under{color:#ffd04c}.kc-side.track{color:#aab4c5}
+        .kc-edge{font-size:12px;color:#cdd5e3;margin-top:6px}.kc-bar{height:5px;background:#242c3a;border-radius:999px;overflow:hidden;margin-top:10px}.kc-fill{height:100%;background:linear-gradient(90deg,#2fa7ff,#43ee78)}
+        .kc-metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:7px;margin:10px 0}.kc-stat{background:#101723;border:1px solid rgba(255,255,255,.08);border-radius:9px;padding:8px;min-width:0}.kc-stat b{display:block;font-size:15px;white-space:nowrap}.kc-stat span{display:block;font-size:9px;color:#8e98aa;font-weight:900;text-transform:uppercase;margin-bottom:3px}
+        .kc-section{background:#0e131d;border:1px solid rgba(255,255,255,.08);border-radius:11px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#dce5f5;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#8ebdff;font-size:11px}
+        .kc-lineup{width:100%;border-collapse:collapse;font-size:12px}.kc-lineup th{color:#8994a8;text-align:left;font-size:10px;text-transform:uppercase;padding:6px;border-bottom:1px solid #242b38}.kc-lineup td{padding:6px;border-bottom:1px solid #1b2230;white-space:nowrap}.kc-lineup td:nth-child(2){white-space:normal;font-weight:800}.kc-lineup .hi{color:#42e878}.kc-lineup .lo{color:#ffbc47}.kc-empty{color:#9ea8bb;font-size:12px;line-height:1.4}
+        .kc-note{font-size:12px;color:#cbd3e0;line-height:1.35}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
+        @media(max-width:640px){.kcard-stack{grid-template-columns:1fr}.kc-metrics{grid-template-columns:repeat(3,1fr)}.kc-proj{font-size:36px}.kc-lineup{font-size:11px}.kc-lineup th:nth-child(7),.kc-lineup td:nth-child(7){display:none}}
         </style>
         """
         cards = []
         for _, rr in d.iterrows():
             row = rr.to_dict()
-            pitcher = html.escape(str(row.get("Pitcher") or row.get("pitcher") or ""))
-            matchup = html.escape(str(row.get("Matchup") or ""))
-            hand = html.escape(str(_kclean_pick(row, ["Pitcher Hand", "Hand", "Throws"], "UNK")))
+            raw_pitcher = str(row.get("Pitcher") or row.get("pitcher") or "")
+            p = board_lookup.get(normalize_name(raw_pitcher), {})
+            pitcher = html.escape(raw_pitcher)
+            raw_matchup = str(row.get("Matchup") or (p or {}).get("matchup") or "")
+            matchup = html.escape(raw_matchup)
+            hand = html.escape(str(_kclean_pick(row, ["Pitcher Hand", "Hand", "Throws"], (p or {}).get("hand", "UNK"))))
+            team = _kcard_pitcher_team(row, p)
+            opp = _kcard_opp_team(row, p)
+            tlogo = _kcard_team_logo(team)
+            ologo = _kcard_team_logo(opp)
+            logo_html = f"<img class='kc-logo' src='{html.escape(tlogo)}' />" if tlogo else f"<div class='kc-logo'>{html.escape(team[:3] or 'MLB')}</div>"
             line = _kclean_fmt(_kclean_pick(row, ["UD/Line", "Line", "Underdog Line"], ""), 1)
             proj = _kclean_fmt(_kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "Winning File K Projection"], ""), 2)
             side, edge, prob, tier = _kclean_card_decision(row)
-            side_class = "kcard-over" if side == "OVER" else "kcard-under" if side == "UNDER" else "kcard-track"
+            side_class = "over" if side == "OVER" else "under" if side == "UNDER" else "track"
             side_txt = html.escape(str(side or "TRACK"))
             prob_txt = "—" if not np.isfinite(prob) else f"{prob:.0f}%"
             prob_width = 0 if not np.isfinite(prob) else max(0, min(100, prob))
             edge_txt = "—" if not np.isfinite(edge) else f"{edge:+.2f} vs {line}"
             opp_k = _kclean_fmt(_kclean_pick(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%"], ""), 1)
-            pk = str(_kclean_pct_display(_kclean_pick(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"], "")))
-            whiff = _kclean_fmt(_kclean_pick(row, ["Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate"], ""), 1)
+            pk = str(_kclean_pct_display(_kclean_pick(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"], "")))
+            whiff = _kclean_fmt(_kclean_pick(row, ["Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate"], ""), 1)
             bf = _kclean_fmt(_kclean_pick(row, ["APP97 Reconciled Expected BF", "Exp BF", "Projected BF"], ""), 1)
+            ip = _kclean_fmt(_kclean_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], ""), 2)
+            savant = html.escape(str(_kclean_pick(row, ["Savant Custom Status", "Official Savant Status"], ""))[:24])
+            lineup_status = html.escape(str(_kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], (p or {}).get("lineup_status", "")))[:34])
+            lineup_rows, lineup_src = _kcard_lineup_rows(row, p)
+            lineup_table = _kcard_lineup_html(lineup_rows)
+            avg_lineup_k = _kclean_fmt(_kclean_pick(row, ["APP88 Batter Lineup K%", "Lineup K%", "Opponent K% vs Pitcher Hand"], ""), 1)
+            high_bats = sum(1 for r in lineup_rows if _kclean_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan) >= 25)
+            low_bats = sum(1 for r in lineup_rows if _kclean_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan) <= 16)
             data_gate = str(_kclean_pick(row, ["Projection Data Gate"], ""))
             win_gate = str(_kclean_pick(row, ["APP99 Right Wins Gate"], ""))
-            note = str(_kclean_pick(row, ["Projection Data Issues", "APP99 Loss Risks", "APP98 Loss Target Reason", "APP97 K Interaction Label"], ""))
-            note_class = "kcard-good" if "GREEN" in data_gate.upper() else "kcard-bad" if "RED" in data_gate.upper() else "kcard-warn"
+            note = str(_kclean_pick(row, ["APP99 Loss Risks", "Projection Data Issues", "APP98 Loss Target Reason", "APP97 K Interaction Label"], ""))
+            note_class = "good" if "GREEN" in data_gate.upper() else "bad" if "RED" in data_gate.upper() else "warn"
             source = html.escape(str(_kclean_pick(row, ["Winning File K Source", "Opponent K% vs Pitcher Hand Source"], ""))[:52])
             cards.append(f"""
             <div class="kcard">
-              <div class="kcard-top">
-                <div><div class="kcard-name">{pitcher}</div><div class="kcard-sub">{matchup} · {hand} · {source}</div></div>
-                <div class="kcard-badge">{html.escape(tier)} {prob_txt}</div>
+              <div class="kc-top">
+                {logo_html}
+                <div><div class="kc-name">{pitcher}</div><div class="kc-sub">{team or '—'} vs {opp or '—'} · {matchup} · {hand}<br>{source}</div></div>
+                <div class="kc-badge">{html.escape(tier)} {prob_txt}</div>
               </div>
-              <div class="kcard-call">
-                <div><div class="kcard-sub">PROJ K</div><div class="kcard-proj">{proj}</div><div class="kcard-sub">{edge_txt}</div></div>
-                <div class="{side_class} kcard-side">{side_txt}<br><span style="font-size:13px;color:#9da6b7">{line} Ks</span></div>
+              <div class="kc-main">
+                <div class="kc-prow">
+                  <div><div class="kc-label">Proj K</div><div class="kc-proj">{proj}</div><div class="kc-edge">{edge_txt}</div></div>
+                  <div class="kc-side {side_class}">{side_txt}<br><span style="font-size:13px;color:#9da6b7">{line} Ks</span></div>
+                </div>
+                <div class="kc-bar"><div class="kc-fill" style="width:{prob_width:.0f}%"></div></div>
               </div>
-              <div class="kcard-bar"><div class="kcard-fill" style="width:{prob_width:.0f}%"></div></div>
-              <div class="kcard-stats">
-                <div class="kstat"><div class="kstat-label">Pitch K%</div><div class="kstat-val">{pk}</div></div>
-                <div class="kstat"><div class="kstat-label">Opp K%</div><div class="kstat-val">{opp_k}</div></div>
-                <div class="kstat"><div class="kstat-label">Whiff</div><div class="kstat-val">{whiff}</div></div>
-                <div class="kstat"><div class="kstat-label">BF</div><div class="kstat-val">{bf}</div></div>
+              <div class="kc-metrics">
+                <div class="kc-stat"><span>Pitch K%</span><b>{pk}</b></div>
+                <div class="kc-stat"><span>Opp K%</span><b>{opp_k}</b></div>
+                <div class="kc-stat"><span>Whiff</span><b>{whiff}</b></div>
+                <div class="kc-stat"><span>BF</span><b>{bf}</b></div>
+                <div class="kc-stat"><span>IP</span><b>{ip}</b></div>
+                <div class="kc-stat"><span>Savant</span><b>{savant or '—'}</b></div>
               </div>
-              <div class="kcard-note"><span class="{note_class}">{html.escape(data_gate or 'DATA GATE')}</span> · {html.escape(win_gate or 'WIN GATE')}<br>{html.escape(note or 'No major data issues flagged')}</div>
+              <div class="kc-section">
+                <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{html.escape(lineup_status or 'lineup')} · avg {avg_lineup_k} · high-K {high_bats} · low-K {low_bats}</span></div>
+                {lineup_table}
+              </div>
+              <div class="kc-section kc-note">
+                <span class="{note_class}">{html.escape(data_gate or 'DATA GATE')}</span> · {html.escape(win_gate or 'WIN GATE')} · {html.escape(lineup_src)}<br>{html.escape(note or 'No major data issues flagged')}
+              </div>
             </div>
             """)
-        st.markdown(css + '<div class="kcard-grid">' + "\n".join(cards) + "</div>", unsafe_allow_html=True)
+        html_doc = css + '<div class="kcard-stack">' + "\n".join(cards) + "</div>"
+        try:
+            import streamlit.components.v1 as components
+            components.html(html_doc, height=max(760, min(26000, 610 * max(1, len(cards)))), scrolling=False)
+        except Exception:
+            st.markdown(html_doc, unsafe_allow_html=True)
     except Exception as e:
         st.info(f"K player cards unavailable: {e}")
 
@@ -42042,7 +42777,8 @@ def render_kproj_tab(board):
         st.text_area("Best plays", slate_text, height=300, key="kclean_copy_paste_best")
 
     st.subheader("K Player Cards")
-    _kclean_render_player_cards(df, limit=18)
+    _kclean_render_player_cards(df, board=board, limit=None)
+    _kclean_render_app88_audit_helpers(df, board)
 
     try:
         total = len(main)
@@ -42062,6 +42798,10 @@ def render_kproj_tab(board):
 
     with st.expander("Data controls / diagnostics", expanded=False):
         try:
+            _xk_render_override_panel(df)
+        except Exception as _xk_e:
+            st.info(f"External K override panel unavailable: {_xk_e}")
+        try:
             _kreal_render_panel()
         except Exception as _kreal_e:
             st.info(f"K/PO real-data override panel unavailable: {_kreal_e}")
@@ -42069,6 +42809,9 @@ def render_kproj_tab(board):
     with st.expander("Full K audit details", expanded=False):
         cols = [c for c in [
             "Pitcher", "Matchup", "UD/Line", "RAW BASE_K", "APP97 True K Projection",
+            "External K Override", "Pre-External K PROJ", "External K Projection",
+            "External Pitcher K%", "External Opp K% vs Hand", "External Expected BF",
+            "External K Sim Side Prob %", "External K Source", "External K Notes",
             "Winning File K Projection", "Winning File K Source", "Winning File K Edge",
             "Winning File K Decision", "Pre-WinningFile K PROJ",
             "File33 Matched K Projection", "File33 Projection Source",
@@ -42085,6 +42828,10 @@ def render_kproj_tab(board):
             "APP97 Pitcher K Source", "APP97 Pitcher K% Warning",
             "APP99 Right Wins Score", "APP99 Right Wins Gate", "APP99 Missing Data",
             "APP99 Loss Risks", "APP99 Data Used",
+            "Savant Custom Status", "Savant Custom Min Filter", "Savant Custom PA",
+            "Savant Custom K%", "Savant Custom BB%", "Savant Custom Whiff%",
+            "Savant Custom Swing%", "Savant Custom xwOBA", "Savant Custom HardHit%",
+            "Savant Custom Barrel%", "Savant Custom SweetSpot%", "Savant Custom Source",
             "Official Savant Status", "Official Savant Rows", "Official Savant K%",
             "Official Savant BB%", "Official Savant Whiff%", "Official Savant CSW%",
             "Official Savant Chase%", "Official Savant First Strike%",
@@ -42398,6 +43145,14 @@ def build_projection_health_audit(board=None):
             savant_rows = int(pd.to_numeric(kdf["Official Savant Rows"], errors="coerce").fillna(0).sum())
         add("Official MLB/Savant Inputs", f"{savant_loaded}/{total} pitchers loaded | {savant_rows} pitch rows", "Missing official Statcast leaves K%, whiff, CSW, chase, and damage risk on weaker fallback inputs.", "Keep MLB pitcher IDs clean; trust GREEN/YELLOW more when Official Savant Status is SUCCESS.")
 
+        custom_loaded = 0
+        custom_low_min = 0
+        if total and "Savant Custom Status" in kdf.columns:
+            custom_loaded = int(kdf["Savant Custom Status"].astype(str).str.upper().eq("SUCCESS").sum())
+        if total and "Savant Custom Min Filter" in kdf.columns:
+            custom_low_min = int(kdf["Savant Custom Min Filter"].astype(str).eq("0").sum())
+        add("Savant Custom Pitcher Board", f"{custom_loaded}/{total} pitchers matched | low-min fallback {custom_low_min}", "Pitcher K%, BB%, Whiff%, xwOBA, hard-hit, and barrel can be wrong when the slate misses official season leaderboards.", "Use the Savant Custom columns in Full K audit; low-min fallback is expected for rookies or unqualified pitchers.")
+
         winning_loaded = 0
         source_counts = {}
         if total and "Winning File K Source" in kdf.columns:
@@ -42420,7 +43175,13 @@ def build_projection_health_audit(board=None):
             yellow = int(dg.str.contains("YELLOW", na=False).sum())
             orange = int(dg.str.contains("ORANGE", na=False).sum())
             red = int(dg.str.contains("RED", na=False).sum())
-            add("Projection Data Integrity", f"Green {green} | Yellow {yellow} | Orange {orange} | Red {red}", "Wrong pitcher IDs, missing hand splits, or failed official fetches create wrong projections even when the formula is good.", "Use Data Gate and Projection Data Issues; treat RED rows as verify/pass until the source is fixed.")
+        add("Projection Data Integrity", f"Green {green} | Yellow {yellow} | Orange {orange} | Red {red}", "Wrong pitcher IDs, missing hand splits, or failed official fetches create wrong projections even when the formula is good.", "Use Data Gate and Projection Data Issues; treat RED rows as verify/pass until the source is fixed.")
+
+        external_on = bool(st.session_state.get("enable_external_k_resim", False)) if "st" in globals() else False
+        external_rows = 0
+        if total and "External K Override" in kdf.columns:
+            external_rows = int(kdf["External K Override"].astype(str).str.upper().str.startswith("YES").sum())
+        add("External K Input Re-Sim", f"{'ON' if external_on else 'OFF'} | {external_rows}/{total} rows overridden", "Outlier/manual K%, team K%, BF, or whiff corrections only help when they are explicitly applied and matched to the right pitcher.", "Use the External K Inputs editor in K tab diagnostics; save rows, turn the toggle on, then refresh.")
 
         app98_adjusted = 0
         if total and "APP98 Loss Target Adjustment" in kdf.columns:
