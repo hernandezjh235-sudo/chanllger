@@ -2573,9 +2573,10 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True  # expected-lineup consensus; MLB confirmed always overrides
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_WIDGETS_LINEUPS_URL = "https://www.widgets.rotowire.com/baseball/daily-lineups.php"
+ROTOGRINDERS_LINEUPS_URL = "https://rotogrinders.com/lineups/mlb"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
 ROTOWIRE_MANUAL_LINEUPS_FILE = os.path.join(STORAGE_DIR, "rotowire_manual_lineups.csv")
-ROTOWIRE_AUTO_PULL_VERSION = "ROTOWIRE_AUTO_PULL_HARDENED_2026_07_26"
+ROTOWIRE_AUTO_PULL_VERSION = "MULTI_SOURCE_LINEUP_PULL_ROTOWIRE_ROTOGRINDERS_2026_07_26"
 LINEUP_CACHE_MAX_HOURS = 30
 # Railway/cloud IPs can occasionally receive a thin/blocked page from RotoWire.
 # Direct RotoWire is ALWAYS attempted first. Jina Reader is only a transport fallback
@@ -2583,6 +2584,7 @@ LINEUP_CACHE_MAX_HOURS = 30
 ROTOWIRE_READER_FALLBACK_ENABLED = True
 ROTOWIRE_READER_URL = "https://r.jina.ai/http://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_READER_URL_HTTPS = "https://r.jina.ai/http://r.jina.ai/http://https://www.rotowire.com/baseball/daily-lineups.php"
+ROTOGRINDERS_READER_URL = "https://r.jina.ai/http://r.jina.ai/http://https://rotogrinders.com/lineups/mlb"
 
 ROTOWIRE_TEAM_ALIASES = {
     "AZ": "ARI", "ARZ": "ARI",
@@ -2597,6 +2599,20 @@ ROTOWIRE_TEAM_ALIASES = {
     "SF": "SF", "SFG": "SF",
     "TB": "TB", "TBR": "TB",
     "WSH": "WSH", "WAS": "WSH",
+}
+
+ROTOGRINDERS_TEAM_NAME_TO_ABBR = {
+    "Arizona Diamondbacks": "ARI", "Atlanta Braves": "ATL", "Baltimore Orioles": "BAL",
+    "Boston Red Sox": "BOS", "Chicago Cubs": "CHC", "Chicago White Sox": "CHW",
+    "Cincinnati Reds": "CIN", "Cleveland Guardians": "CLE", "Colorado Rockies": "COL",
+    "Detroit Tigers": "DET", "Houston Astros": "HOU", "Kansas City Royals": "KC",
+    "Los Angeles Angels": "LAA", "Los Angeles Dodgers": "LAD", "Miami Marlins": "MIA",
+    "Milwaukee Brewers": "MIL", "Minnesota Twins": "MIN", "New York Mets": "NYM",
+    "New York Yankees": "NYY", "Athletics": "ATH", "Oakland Athletics": "ATH",
+    "Philadelphia Phillies": "PHI", "Pittsburgh Pirates": "PIT", "San Diego Padres": "SD",
+    "Seattle Mariners": "SEA", "San Francisco Giants": "SF", "St. Louis Cardinals": "STL",
+    "Tampa Bay Rays": "TB", "Texas Rangers": "TEX", "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSH",
 }
 
 def _rw_norm_team_abbr(abbr):
@@ -2835,6 +2851,151 @@ def _rotowire_fetch_daily_lineups_payload():
 def _rotowire_fetch_daily_lineups_html():
     # Backward-compatible helper used by older code paths.
     return (_rotowire_fetch_daily_lineups_payload() or {}).get("text", "")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _rotogrinders_fetch_lineups_payload():
+    payload = {
+        "text": "", "transport": "NONE", "status": "DISABLED", "http_status": None,
+        "bytes": 0, "error": "", "url": ROTOGRINDERS_LINEUPS_URL,
+        "auto_pull_version": ROTOWIRE_AUTO_PULL_VERSION,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    errors = []
+    for url, transport in [(ROTOGRINDERS_LINEUPS_URL, "DIRECT_ROTOGRINDERS"), (ROTOGRINDERS_READER_URL, "ROTOGRINDERS_VIA_READER")]:
+        try:
+            r = requests.get(url, timeout=22, headers=headers, allow_redirects=True)
+            txt = r.text or ""
+            team_hits = sum(1 for name in ROTOGRINDERS_TEAM_NAME_TO_ABBR if name in txt)
+            player_like = len(re.findall(r"\b[A-Z][a-zA-Z.'-]+\s+[A-Z][a-zA-Z.'-]+\s+\([LRS]\)", txt))
+            if r.status_code < 400 and len(txt) >= 4500 and team_hits >= 4 and player_like >= 30:
+                payload.update({
+                    "text": txt,
+                    "transport": transport,
+                    "status": "SUCCESS",
+                    "http_status": r.status_code,
+                    "bytes": len(txt),
+                    "error": "; ".join(errors)[:700],
+                    "url": str(r.url),
+                    "auto_pull_signal": f"teams={team_hits}; players={player_like}",
+                })
+                return payload
+            errors.append(f"{transport} HTTP {r.status_code}; bytes={len(txt)}; teams={team_hits}; players={player_like}")
+        except Exception as exc:
+            errors.append(f"{transport} error: {type(exc).__name__}: {exc}")
+    payload.update({"status": "FAILED", "error": "; ".join(errors)[:1200]})
+    return payload
+
+
+def _rotogrinders_extract_lineups_from_html(raw_html):
+    """Parse public Rotogrinders MLB lineup text as a fallback source."""
+    if not raw_html:
+        return {}
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw_html, "html.parser")
+        for bad in soup(["script", "style", "noscript"]):
+            bad.decompose()
+        lines = [_rw_clean_name(x) for x in soup.get_text("\n", strip=True).split("\n")]
+        lines = [x for x in lines if x]
+    except Exception:
+        lines = [_rw_clean_name(x) for x in str(raw_html).splitlines() if _rw_clean_name(x)]
+
+    team_names = list(ROTOGRINDERS_TEAM_NAME_TO_ABBR.keys())
+
+    def is_team_name(txt):
+        return txt in ROTOGRINDERS_TEAM_NAME_TO_ABBR
+
+    def parse_player_line(txt):
+        # Examples: Steven Kwan (L) 7 6%, Pete Crow-Armstrong (L) 10 6%.
+        m = re.match(r"^([A-Z][A-Za-z.'’\-]+(?:\s+[A-Z][A-Za-z.'’\-]+)+)\s+\(([LRS])\)(?:\s+.*)?$", txt)
+        if not m:
+            return None, None
+        name = _rw_clean_name(m.group(1).replace("’", "'"))
+        if any(bad in name.lower() for bad in ["lineup", "weather", "forecast", "optimizer"]):
+            return None, None
+        return name, m.group(2).upper()
+
+    out = {}
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not is_team_name(lines[i]):
+            i += 1
+            continue
+        team_a = ROTOGRINDERS_TEAM_NAME_TO_ABBR.get(lines[i])
+        j = i + 1
+        while j < min(i + 25, n) and not is_team_name(lines[j]):
+            j += 1
+        if j >= n or not is_team_name(lines[j]):
+            i += 1
+            continue
+        team_b = ROTOGRINDERS_TEAM_NAME_TO_ABBR.get(lines[j])
+        if not team_a or not team_b or team_a == team_b:
+            i += 1
+            continue
+
+        # End before next game-team pair.
+        end = n
+        k = j + 1
+        while k < n - 1:
+            if is_team_name(lines[k]):
+                kk = k + 1
+                while kk < min(k + 25, n) and not is_team_name(lines[kk]):
+                    kk += 1
+                if kk < n and is_team_name(lines[kk]):
+                    end = k
+                    break
+            k += 1
+        block = lines[j + 1:end]
+
+        lineup_markers = [idx for idx, txt in enumerate(block) if "lineup" in txt.lower() and ("released" in txt.lower() or "confirmed" in txt.lower() or "not released" in txt.lower())]
+        if len(lineup_markers) < 2:
+            i = end if end < n else i + 1
+            continue
+
+        def collect(marker_idx, source):
+            rows = []
+            pos = 1
+            idx = marker_idx + 1
+            while idx < len(block) and len(rows) < 9:
+                cur = block[idx]
+                if "lineup" in cur.lower() and rows:
+                    break
+                if re.fullmatch(r"\d+", cur):
+                    pos = int(cur)
+                    idx += 1
+                    continue
+                name, hand = parse_player_line(cur)
+                if name:
+                    rows.append({
+                        "Order": len(rows) + 1 if not pos else pos,
+                        "Batter": name,
+                        "Position": None,
+                        "Hand": hand,
+                        "Lineup Source": source,
+                        "Lineup Provider": "ROTOGRINDERS",
+                    })
+                    pos = len(rows) + 1
+                idx += 1
+            # Normalize orders if duplicate/missing.
+            for order, row in enumerate(rows, start=1):
+                row["Order"] = order
+            return rows[:9]
+
+        for team, marker_idx in [(team_a, lineup_markers[0]), (team_b, lineup_markers[1])]:
+            marker_txt = block[marker_idx].lower()
+            source = "ROTOGRINDERS_CONFIRMED_LINEUP" if "confirmed" in marker_txt and "not" not in marker_txt else "ROTOGRINDERS_PROJECTED_LINEUP"
+            rows = collect(marker_idx, source)
+            if len(rows) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
+                out[_rw_norm_team_abbr(team)] = rows[:9]
+
+        i = end if end < n else i + 1
+    return out
 
 def _rotowire_extract_lineups_from_html(raw_html):
     """Best-effort Rotowire parser. Returns {TEAM_ABBR: [lineup rows]}.
@@ -3271,11 +3432,30 @@ def get_rotowire_expected_lineups_bundle():
     payload = _rotowire_fetch_daily_lineups_payload() or {}
     raw = payload.get("text", "") or ""
     lineups = _rotowire_extract_lineups_from_html(raw) if raw else {}
+    provider_counts = {"ROTOWIRE": len(lineups or {}), "ROTOGRINDERS": 0, "MANUAL": 0}
+    rg_payload = {}
+    rg_lineups = {}
+    if sum(1 for v in (lineups or {}).values() if len(v or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS) < 10:
+        try:
+            rg_payload = _rotogrinders_fetch_lineups_payload() or {}
+            rg_raw = rg_payload.get("text", "") or ""
+            rg_lineups = _rotogrinders_extract_lineups_from_html(rg_raw) if rg_raw else {}
+            provider_counts["ROTOGRINDERS"] = len(rg_lineups or {})
+            if rg_lineups:
+                lineups = dict(lineups or {})
+                for team, rows in rg_lineups.items():
+                    team = _rw_norm_team_abbr(team)
+                    if len(lineups.get(team, []) or []) < ROTOWIRE_LINEUP_MIN_VALID_HITTERS and len(rows or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
+                        lineups[team] = rows[:9]
+        except Exception as _rg_e:
+            rg_payload = {"status": "FAILED", "error": str(_rg_e)[:240], "transport": "ROTOGRINDERS_ERROR"}
     manual_lineups = _rotowire_manual_lineups_dict()
     if manual_lineups:
         # Auto RotoWire has priority. Manual RotoWire rows only fill teams the
-        # live fetch/parser did not produce.
+        # live fetch/parser did not produce. Rotogrinders fallback is tried
+        # before manual rows.
         lineups = dict(lineups or {})
+        provider_counts["MANUAL"] = len(manual_lineups or {})
         for team, rows in manual_lineups.items():
             team = _rw_norm_team_abbr(team)
             if len(lineups.get(team, []) or []) < ROTOWIRE_LINEUP_MIN_VALID_HITTERS and len(rows or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
@@ -3286,8 +3466,15 @@ def get_rotowire_expected_lineups_bundle():
     status.pop("text", None)
     status["manual_override_file"] = ROTOWIRE_MANUAL_LINEUPS_FILE
     status["manual_override_teams"] = len(manual_lineups or {})
+    status["rotogrinders_status"] = rg_payload.get("status", "SKIPPED") if isinstance(rg_payload, dict) else "SKIPPED"
+    status["rotogrinders_transport"] = rg_payload.get("transport", "NONE") if isinstance(rg_payload, dict) else "NONE"
+    status["rotogrinders_error"] = rg_payload.get("error", "") if isinstance(rg_payload, dict) else ""
+    status["provider_counts"] = provider_counts
     status["parsed_teams"] = parsed_teams
     status["team_counts"] = team_counts
+    if rg_lineups and payload.get("status") != "SUCCESS" and parsed_teams >= 1:
+        status["status"] = "SUCCESS"
+        status["transport"] = "ROTOGRINDERS_BACKUP+" + str(status.get("transport") or "FETCH")
     if manual_lineups and payload.get("status") != "SUCCESS" and parsed_teams >= 1:
         status["status"] = "SUCCESS"
         status["transport"] = "MANUAL_ROTOWIRE_BACKUP+" + str(status.get("transport") or "FETCH")
@@ -39899,12 +40086,13 @@ def _rotowire_parse_manual_upload(uploaded_file=None, text=""):
 
 
 def _render_rotowire_manual_lineup_panel():
-    st.markdown('<div class="section-title-pro">RotoWire Auto Lineup Pull / Diagnostics</div>', unsafe_allow_html=True)
-    st.caption("Auto-pull is the primary lineup source. Manual CSV is only an emergency backup if RotoWire blocks the server or returns a thin page.")
-    if st.button("Auto Pull RotoWire Lineups Now", key="auto_pull_rotowire_lineups_now", use_container_width=True):
+    st.markdown('<div class="section-title-pro">Auto Lineup Pull / Diagnostics</div>', unsafe_allow_html=True)
+    st.caption("Auto tries RotoWire first, then Rotogrinders as backup. Manual CSV only fills teams both auto sources miss.")
+    if st.button("Auto Pull Lineups Now — RotoWire + Rotogrinders", key="auto_pull_rotowire_lineups_now", use_container_width=True):
         try:
             get_rotowire_expected_lineups_bundle.clear()
             _rotowire_fetch_daily_lineups_payload.clear()
+            _rotogrinders_fetch_lineups_payload.clear()
         except Exception:
             pass
         diag_now = get_rotowire_lineup_diagnostics() if "get_rotowire_lineup_diagnostics" in globals() else {}
@@ -39938,9 +40126,16 @@ def _render_rotowire_manual_lineup_panel():
     current = _rotowire_load_manual_lineups()
     diag = get_rotowire_lineup_diagnostics() if "get_rotowire_lineup_diagnostics" in globals() else {}
     d1, d2, d3 = st.columns(3)
-    d1.metric("RotoWire Status", str(diag.get("status", "UNKNOWN")))
+    d1.metric("Lineup Status", str(diag.get("status", "UNKNOWN")))
     d2.metric("Transport", str(diag.get("transport", "NONE"))[:24])
-    d3.metric("Auto Parsed Teams", int(diag.get("parsed_teams", 0) or 0))
+    d3.metric("Parsed Teams", int(diag.get("parsed_teams", 0) or 0))
+    try:
+        rg1, rg2, rg3 = st.columns(3)
+        rg1.metric("Rotogrinders", str(diag.get("rotogrinders_status", "SKIPPED")))
+        rg2.metric("RG Transport", str(diag.get("rotogrinders_transport", "NONE"))[:24])
+        rg3.metric("Providers", str(diag.get("provider_counts", {}))[:40])
+    except Exception:
+        pass
     if isinstance(current, pd.DataFrame) and not current.empty:
         with st.expander("Current manual RotoWire lineups", expanded=False):
             st.dataframe(current, use_container_width=True, hide_index=True)
