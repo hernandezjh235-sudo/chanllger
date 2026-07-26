@@ -42277,6 +42277,298 @@ def build_kproj_table(board):
     return _app99_apply_right_wins_gate(_APP99_PREV_BUILD_K(board))
 
 
+# =============================================================================
+# APP100 K PROJECTION QUALITY PACK
+# Brings together: confirmed lineups, batter split coverage, BF/K workload,
+# pitch-mix coverage, calibration buckets, and recent skill support.
+# =============================================================================
+APP100_K_QUALITY_VERSION = "APP100_K_PROJECTION_QUALITY_PACK_2026_07_26"
+
+
+def _app100_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _app100_text(row, keys, default=""):
+    for key in keys:
+        try:
+            v = row.get(key)
+            if v not in (None, "", "—", "nan", "NaN"):
+                return str(v)
+        except Exception:
+            pass
+    return default
+
+
+def _app100_bucket(value, cuts, labels):
+    v = _app100_num(value, np.nan)
+    if not np.isfinite(v):
+        return "UNKNOWN"
+    try:
+        return calibration_bucket(v, cuts, labels) if "calibration_bucket" in globals() else labels[min(len(labels) - 1, sum(v > c for c in cuts))]
+    except Exception:
+        return "UNKNOWN"
+
+
+def _app100_board_lookup(board):
+    lookup = {}
+    for p in board or []:
+        try:
+            nm = str(p.get("pitcher") or p.get("Pitcher") or "").strip()
+            if nm:
+                lookup[normalize_name(nm)] = p
+        except Exception:
+            pass
+    return lookup
+
+
+def _app100_lineup_coverage(row, p):
+    rows = [r for r in ((p or {}).get("lineup_rows") or []) if isinstance(r, dict)]
+    batter_count = len(rows)
+    lineup_status = _app100_text(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], _app100_text(p or {}, ["lineup_status", "projection_source"], "UNKNOWN")).upper()
+    confirmed = any(x in lineup_status for x in ["CONFIRMED", "LOCKED", "OFFICIAL", "ACTUAL"])
+    split_count = 0
+    fallback_count = 0
+    used_vals = []
+    for r in rows[:9]:
+        used = _app100_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan)
+        split = _app100_num(r.get("Split K%") if r.get("Split K%") is not None else r.get("K% vs Hand"), np.nan)
+        if np.isfinite(used):
+            used_vals.append(used)
+        if np.isfinite(split):
+            split_count += 1
+        else:
+            fallback_count += 1
+    avg_lineup_k = float(np.mean(used_vals)) if used_vals else _app100_num(_app100_text(row, ["APP88 Batter Lineup K%", "Lineup K%", "Opponent K% vs Pitcher Hand"], np.nan), np.nan)
+    if batter_count >= 9 and confirmed and split_count >= 7:
+        label = "CONFIRMED_SPLIT_READY"
+    elif batter_count >= 9 and split_count >= 5:
+        label = "PROJECTED_SPLIT_READY"
+    elif batter_count >= 5:
+        label = "PROJECTED_FALLBACK_MIX"
+    else:
+        label = "TEAM_FALLBACK_ONLY"
+    return {
+        "APP100 Confirmed Lineup": "YES" if confirmed else "NO",
+        "APP100 Batter Count": batter_count,
+        "APP100 Batter Split Count": split_count,
+        "APP100 Batter Fallback Count": fallback_count,
+        "APP100 Avg Batter K%": "" if not np.isfinite(avg_lineup_k) else round(avg_lineup_k, 1),
+        "APP100 Lineup Coverage": label,
+    }
+
+
+def _app100_workload(row):
+    proj_k = _app100_num(_app100_text(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection"], np.nan), np.nan)
+    bf = _app100_num(_app100_text(row, ["APP97 Reconciled Expected BF", "Exp BF", "Projected BF", "Expected BF"], np.nan), np.nan)
+    ip = _app100_num(_app100_text(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], np.nan), np.nan)
+    live_l5_bf = _app100_num(row.get("APP97 Live L5 BF Median"), np.nan)
+    live_l10_bf = _app100_num(row.get("APP97 Live L10 BF Median"), np.nan)
+    pitch_med = _app100_num(row.get("APP97 Live L5 Pitch Median"), np.nan)
+    k_per_bf = proj_k / bf if np.isfinite(proj_k) and np.isfinite(bf) and bf > 0 else np.nan
+    label = "BF_UNKNOWN"
+    if np.isfinite(bf):
+        if bf >= 23:
+            label = "FULL_BF"
+        elif bf >= 20:
+            label = "NORMAL_BF"
+        elif bf >= 17:
+            label = "THIN_BF"
+        else:
+            label = "LOW_BF"
+    return {
+        "APP100 Projected Strikeouts": "" if not np.isfinite(proj_k) else round(proj_k, 2),
+        "APP100 Projected BF": "" if not np.isfinite(bf) else round(bf, 1),
+        "APP100 Projected IP": "" if not np.isfinite(ip) else round(ip, 2),
+        "APP100 K per BF": "" if not np.isfinite(k_per_bf) else round(k_per_bf * 100.0, 1),
+        "APP100 L5 BF": "" if not np.isfinite(live_l5_bf) else round(live_l5_bf, 1),
+        "APP100 L10 BF": "" if not np.isfinite(live_l10_bf) else round(live_l10_bf, 1),
+        "APP100 L5 Pitch Median": "" if not np.isfinite(pitch_med) else round(pitch_med, 1),
+        "APP100 BF Coverage": label,
+    }
+
+
+def _app100_pitch_mix(row, p):
+    pitch_rows = [r for r in ((p or {}).get("pitch_type_rows") or []) if isinstance(r, dict)]
+    batter_pitch_rows = [r for r in ((p or {}).get("batter_pitch_profile_rows") or []) if isinstance(r, dict)]
+    available = str(_app100_text(row, ["pitch_type_matchup_available", "Pitch-Type Available", "Pitch-Type Matchup Available"], "")).upper()
+    arsenal_score = _app100_num(_app100_text(row, ["APP88 Arsenal Matchup Score", "Pitch Mix Matchup Score", "Pitch Arsenal Matchup Score"], np.nan), np.nan)
+    top_pitch = _app100_text(row, ["Pitch Arsenal Top Pitch Used", "Top Pitch", "Primary Pitch"], "")
+    top_usage = _app100_num(_app100_text(row, ["Pitch Arsenal Top Usage Used", "Top Pitch Usage"], np.nan), np.nan)
+    if len(batter_pitch_rows) >= 5 or "TRUE" in available or "YES" in available:
+        label = "PITCH_MIX_MATCHUP_READY"
+    elif len(pitch_rows) >= 3 or np.isfinite(arsenal_score):
+        label = "PITCHER_ARSENAL_ONLY"
+    else:
+        label = "PITCH_MIX_MISSING"
+    return {
+        "APP100 Pitch Mix Coverage": label,
+        "APP100 Pitch Mix Batter Rows": len(batter_pitch_rows),
+        "APP100 Pitch Arsenal Rows": len(pitch_rows),
+        "APP100 Arsenal Score": "" if not np.isfinite(arsenal_score) else round(arsenal_score, 1),
+        "APP100 Top Pitch": top_pitch,
+        "APP100 Top Pitch Usage": "" if not np.isfinite(top_usage) else round(top_usage, 1),
+    }
+
+
+def _app100_recent_skill(row):
+    whiff = _app100_num(_app100_text(row, ["Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate", "Recent SwStr%"], np.nan), np.nan)
+    csw = _app100_num(_app100_text(row, ["Official Savant CSW%", "Recent CSW%", "CSW%"], np.nan), np.nan)
+    chase = _app100_num(_app100_text(row, ["Official Savant Chase%", "Recent Chase%", "Chase%"], np.nan), np.nan)
+    first = _app100_num(_app100_text(row, ["Official Savant First Strike%", "First Strike %", "F-Strike%"], np.nan), np.nan)
+    velo = _app100_num(_app100_text(row, ["Official Savant FB Velo Delta", "Velo Δ", "Velocity Delta"], np.nan), np.nan)
+    support = 0
+    caution = 0
+    if np.isfinite(whiff):
+        support += whiff >= 29
+        caution += whiff < 23
+    if np.isfinite(csw):
+        support += csw >= 30
+        caution += csw < 26
+    if np.isfinite(chase):
+        support += chase >= 31
+        caution += chase < 25
+    if np.isfinite(first):
+        support += first >= 63
+        caution += first < 58
+    if np.isfinite(velo):
+        support += velo >= 0.4
+        caution += velo <= -0.7
+    label = "RECENT_SKILL_SUPPORT" if support >= 2 and caution <= 1 else "RECENT_SKILL_CAUTION" if caution >= 2 else "RECENT_SKILL_NEUTRAL"
+    return {
+        "APP100 Recent Skill": label,
+        "APP100 Whiff%": "" if not np.isfinite(whiff) else round(whiff, 1),
+        "APP100 CSW%": "" if not np.isfinite(csw) else round(csw, 1),
+        "APP100 Chase%": "" if not np.isfinite(chase) else round(chase, 1),
+        "APP100 First Strike%": "" if not np.isfinite(first) else round(first, 1),
+        "APP100 Velo Delta": "" if not np.isfinite(velo) else round(velo, 2),
+    }
+
+
+def _app100_pitcher_stat_row(row):
+    k_pct = _app100_num(_app100_text(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Official Savant K%", "Pitcher K% Used", "Pitcher K%"], np.nan), np.nan)
+    if np.isfinite(k_pct) and k_pct <= 1:
+        k_pct *= 100.0
+    k9 = _app100_num(_app100_text(row, ["APP97 Live Pitcher K/9", "Pitcher K/9 Used", "K/9", "K9", "Season K/9"], np.nan), np.nan)
+    bb_pct = _app100_num(_app100_text(row, ["Savant Custom BB%", "Official Savant BB%", "BB%", "Pitcher BB%"], np.nan), np.nan)
+    if np.isfinite(bb_pct) and bb_pct <= 1:
+        bb_pct *= 100.0
+    bb9 = _app100_num(_app100_text(row, ["Pitcher BB/9 Used", "Run Damage BB9", "BB/9", "Walks/9", "Season BB/9"], np.nan), np.nan)
+    era = _app100_num(_app100_text(row, ["Pitcher ERA Used", "ERA", "Pitcher ERA", "Season ERA"], np.nan), np.nan)
+    fip = _app100_num(_app100_text(row, ["Pitcher FIP Used", "FIP"], np.nan), np.nan)
+    xfip = _app100_num(_app100_text(row, ["xFIP"], np.nan), np.nan)
+    siera = _app100_num(_app100_text(row, ["SIERA"], np.nan), np.nan)
+    kbb = k_pct - bb_pct if np.isfinite(k_pct) and np.isfinite(bb_pct) else _app100_num(_app100_text(row, ["K-BB%"], np.nan), np.nan)
+    notes = []
+    if np.isfinite(k_pct): notes.append(f"K% {k_pct:.1f}")
+    if np.isfinite(k9): notes.append(f"K/9 {k9:.1f}")
+    if np.isfinite(bb9): notes.append(f"BB/9 {bb9:.1f}")
+    if np.isfinite(era): notes.append(f"ERA {era:.2f}")
+    if np.isfinite(fip): notes.append(f"FIP {fip:.2f}")
+    elif np.isfinite(siera): notes.append(f"SIERA {siera:.2f}")
+    return {
+        "APP100 Pitcher K%": "" if not np.isfinite(k_pct) else round(k_pct, 1),
+        "APP100 Pitcher K/9": "" if not np.isfinite(k9) else round(k9, 2),
+        "APP100 Pitcher BB%": "" if not np.isfinite(bb_pct) else round(bb_pct, 1),
+        "APP100 Pitcher BB/9": "" if not np.isfinite(bb9) else round(bb9, 2),
+        "APP100 Pitcher K-BB%": "" if not np.isfinite(kbb) else round(kbb, 1),
+        "APP100 Pitcher ERA": "" if not np.isfinite(era) else round(era, 2),
+        "APP100 Pitcher FIP": "" if not np.isfinite(fip) else round(fip, 2),
+        "APP100 Pitcher xFIP": "" if not np.isfinite(xfip) else round(xfip, 2),
+        "APP100 Pitcher SIERA": "" if not np.isfinite(siera) else round(siera, 2),
+        "APP100 Pitcher Stat Row": "; ".join(notes) or "pitcher stat row incomplete",
+    }
+
+
+def _app100_calibration(row):
+    line = _app100_num(_app100_text(row, ["UD/Line", "Line", "Underdog Line"], np.nan), np.nan)
+    proj = _app100_num(_app100_text(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection"], np.nan), np.nan)
+    edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
+    side = _kclean_side_label(row) if "_kclean_side_label" in globals() else ("OVER" if np.isfinite(edge) and edge > 0 else "UNDER" if np.isfinite(edge) and edge < 0 else "PASS")
+    return {
+        "APP100 Line Bucket": _app100_bucket(line, [2.5, 3.5, 4.5, 5.5, 6.5], ["<=2.5", "3.5", "4.5", "5.5", "6.5", "7+"]),
+        "APP100 Projection Bucket": _app100_bucket(proj, [3, 4, 5, 6, 7], ["<3", "3-4", "4-5", "5-6", "6-7", "7+"]),
+        "APP100 Edge Bucket": _app100_bucket(abs(edge) if np.isfinite(edge) else np.nan, [0.65, 1.0, 1.5], ["<0.65", "0.65-1.0", "1.0-1.5", "1.5+"]),
+        "APP100 Side": side,
+    }
+
+
+def _app100_score(row):
+    score = 100
+    notes = []
+    lineup = str(row.get("APP100 Lineup Coverage") or "")
+    bf = str(row.get("APP100 BF Coverage") or "")
+    pmix = str(row.get("APP100 Pitch Mix Coverage") or "")
+    skill = str(row.get("APP100 Recent Skill") or "")
+    split_fallback = _app100_num(row.get("APP100 Batter Fallback Count"), 0)
+    if "CONFIRMED" not in lineup:
+        score -= 10; notes.append("lineup not confirmed")
+    if "TEAM_FALLBACK" in lineup:
+        score -= 16; notes.append("missing batter-level lineup")
+    if split_fallback >= 4:
+        score -= 8; notes.append("batter split fallback heavy")
+    if bf in {"LOW_BF", "BF_UNKNOWN"}:
+        score -= 14; notes.append("BF/workload weak")
+    elif bf == "THIN_BF":
+        score -= 7; notes.append("thin BF")
+    if pmix == "PITCH_MIX_MISSING":
+        score -= 8; notes.append("pitch mix missing")
+    elif pmix == "PITCHER_ARSENAL_ONLY":
+        score -= 4; notes.append("no batter pitch-mix rows")
+    if skill == "RECENT_SKILL_CAUTION":
+        score -= 8; notes.append("recent skill caution")
+    if str(row.get("Savant Custom Status") or "").upper() != "SUCCESS" and str(row.get("Official Savant Status") or "").upper() != "SUCCESS":
+        score -= 8; notes.append("official Savant missing")
+    score = int(max(0, min(100, score)))
+    if score >= 86:
+        label = "A - FULL DATA"
+    elif score >= 74:
+        label = "B - PLAYABLE DATA"
+    elif score >= 62:
+        label = "C - TRACK DATA"
+    else:
+        label = "D - PASS/VERIFY DATA"
+    return score, label, "; ".join(notes) or "complete enough"
+
+
+def _app100_apply_quality_pack(df, board=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    lookup = _app100_board_lookup(board)
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        p = lookup.get(normalize_name(str(row.get("Pitcher") or row.get("pitcher") or "")), {})
+        row.update(_app100_lineup_coverage(row, p))
+        row.update(_app100_workload(row))
+        row.update(_app100_pitch_mix(row, p))
+        row.update(_app100_recent_skill(row))
+        row.update(_app100_pitcher_stat_row(row))
+        row.update(_app100_calibration(row))
+        score, label, notes = _app100_score(row)
+        row["APP100 Projection Quality Score"] = score
+        row["APP100 Projection Quality"] = label
+        row["APP100 Projection Quality Notes"] = notes
+        row["APP100 Version"] = APP100_K_QUALITY_VERSION
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+_APP100_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _APP100_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _app100_apply_quality_pack(_APP100_PREV_BUILD_K(board), board)
+
+
 K_CLEAN_SINGLE_BOARD_UI_VERSION = "K_CLEAN_SINGLE_BOARD_UI_2026_07_26"
 
 
@@ -42365,6 +42657,9 @@ def _kclean_main_df(df):
             "Matchup": _kclean_pick(row, ["Matchup", "matchup"], ""),
             "Line": _kclean_pick(row, ["UD/Line", "Line", "Underdog Line"], ""),
             "K Projection": _kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection", "APP98 Loss Target Projection"], ""),
+            "Proj SO": _kclean_pick(row, ["APP100 Projected Strikeouts", "K PROJ", "Final K Projection"], ""),
+            "Proj BF": _kclean_pick(row, ["APP100 Projected BF", "APP97 Reconciled Expected BF", "Exp BF"], ""),
+            "Proj IP": _kclean_pick(row, ["APP100 Projected IP", "IP Floor", "IP PROJ"], ""),
             "Edge": _kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], ""),
             "Pick": _kclean_display_decision(row),
             "K Source": _kclean_pick(row, ["Winning File K Source", "Active K Pipeline", "File33 Projection Source"], ""),
@@ -42375,9 +42670,20 @@ def _kclean_main_df(df):
             "Opp K%": _kclean_pick(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used"], ""),
             "Opp K Source": _kclean_pick(row, ["Opponent K% vs Pitcher Hand Source", "Handedness Source"], ""),
             "Pitcher K%": pitcher_k_display,
+            "K/9": _kclean_pick(row, ["APP100 Pitcher K/9", "APP97 Live Pitcher K/9", "Pitcher K/9 Used"], ""),
+            "BB/9": _kclean_pick(row, ["APP100 Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9"], ""),
+            "ERA": _kclean_pick(row, ["APP100 Pitcher ERA", "Pitcher ERA Used", "ERA"], ""),
+            "FIP": _kclean_pick(row, ["APP100 Pitcher FIP", "Pitcher FIP Used", "FIP", "SIERA"], ""),
             "Pitcher K Source": pitcher_k_source,
             "Whiff": _kclean_pick(row, ["Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate", "Recent SwStr%"], ""),
             "Savant": _kclean_pick(row, ["Savant Custom Status", "Official Savant K Skill Signal", "Official Savant Status"], ""),
+            "Lineup Quality": _kclean_pick(row, ["APP100 Lineup Coverage"], ""),
+            "Split Cov": _kclean_pick(row, ["APP100 Batter Split Count"], ""),
+            "BF Quality": _kclean_pick(row, ["APP100 BF Coverage"], ""),
+            "Pitch Mix": _kclean_pick(row, ["APP100 Pitch Mix Coverage"], ""),
+            "Recent Skill": _kclean_pick(row, ["APP100 Recent Skill"], ""),
+            "Quality": _kclean_pick(row, ["APP100 Projection Quality"], ""),
+            "Quality Score": _kclean_pick(row, ["APP100 Projection Quality Score"], ""),
             "Win Gate": _kclean_pick(row, ["APP99 Right Wins Gate"], ""),
             "Win Score": _kclean_pick(row, ["APP99 Right Wins Score"], ""),
             "Data Gate": _kclean_pick(row, ["Projection Data Gate"], ""),
@@ -42692,6 +42998,15 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             bf = _kclean_fmt(_kclean_pick(row, ["APP97 Reconciled Expected BF", "Exp BF", "Projected BF"], ""), 1)
             ip = _kclean_fmt(_kclean_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], ""), 2)
             savant = html.escape(str(_kclean_pick(row, ["Savant Custom Status", "Official Savant Status"], ""))[:24])
+            quality = html.escape(str(_kclean_pick(row, ["APP100 Projection Quality"], "—"))[:22])
+            qscore = html.escape(str(_kclean_pick(row, ["APP100 Projection Quality Score"], "—")))
+            k9 = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher K/9", "APP97 Live Pitcher K/9", "Pitcher K/9 Used"], ""), 1)
+            bb9 = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9"], ""), 1)
+            era = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher ERA", "Pitcher ERA Used", "ERA"], ""), 2)
+            fip = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher FIP", "Pitcher FIP Used", "FIP", "SIERA"], ""), 2)
+            bf_quality = html.escape(str(_kclean_pick(row, ["APP100 BF Coverage"], ""))[:18])
+            recent_skill = html.escape(str(_kclean_pick(row, ["APP100 Recent Skill"], ""))[:24])
+            pitch_mix_quality = html.escape(str(_kclean_pick(row, ["APP100 Pitch Mix Coverage"], ""))[:24])
             lineup_status = html.escape(str(_kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], (p or {}).get("lineup_status", "")))[:34])
             lineup_rows, lineup_src = _kcard_lineup_rows(row, p)
             lineup_table = _kcard_lineup_html(lineup_rows)
@@ -42724,13 +43039,19 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 <div class="kc-stat"><span>BF</span><b>{bf}</b></div>
                 <div class="kc-stat"><span>IP</span><b>{ip}</b></div>
                 <div class="kc-stat"><span>Savant</span><b>{savant or '—'}</b></div>
+                <div class="kc-stat"><span>Quality</span><b>{qscore}</b></div>
+                <div class="kc-stat"><span>BF Gate</span><b>{bf_quality or '—'}</b></div>
+                <div class="kc-stat"><span>Skill</span><b>{recent_skill or '—'}</b></div>
+                <div class="kc-stat"><span>K/9</span><b>{k9}</b></div>
+                <div class="kc-stat"><span>BB/9</span><b>{bb9}</b></div>
+                <div class="kc-stat"><span>ERA/FIP</span><b>{era}/{fip}</b></div>
               </div>
               <div class="kc-section">
                 <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{html.escape(lineup_status or 'lineup')} · avg {avg_lineup_k} · high-K {high_bats} · low-K {low_bats}</span></div>
                 {lineup_table}
               </div>
               <div class="kc-section kc-note">
-                <span class="{note_class}">{html.escape(data_gate or 'DATA GATE')}</span> · {html.escape(win_gate or 'WIN GATE')} · {html.escape(lineup_src)}<br>{html.escape(note or 'No major data issues flagged')}
+                <span class="{note_class}">{html.escape(data_gate or 'DATA GATE')}</span> · {html.escape(win_gate or 'WIN GATE')} · {quality} · {pitch_mix_quality}<br>{html.escape(lineup_src)}<br>{html.escape(note or 'No major data issues flagged')}
               </div>
             </div>
             """)
@@ -42809,6 +43130,21 @@ def render_kproj_tab(board):
     with st.expander("Full K audit details", expanded=False):
         cols = [c for c in [
             "Pitcher", "Matchup", "UD/Line", "RAW BASE_K", "APP97 True K Projection",
+            "APP100 Projected Strikeouts", "APP100 Projected BF", "APP100 Projected IP",
+            "APP100 K per BF", "APP100 L5 BF", "APP100 L10 BF", "APP100 L5 Pitch Median",
+            "APP100 Pitcher K%", "APP100 Pitcher K/9", "APP100 Pitcher BB%",
+            "APP100 Pitcher BB/9", "APP100 Pitcher K-BB%", "APP100 Pitcher ERA",
+            "APP100 Pitcher FIP", "APP100 Pitcher xFIP", "APP100 Pitcher SIERA",
+            "APP100 Pitcher Stat Row",
+            "APP100 Confirmed Lineup", "APP100 Batter Count", "APP100 Batter Split Count",
+            "APP100 Batter Fallback Count", "APP100 Avg Batter K%", "APP100 Lineup Coverage",
+            "APP100 BF Coverage", "APP100 Pitch Mix Coverage", "APP100 Pitch Mix Batter Rows",
+            "APP100 Pitch Arsenal Rows", "APP100 Arsenal Score", "APP100 Top Pitch",
+            "APP100 Top Pitch Usage", "APP100 Recent Skill", "APP100 Whiff%", "APP100 CSW%",
+            "APP100 Chase%", "APP100 First Strike%", "APP100 Velo Delta",
+            "APP100 Line Bucket", "APP100 Projection Bucket", "APP100 Edge Bucket",
+            "APP100 Side", "APP100 Projection Quality Score", "APP100 Projection Quality",
+            "APP100 Projection Quality Notes",
             "External K Override", "Pre-External K PROJ", "External K Projection",
             "External Pitcher K%", "External Opp K% vs Hand", "External Expected BF",
             "External K Sim Side Prob %", "External K Source", "External K Notes",
@@ -42840,7 +43176,7 @@ def render_kproj_tab(board):
             "Official Savant K Skill Signal", "Official Savant Damage Signal",
             "K Real Data Override", "K Real Data Used", "K Real Data Notes", "K Real Data Version",
             "APP88 Batter Lineup K%", "APP85 PutAway Rate", "Atlas Grade", "Official Card Tier",
-            "APP98 Version", "APP99 Version", "K Clean UI Version"
+            "APP98 Version", "APP99 Version", "APP100 Version", "K Clean UI Version"
         ] if c in df.columns]
         show = df.copy()
         show["K Clean UI Version"] = K_CLEAN_SINGLE_BOARD_UI_VERSION
@@ -43128,6 +43464,31 @@ def build_projection_health_audit(board=None):
                     mask = mask | kdf[c].astype(str).str.upper().str.contains("CONFIRMED|ROTO|ACTUAL", na=False)
                 confirmed = int(mask.sum())
         add("K Batter Lineups", f"{confirmed}/{total} confirmed or RotoWire-backed", "Projected/manual lineups still create wrong opponent K% spots.", "Use Auto Pull RotoWire daily, then refresh after confirmed lineups post.")
+
+        if total and "APP100 Projection Quality Score" in kdf.columns:
+            q = pd.to_numeric(kdf["APP100 Projection Quality Score"], errors="coerce")
+            strong = int((q >= 86).sum())
+            playable = int(((q >= 74) & (q < 86)).sum())
+            track = int(((q >= 62) & (q < 74)).sum())
+            verify = int((q < 62).sum())
+            add("APP100 K Projection Quality", f"A {strong} | B {playable} | C {track} | D {verify}", "The K number can be mathematically fine but built from weak lineup, split, BF, pitch-mix, or recent-skill coverage.", "Prioritize A/B rows; treat C/D rows as track/pass unless price and edge are very strong.")
+
+        if total and "APP100 Batter Split Count" in kdf.columns:
+            split_avg = float(pd.to_numeric(kdf["APP100 Batter Split Count"], errors="coerce").fillna(0).mean()) if total else 0.0
+            fallback_avg = float(pd.to_numeric(kdf.get("APP100 Batter Fallback Count", pd.Series(dtype=float)), errors="coerce").fillna(0).mean()) if total else 0.0
+            add("Batter Split Coverage", f"Avg split bats {split_avg:.1f}/9 | fallback bats {fallback_avg:.1f}/9", "Blank vs-hand batter splits make opponent K% less precise.", "Use confirmed/projected batter rows with K% vs pitcher hand; fallback to season K% only when split sample is missing.")
+
+        if total and "APP100 BF Coverage" in kdf.columns:
+            bf_counts = kdf["APP100 BF Coverage"].astype(str).value_counts().head(5).to_dict()
+            add("Batters Faced / Workload", str(bf_counts), "K props miss when projected BF/IP is wrong even if pitcher K% is right.", "Check APP100 Projected BF, L5 BF, L10 BF, pitch median, and low/thin BF labels before trusting overs.")
+
+        if total and "APP100 Pitch Mix Coverage" in kdf.columns:
+            pm_counts = kdf["APP100 Pitch Mix Coverage"].astype(str).value_counts().head(5).to_dict()
+            add("Pitch Mix Matchup Coverage", str(pm_counts), "Pitch arsenal edge is weaker when only pitcher mix is known and batter pitch-type whiff/contact rows are missing.", "Trust pitch-mix boosts more when APP100 Pitch Mix Coverage says matchup ready.")
+
+        if total and "APP100 Recent Skill" in kdf.columns:
+            sk_counts = kdf["APP100 Recent Skill"].astype(str).value_counts().head(5).to_dict()
+            add("Recent Skill Form", str(sk_counts), "Recent strikeout totals can lie; CSW, whiff, chase, first-strike, and velo better show if K stuff is real.", "Use APP100 Recent Skill and the Whiff/CSW/Chase columns to downgrade fading stuff.")
 
         warning_count = 0
         if total and "APP97 Pitcher K% Warning" in kdf.columns:
