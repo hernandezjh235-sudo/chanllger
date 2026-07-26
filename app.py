@@ -39726,6 +39726,10 @@ try:
         profile = {
             "available": False, "season_k_pct": None, "season_k9": None,
             "season_bf": None, "season_ip": None, "season_so": None,
+            "season_bb": None, "season_hr": None, "season_er": None,
+            "season_bb_pct": None, "season_bb9": None, "season_era": None,
+            "season_fip": None, "season_xfip": None, "season_siera": None,
+            "season_kbb_pct": None,
             "l3_k_avg": None, "l5_k_avg": None, "l10_k_avg": None,
             "l3_bf_avg": None, "l5_bf_median": None, "l10_bf_median": None,
             "l5_ip_avg": None, "l10_ip_avg": None,
@@ -39745,13 +39749,46 @@ try:
             if splits:
                 stt = splits[-1].get("stat") or {}
                 so = _app97_num(stt.get("strikeOuts"), None)
+                bb = _app97_num(stt.get("baseOnBalls"), None)
+                hr = _app97_num(stt.get("homeRuns"), None)
+                er = _app97_num(stt.get("earnedRuns"), None)
                 bf = _app97_num(stt.get("battersFaced"), None)
                 ip = _app97_parse_ip(stt.get("inningsPitched"))
-                profile.update({"season_so":so,"season_bf":bf,"season_ip":ip})
+                profile.update({"season_so":so,"season_bb":bb,"season_hr":hr,"season_er":er,"season_bf":bf,"season_ip":ip})
                 if so is not None and bf and bf > 0:
                     profile["season_k_pct"] = 100.0 * so / bf
+                if bb is not None and bf and bf > 0:
+                    profile["season_bb_pct"] = 100.0 * bb / bf
                 if so is not None and ip and ip > 0:
                     profile["season_k9"] = 9.0 * so / ip
+                if bb is not None and ip and ip > 0:
+                    profile["season_bb9"] = 9.0 * bb / ip
+                era_api = _app97_num(stt.get("era"), None)
+                if era_api is not None:
+                    profile["season_era"] = era_api
+                elif er is not None and ip and ip > 0:
+                    profile["season_era"] = 9.0 * er / ip
+                if profile.get("season_k_pct") is not None and profile.get("season_bb_pct") is not None:
+                    profile["season_kbb_pct"] = profile["season_k_pct"] - profile["season_bb_pct"]
+                if so is not None and bb is not None and hr is not None and ip and ip > 0:
+                    dips = {}
+                    try:
+                        if "build_dips_metrics_from_counts" in globals():
+                            dips = build_dips_metrics_from_counts(so=so, bb=bb, hr=hr, ip=ip, bf=bf)
+                    except Exception:
+                        dips = {}
+                    profile["season_fip"] = _app97_num(dips.get("fip"), None)
+                    profile["season_xfip"] = _app97_num(dips.get("xfip"), None)
+                    profile["season_siera"] = _app97_num(dips.get("siera"), None)
+                    if profile["season_fip"] is None:
+                        profile["season_fip"] = ((13.0 * hr) + (3.0 * bb) - (2.0 * so)) / ip + 3.10
+                    if profile["season_xfip"] is None:
+                        norm_hr = ip * 1.05 / 9.0
+                        profile["season_xfip"] = ((13.0 * norm_hr) + (3.0 * bb) - (2.0 * so)) / ip + 3.10
+                    if profile["season_siera"] is None and profile.get("season_k_pct") is not None and profile.get("season_bb_pct") is not None:
+                        k_dec = profile["season_k_pct"] / 100.0
+                        bb_dec = profile["season_bb_pct"] / 100.0
+                        profile["season_siera"] = max(2.0, min(6.8, 4.20 - 12.0 * (k_dec - 0.22) + 7.0 * (bb_dec - 0.08)))
                 profile["season_status"] = "SUCCESS"
             else:
                 profile["season_status"] = "NO_SPLITS"
@@ -40037,6 +40074,13 @@ def _app97_apply(df, board=None):
             "APP97 Pitcher GameLog Fetch Status": live.get("gamelog_status","UNAVAILABLE") if isinstance(live,dict) else "UNAVAILABLE",
             "APP97 Pitcher Player ID": pid if pid else np.nan,
             "APP97 Live Pitcher K/9": round(_app97_num(live.get("season_k9"),0.0),2) if _app97_num(live.get("season_k9"),None) is not None else np.nan,
+            "APP97 Live Pitcher BB%": round(_app97_num(live.get("season_bb_pct"),0.0),1) if _app97_num(live.get("season_bb_pct"),None) is not None else np.nan,
+            "APP97 Live Pitcher BB/9": round(_app97_num(live.get("season_bb9"),0.0),2) if _app97_num(live.get("season_bb9"),None) is not None else np.nan,
+            "APP97 Live Pitcher K-BB%": round(_app97_num(live.get("season_kbb_pct"),0.0),1) if _app97_num(live.get("season_kbb_pct"),None) is not None else np.nan,
+            "APP97 Live Pitcher ERA": round(_app97_num(live.get("season_era"),0.0),2) if _app97_num(live.get("season_era"),None) is not None else np.nan,
+            "APP97 Live Pitcher FIP": round(_app97_num(live.get("season_fip"),0.0),2) if _app97_num(live.get("season_fip"),None) is not None else np.nan,
+            "APP97 Live Pitcher xFIP": round(_app97_num(live.get("season_xfip"),0.0),2) if _app97_num(live.get("season_xfip"),None) is not None else np.nan,
+            "APP97 Live Pitcher SIERA": round(_app97_num(live.get("season_siera"),0.0),2) if _app97_num(live.get("season_siera"),None) is not None else np.nan,
             "APP97 Team K% Current Blend": round(team_env,2),
             "APP97 Recent Hand Split Suspect": bool(split_suspect),
             "APP97 Team K Blend Detail": team_detail,
@@ -40074,6 +40118,19 @@ def _app97_apply(df, board=None):
             out.at[idx, "APP97 Pitcher K% Display Source"] = "MODEL FALLBACK"
         out.at[idx, "Exp BF"] = round(bf, 2)
         out.at[idx, "APP97 Current Matchup Read"] = interaction_label
+        for dst, src in [
+            ("Pitcher K/9 Used", "season_k9"),
+            ("Pitcher BB/9 Used", "season_bb9"),
+            ("Pitcher ERA Used", "season_era"),
+            ("Pitcher FIP Used", "season_fip"),
+            ("xFIP", "season_xfip"),
+            ("SIERA", "season_siera"),
+            ("BB%", "season_bb_pct"),
+            ("K-BB%", "season_kbb_pct"),
+        ]:
+            val = _app97_num(live.get(src), None) if isinstance(live, dict) else None
+            if val is not None:
+                out.at[idx, dst] = round(val, 2)
 
     add = pd.DataFrame(records).set_index("_idx")
     for c in add.columns:
@@ -42456,15 +42513,15 @@ def _app100_pitcher_stat_row(row):
     if np.isfinite(k_pct) and k_pct <= 1:
         k_pct *= 100.0
     k9 = _app100_num(_app100_text(row, ["APP97 Live Pitcher K/9", "Pitcher K/9 Used", "K/9", "K9", "Season K/9"], np.nan), np.nan)
-    bb_pct = _app100_num(_app100_text(row, ["Savant Custom BB%", "Official Savant BB%", "BB%", "Pitcher BB%"], np.nan), np.nan)
+    bb_pct = _app100_num(_app100_text(row, ["APP97 Live Pitcher BB%", "Savant Custom BB%", "Official Savant BB%", "BB%", "Pitcher BB%"], np.nan), np.nan)
     if np.isfinite(bb_pct) and bb_pct <= 1:
         bb_pct *= 100.0
-    bb9 = _app100_num(_app100_text(row, ["Pitcher BB/9 Used", "Run Damage BB9", "BB/9", "Walks/9", "Season BB/9"], np.nan), np.nan)
-    era = _app100_num(_app100_text(row, ["Pitcher ERA Used", "ERA", "Pitcher ERA", "Season ERA"], np.nan), np.nan)
-    fip = _app100_num(_app100_text(row, ["Pitcher FIP Used", "FIP"], np.nan), np.nan)
-    xfip = _app100_num(_app100_text(row, ["xFIP"], np.nan), np.nan)
-    siera = _app100_num(_app100_text(row, ["SIERA"], np.nan), np.nan)
-    kbb = k_pct - bb_pct if np.isfinite(k_pct) and np.isfinite(bb_pct) else _app100_num(_app100_text(row, ["K-BB%"], np.nan), np.nan)
+    bb9 = _app100_num(_app100_text(row, ["APP97 Live Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9", "BB/9", "Walks/9", "Season BB/9"], np.nan), np.nan)
+    era = _app100_num(_app100_text(row, ["APP97 Live Pitcher ERA", "Pitcher ERA Used", "ERA", "Pitcher ERA", "Season ERA"], np.nan), np.nan)
+    fip = _app100_num(_app100_text(row, ["APP97 Live Pitcher FIP", "Pitcher FIP Used", "FIP"], np.nan), np.nan)
+    xfip = _app100_num(_app100_text(row, ["APP97 Live Pitcher xFIP", "xFIP"], np.nan), np.nan)
+    siera = _app100_num(_app100_text(row, ["APP97 Live Pitcher SIERA", "SIERA"], np.nan), np.nan)
+    kbb = k_pct - bb_pct if np.isfinite(k_pct) and np.isfinite(bb_pct) else _app100_num(_app100_text(row, ["APP97 Live Pitcher K-BB%", "K-BB%"], np.nan), np.nan)
     notes = []
     if np.isfinite(k_pct): notes.append(f"K% {k_pct:.1f}")
     if np.isfinite(k9): notes.append(f"K/9 {k9:.1f}")
@@ -42482,6 +42539,7 @@ def _app100_pitcher_stat_row(row):
         "APP100 Pitcher FIP": "" if not np.isfinite(fip) else round(fip, 2),
         "APP100 Pitcher xFIP": "" if not np.isfinite(xfip) else round(xfip, 2),
         "APP100 Pitcher SIERA": "" if not np.isfinite(siera) else round(siera, 2),
+        "APP100 Pitcher Hand": _app100_text(row, ["Pitcher Hand", "Hand", "Throws"], ""),
         "APP100 Pitcher Stat Row": "; ".join(notes) or "pitcher stat row incomplete",
     }
 
@@ -42666,14 +42724,15 @@ def _kclean_main_df(df):
             "External": _kclean_pick(row, ["External K Override"], ""),
             "Sim Side %": _kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], ""),
             "Lineup": _kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], ""),
-            "Hand": _kclean_pick(row, ["Pitcher Hand", "Hand", "Throws"], ""),
+            "Hand": _kclean_pick(row, ["APP100 Pitcher Hand", "Pitcher Hand", "Hand", "Throws"], ""),
+            "Pitcher Hand": _kclean_pick(row, ["APP100 Pitcher Hand", "Pitcher Hand", "Hand", "Throws"], ""),
             "Opp K%": _kclean_pick(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used"], ""),
             "Opp K Source": _kclean_pick(row, ["Opponent K% vs Pitcher Hand Source", "Handedness Source"], ""),
             "Pitcher K%": pitcher_k_display,
             "K/9": _kclean_pick(row, ["APP100 Pitcher K/9", "APP97 Live Pitcher K/9", "Pitcher K/9 Used"], ""),
-            "BB/9": _kclean_pick(row, ["APP100 Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9"], ""),
-            "ERA": _kclean_pick(row, ["APP100 Pitcher ERA", "Pitcher ERA Used", "ERA"], ""),
-            "FIP": _kclean_pick(row, ["APP100 Pitcher FIP", "Pitcher FIP Used", "FIP", "SIERA"], ""),
+            "BB/9": _kclean_pick(row, ["APP100 Pitcher BB/9", "APP97 Live Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9"], ""),
+            "ERA": _kclean_pick(row, ["APP100 Pitcher ERA", "APP97 Live Pitcher ERA", "Pitcher ERA Used", "ERA"], ""),
+            "FIP": _kclean_pick(row, ["APP100 Pitcher FIP", "APP97 Live Pitcher FIP", "Pitcher FIP Used", "FIP", "SIERA"], ""),
             "Pitcher K Source": pitcher_k_source,
             "Whiff": _kclean_pick(row, ["Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate", "Recent SwStr%"], ""),
             "Savant": _kclean_pick(row, ["Savant Custom Status", "Official Savant K Skill Signal", "Official Savant Status"], ""),
@@ -43001,9 +43060,9 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             quality = html.escape(str(_kclean_pick(row, ["APP100 Projection Quality"], "—"))[:22])
             qscore = html.escape(str(_kclean_pick(row, ["APP100 Projection Quality Score"], "—")))
             k9 = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher K/9", "APP97 Live Pitcher K/9", "Pitcher K/9 Used"], ""), 1)
-            bb9 = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9"], ""), 1)
-            era = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher ERA", "Pitcher ERA Used", "ERA"], ""), 2)
-            fip = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher FIP", "Pitcher FIP Used", "FIP", "SIERA"], ""), 2)
+            bb9 = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher BB/9", "APP97 Live Pitcher BB/9", "Pitcher BB/9 Used", "Run Damage BB9"], ""), 1)
+            era = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher ERA", "APP97 Live Pitcher ERA", "Pitcher ERA Used", "ERA"], ""), 2)
+            fip = _kclean_fmt(_kclean_pick(row, ["APP100 Pitcher FIP", "APP97 Live Pitcher FIP", "Pitcher FIP Used", "FIP", "SIERA"], ""), 2)
             bf_quality = html.escape(str(_kclean_pick(row, ["APP100 BF Coverage"], ""))[:18])
             recent_skill = html.escape(str(_kclean_pick(row, ["APP100 Recent Skill"], ""))[:24])
             pitch_mix_quality = html.escape(str(_kclean_pick(row, ["APP100 Pitch Mix Coverage"], ""))[:24])
