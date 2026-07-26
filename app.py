@@ -40592,6 +40592,819 @@ def render_moneyline_edge_tab(board, dates=None):
         _MLUI_PREV_RENDER_ML(board, dates)
 
 
+ML_BLOWOUT_COVER_BRAIN_VERSION = "ML_BLOWOUT_COVER_BRAIN_SUPPORT_ONLY_2026_07_26"
+
+
+def _mlbc_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _mlbc_clamp(value, lo=0.0, hi=100.0):
+    try:
+        return max(lo, min(hi, float(value)))
+    except Exception:
+        return lo
+
+
+def _mlbc_pick_team(row, away, home):
+    text = " ".join(str(row.get(c) or "") for c in [
+        "ML Card Best Play", "ML Final Pick", "ML Official Pick", "ML Sim Pick", "Pick", "Best Play"
+    ]).upper()
+    if away and str(away).upper() in text:
+        return str(away).upper()
+    if home and str(home).upper() in text:
+        return str(home).upper()
+    awp = _mlbc_num(row.get("ML Card Away Win %"), _mlbc_num(row.get("Away Model %"), np.nan))
+    hwp = _mlbc_num(row.get("ML Card Home Win %"), _mlbc_num(row.get("Home Model %"), np.nan))
+    if np.isfinite(awp) and np.isfinite(hwp):
+        return str(away).upper() if awp >= hwp else str(home).upper()
+    return str(row.get("Pick") or "").upper().replace(" ML", "").strip()
+
+
+def _mlbc_pick_context(row):
+    away, home = _mlcard_matchup_teams(row) if "_mlcard_matchup_teams" in globals() else ("AWAY", "HOME")
+    away = str(away or "AWAY").upper()
+    home = str(home or "HOME").upper()
+    pick = _mlbc_pick_team(row, away, home)
+    awp = _mlbc_num(row.get("ML Card Away Win %"), _mlbc_num(row.get("ML Sim Away Win %"), _mlbc_num(row.get("Away Model %"), 50.0)))
+    hwp = _mlbc_num(row.get("ML Card Home Win %"), _mlbc_num(row.get("ML Sim Home Win %"), _mlbc_num(row.get("Home Model %"), 100.0 - awp if np.isfinite(awp) else 50.0)))
+    ar = _mlbc_num(row.get("ML Card Away Projected Runs"), _mlbc_num(row.get("Away Projected Runs"), np.nan))
+    hr = _mlbc_num(row.get("ML Card Home Projected Runs"), _mlbc_num(row.get("Home Projected Runs"), np.nan))
+    if not np.isfinite(ar) or not np.isfinite(hr):
+        parsed = _mlcard_projected_runs(row) if "_mlcard_projected_runs" in globals() else (np.nan, np.nan)
+        ar = parsed[0] if not np.isfinite(ar) else ar
+        hr = parsed[1] if not np.isfinite(hr) else hr
+    if pick == away:
+        pick_prob, opp_prob = awp, hwp
+        pick_runs, opp_runs = ar, hr
+        cover_plus = _mlbc_num(row.get("ML Card Away +1.5 %"), np.nan)
+        cover_minus = _mlbc_num(row.get("ML Card Away -1.5 %"), np.nan)
+    elif pick == home:
+        pick_prob, opp_prob = hwp, awp
+        pick_runs, opp_runs = hr, ar
+        cover_plus = _mlbc_num(row.get("ML Card Home +1.5 %"), np.nan)
+        cover_minus = _mlbc_num(row.get("ML Card Home -1.5 %"), np.nan)
+    else:
+        pick_prob, opp_prob = max(awp, hwp), min(awp, hwp)
+        pick_runs, opp_runs = max(ar, hr), min(ar, hr)
+        cover_plus, cover_minus = np.nan, np.nan
+    run_gap = pick_runs - opp_runs if np.isfinite(pick_runs) and np.isfinite(opp_runs) else np.nan
+    return away, home, pick, pick_prob, opp_prob, pick_runs, opp_runs, run_gap, cover_plus, cover_minus
+
+
+def _mlbc_profile(row):
+    away, home, pick, pick_prob, opp_prob, pick_runs, opp_runs, run_gap, cover_plus, cover_minus = _mlbc_pick_context(row)
+    prob_edge = pick_prob - 50.0 if np.isfinite(pick_prob) else 0.0
+    gap = run_gap if np.isfinite(run_gap) else 0.0
+    total_runs = (pick_runs + opp_runs) if np.isfinite(pick_runs) and np.isfinite(opp_runs) else np.nan
+    volatility = _mlbc_num(row.get("Game Volatility"), _mlbc_num(row.get("ML Volatility"), 0.0))
+    risk_txt = str(row.get("ML Risk Reasons") or row.get("ML SP Sample Guardrail") or "").upper()
+    support_txt = str(row.get("ML Support Signals") or "").upper()
+
+    blowout = 44.0 + max(0.0, prob_edge) * 0.72 + max(0.0, gap) * 16.0
+    if np.isfinite(total_runs) and total_runs >= 9.0:
+        blowout += 3.0
+    if "BULLPEN" in support_txt or "POWER" in support_txt:
+        blowout += 2.0
+    if gap < 0.55:
+        blowout -= 12.0
+    elif gap < 0.95:
+        blowout -= 5.0
+    if np.isfinite(pick_prob) and pick_prob < 55.0:
+        blowout -= 10.0
+    if "ROOKIE" in risk_txt or "VOLATILITY" in risk_txt:
+        blowout -= 4.0
+    if np.isfinite(volatility) and volatility >= 8.0:
+        blowout -= 3.0
+    blowout = round(_mlbc_clamp(blowout, 1.0, 99.0), 1)
+
+    plus_conf = cover_plus if np.isfinite(cover_plus) else _mlbc_clamp(55.0 + prob_edge * 0.35 - max(0.0, gap - 1.0) * 5.0, 1.0, 99.0)
+    minus_conf = cover_minus if np.isfinite(cover_minus) else _mlbc_clamp(43.0 + max(0.0, prob_edge - 6.0) * 0.65 + max(0.0, gap - 0.75) * 14.0, 1.0, 99.0)
+
+    if pick:
+        if blowout >= 68.0 and gap >= 1.05 and np.isfinite(pick_prob) and pick_prob >= 58.0:
+            cover = f"{pick} CVR -1.5"
+            cover_conf = minus_conf
+            cover_reason = "blowout profile: win prob + run gap support -1.5"
+        elif np.isfinite(pick_prob) and pick_prob >= 53.0:
+            cover = f"{pick} CVR +1.5"
+            cover_conf = plus_conf
+            cover_reason = "safer cover: ML side supported, run gap not strong enough for -1.5"
+        else:
+            cover = "PASS COVER"
+            cover_conf = max(plus_conf, minus_conf)
+            cover_reason = "cover pass: ML probability too thin"
+    else:
+        cover = "PASS COVER"
+        cover_conf = np.nan
+        cover_reason = "missing ML pick team"
+
+    if blowout >= 78.0:
+        tier = "ELITE BLOWOUT"
+    elif blowout >= 68.0:
+        tier = "GOOD BLOWOUT"
+    elif blowout >= 58.0:
+        tier = "LEAN ML"
+    else:
+        tier = "PASS/TIGHT GAME"
+
+    original_cover = str(row.get("ML Card Cover Lean") or row.get("ML Cover Lean") or "")
+    side_check = "OK"
+    if original_cover and pick and pick not in original_cover.upper():
+        side_check = "REVIEW: cover team did not match ML side"
+    elif original_cover and "-1.5" in original_cover and "+1.5" in cover:
+        side_check = "REVIEW: original was aggressive -1.5, brain prefers +1.5"
+    elif original_cover and "+1.5" in original_cover and "-1.5" in cover:
+        side_check = "UPGRADE: blowout brain supports -1.5"
+
+    return {
+        "ML Blowout Brain Version": ML_BLOWOUT_COVER_BRAIN_VERSION,
+        "ML Blowout Score": blowout,
+        "ML Blowout Tier": tier,
+        "ML Blowout Pick Team": pick,
+        "ML Blowout Run Gap": "" if not np.isfinite(run_gap) else round(float(run_gap), 2),
+        "ML Blowout Win Prob %": "" if not np.isfinite(pick_prob) else round(float(pick_prob), 1),
+        "ML Correct Cover Lean": cover,
+        "ML Correct Cover Prob %": "" if not np.isfinite(cover_conf) else round(float(cover_conf), 1),
+        "ML Cover Side Check": side_check,
+        "ML Cover Brain Reason": cover_reason,
+        "ML Card Cover Lean Original": original_cover,
+    }
+
+
+def _mlbc_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            add = _mlbc_profile(row)
+            row.update(add)
+            # Correct display-only cover lean. ML pick/probability/projection columns stay untouched.
+            row["ML Card Cover Lean"] = add.get("ML Correct Cover Lean", row.get("ML Card Cover Lean", ""))
+            row["ML Card Cover Prob %"] = add.get("ML Correct Cover Prob %", row.get("ML Card Cover Prob %", ""))
+        except Exception as e:
+            row["ML Blowout Brain Version"] = ML_BLOWOUT_COVER_BRAIN_VERSION
+            row["ML Blowout Brain Error"] = str(e)[:120]
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    try:
+        out["_mlbc_sort"] = pd.to_numeric(out.get("ML Blowout Score"), errors="coerce").fillna(-999)
+        out = out.sort_values("_mlbc_sort", ascending=False).drop(columns=["_mlbc_sort"])
+    except Exception:
+        pass
+    return out
+
+
+_MLBC_PREV_BUILD_BOARD = ml_build_board if "ml_build_board" in globals() else None
+
+
+def ml_build_board(board):
+    if _MLBC_PREV_BUILD_BOARD is None:
+        return pd.DataFrame()
+    return _mlbc_apply(_MLBC_PREV_BUILD_BOARD(board))
+
+
+_MLBC_PREV_RENDER_ML = render_moneyline_edge_tab if "render_moneyline_edge_tab" in globals() else None
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    if _MLBC_PREV_RENDER_ML is not None:
+        _MLBC_PREV_RENDER_ML(board, dates)
+    try:
+        df = ml_build_board(board)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">ML Blowout / Cover Brain</div>', unsafe_allow_html=True)
+            st.caption("Support-only. This does not change the ML projection or pick; it fixes cover direction and flags games with real blowout separation.")
+            cols = [c for c in [
+                "Matchup", "ML Card Best Play", "ML Card Best Play Prob %",
+                "ML Blowout Tier", "ML Blowout Score", "ML Blowout Run Gap",
+                "ML Correct Cover Lean", "ML Correct Cover Prob %", "ML Cover Side Check",
+                "ML Cover Brain Reason", "ML Card Cover Lean Original",
+                "ML Card Away Projected Runs", "ML Card Home Projected Runs",
+                "ML Card Away Win %", "ML Card Home Win %",
+                "Away SP", "Home SP", "ML SP Sample Guardrail",
+                "ML Risk Reasons", "ML Support Signals", "ML Blowout Brain Version",
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"ML blowout / cover brain unavailable: {e}")
+
+
+ML_SCORE_BRAIN_VERSION = "ML_SCORE_PROJECTION_BRAIN_SUPPORT_ONLY_2026_07_26"
+
+
+def _mlsb_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _mlsb_clip(value, lo, hi, default=np.nan):
+    v = _mlsb_num(value, default)
+    if not np.isfinite(v):
+        return default
+    return max(lo, min(hi, float(v)))
+
+
+def _mlsb_side_value(row, side, keys, default=np.nan):
+    pfx = "Away" if str(side).upper() == "AWAY" else "Home"
+    for key in keys:
+        v = _mlsb_num(row.get(f"{pfx} {key}"), np.nan)
+        if np.isfinite(v):
+            return v
+    return default
+
+
+def _mlsb_score_profile(row):
+    away, home = _mlcard_matchup_teams(row) if "_mlcard_matchup_teams" in globals() else ("AWAY", "HOME")
+    away = str(away or "AWAY").upper()
+    home = str(home or "HOME").upper()
+    ar = _mlsb_num(row.get("ML Card Away Projected Runs"), _mlsb_num(row.get("Away Projected Runs"), np.nan))
+    hr = _mlsb_num(row.get("ML Card Home Projected Runs"), _mlsb_num(row.get("Home Projected Runs"), np.nan))
+    if not np.isfinite(ar) or not np.isfinite(hr):
+        parsed = _mlcard_projected_runs(row) if "_mlcard_projected_runs" in globals() else (np.nan, np.nan)
+        ar = parsed[0] if not np.isfinite(ar) else ar
+        hr = parsed[1] if not np.isfinite(hr) else hr
+
+    a_bsr = _mlsb_side_value(row, "AWAY", ["BaseRuns/G", "BaseRuns"], np.nan)
+    h_bsr = _mlsb_side_value(row, "HOME", ["BaseRuns/G", "BaseRuns"], np.nan)
+    a_power = _mlsb_side_value(row, "AWAY", ["Power Rating", "Lineup Strength"], 50.0)
+    h_power = _mlsb_side_value(row, "HOME", ["Power Rating", "Lineup Strength"], 50.0)
+    a_bp_runs = _mlsb_side_value(row, "AWAY", ["Opp Bullpen Runs", "Opponent Bullpen Runs"], np.nan)
+    h_bp_runs = _mlsb_side_value(row, "HOME", ["Opp Bullpen Runs", "Opponent Bullpen Runs"], np.nan)
+    a_bp = _mlsb_side_value(row, "AWAY", ["Bullpen"], 50.0)
+    h_bp = _mlsb_side_value(row, "HOME", ["Bullpen"], 50.0)
+    park = _mlsb_clip(row.get("Park Factor"), 0.86, 1.16, 1.0)
+    total_line = _mlsb_num(row.get("ML Card Total Line"), _mlsb_num(row.get("Total Line"), _mlsb_num(row.get("Game Total"), np.nan)))
+    market_total = total_line if np.isfinite(total_line) and 5.0 <= total_line <= 14.0 else np.nan
+
+    def one_side(base_runs, opp_bsr, power, opp_bp_runs, opp_bp, raw):
+        parts = []
+        if np.isfinite(raw):
+            parts.append((float(raw), 0.46))
+        if np.isfinite(base_runs):
+            parts.append((float(base_runs), 0.24))
+        if np.isfinite(opp_bsr):
+            parts.append((9.0 - float(opp_bsr)) * 0.52, 0.08)
+        if np.isfinite(opp_bp_runs):
+            parts.append(float(opp_bp_runs) + 2.75, 0.09)
+        if np.isfinite(power):
+            parts.append(4.35 + (float(power) - 50.0) * 0.020, 0.08)
+        if np.isfinite(opp_bp):
+            parts.append(4.35 - (float(opp_bp) - 50.0) * 0.010, 0.05)
+        if not parts:
+            return raw if np.isfinite(raw) else 4.35
+        val = sum(v * w for v, w in parts) / max(0.001, sum(w for _, w in parts))
+        if np.isfinite(park):
+            val *= (0.74 + 0.26 * float(park))
+        return max(1.7, min(8.2, val))
+
+    adj_a = one_side(a_bsr, h_bsr, a_power, a_bp_runs, h_bp, ar)
+    adj_h = one_side(h_bsr, a_bsr, h_power, h_bp_runs, a_bp, hr)
+
+    if np.isfinite(market_total):
+        raw_total = max(0.1, adj_a + adj_h)
+        blend_total = raw_total * 0.72 + market_total * 0.28
+        scale = max(0.72, min(1.25, blend_total / raw_total))
+        adj_a *= scale
+        adj_h *= scale
+
+    # Do not let the support layer swing good projections wildly in one pass.
+    if np.isfinite(ar):
+        adj_a = ar + max(-0.65, min(0.65, adj_a - ar))
+    if np.isfinite(hr):
+        adj_h = hr + max(-0.65, min(0.65, adj_h - hr))
+
+    raw_gap = ar - hr if np.isfinite(ar) and np.isfinite(hr) else np.nan
+    adj_gap = adj_a - adj_h
+    total_adj = adj_a + adj_h
+    reasons = []
+    if np.isfinite(market_total):
+        reasons.append(f"market total blend {market_total:.1f}")
+    if np.isfinite(a_bsr) or np.isfinite(h_bsr):
+        reasons.append("BaseRuns check")
+    if np.isfinite(a_bp_runs) or np.isfinite(h_bp_runs):
+        reasons.append("bullpen run exposure")
+    if np.isfinite(park) and abs(park - 1.0) >= 0.025:
+        reasons.append(f"park x{park:.3f}")
+    if np.isfinite(raw_gap) and abs(adj_gap - raw_gap) >= 0.35:
+        reasons.append("run-gap correction")
+    if not reasons:
+        reasons.append("original score trusted")
+
+    confidence = 50.0
+    confidence += 10.0 if np.isfinite(ar) and np.isfinite(hr) else -8.0
+    confidence += 8.0 if np.isfinite(a_bsr) and np.isfinite(h_bsr) else 0.0
+    confidence += 6.0 if np.isfinite(a_bp_runs) or np.isfinite(h_bp_runs) else 0.0
+    confidence += 5.0 if np.isfinite(market_total) else 0.0
+    confidence += 4.0 if np.isfinite(park) else 0.0
+    if np.isfinite(raw_gap) and abs(adj_gap - raw_gap) > 0.55:
+        confidence -= 7.0
+    confidence = round(max(20.0, min(92.0, confidence)), 1)
+
+    if confidence >= 75:
+        label = "TRUST_SCORE"
+    elif confidence >= 62:
+        label = "GOOD_SCORE_READ"
+    elif confidence >= 48:
+        label = "TRACK_SCORE"
+    else:
+        label = "LOW_SCORE_CONFIDENCE"
+
+    return {
+        "ML Score Brain Version": ML_SCORE_BRAIN_VERSION,
+        "ML Score Brain Away Runs": round(float(adj_a), 2),
+        "ML Score Brain Home Runs": round(float(adj_h), 2),
+        "ML Score Brain Projected Score": f"{away} {adj_a:.1f} - {home} {adj_h:.1f}",
+        "ML Score Brain Run Gap": round(float(adj_gap), 2),
+        "ML Score Brain Total Runs": round(float(total_adj), 2),
+        "ML Score Confidence %": confidence,
+        "ML Score Confidence Label": label,
+        "ML Score Brain Notes": "; ".join(reasons),
+    }
+
+
+def _mlsb_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            add = _mlsb_score_profile(row)
+            row.update(add)
+            # Display/simulation support only: keep Pick and model win probability unchanged.
+            row["ML Card Away Projected Runs Original"] = row.get("ML Card Away Projected Runs", row.get("Away Projected Runs", ""))
+            row["ML Card Home Projected Runs Original"] = row.get("ML Card Home Projected Runs", row.get("Home Projected Runs", ""))
+            row["ML Card Away Projected Runs"] = round(float(add["ML Score Brain Away Runs"]), 1)
+            row["ML Card Home Projected Runs"] = round(float(add["ML Score Brain Home Runs"]), 1)
+            row["Projected Score"] = add["ML Score Brain Projected Score"]
+            if "_mlbc_profile" in globals():
+                row.update(_mlbc_profile(row))
+                row["ML Card Cover Lean"] = row.get("ML Correct Cover Lean", row.get("ML Card Cover Lean", ""))
+                row["ML Card Cover Prob %"] = row.get("ML Correct Cover Prob %", row.get("ML Card Cover Prob %", ""))
+        except Exception as e:
+            row["ML Score Brain Version"] = ML_SCORE_BRAIN_VERSION
+            row["ML Score Brain Error"] = str(e)[:120]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+_MLSB_PREV_BUILD_BOARD = ml_build_board if "ml_build_board" in globals() else None
+
+
+def ml_build_board(board):
+    if _MLSB_PREV_BUILD_BOARD is None:
+        return pd.DataFrame()
+    return _mlsb_apply(_MLSB_PREV_BUILD_BOARD(board))
+
+
+_MLSB_PREV_RENDER_ML = render_moneyline_edge_tab if "render_moneyline_edge_tab" in globals() else None
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    if _MLSB_PREV_RENDER_ML is not None:
+        _MLSB_PREV_RENDER_ML(board, dates)
+    try:
+        df = ml_build_board(board)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">ML Score Projection Brain</div>', unsafe_allow_html=True)
+            st.caption("Support-only score sanity layer. It blends original projected score with BaseRuns, bullpen run exposure, park, and market total when available; ML pick and win probability are not replaced.")
+            cols = [c for c in [
+                "Matchup", "ML Score Brain Projected Score", "ML Score Confidence Label", "ML Score Confidence %",
+                "ML Score Brain Run Gap", "ML Score Brain Total Runs", "ML Score Brain Notes",
+                "ML Card Away Projected Runs Original", "ML Card Home Projected Runs Original",
+                "ML Card Away Projected Runs", "ML Card Home Projected Runs",
+                "ML Card Best Play", "ML Blowout Tier", "ML Correct Cover Lean", "ML Cover Side Check",
+                "Away BaseRuns/G", "Home BaseRuns/G", "Away Opp Bullpen Runs", "Home Opp Bullpen Runs",
+                "Park Factor", "ML Card Total Line", "ML Score Brain Version",
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"ML score projection brain unavailable: {e}")
+
+
+HISTORICAL_ACTUALS_DB_VERSION = "HISTORICAL_ACTUALS_POST_SLATE_CALIBRATION_2026_07_26"
+
+
+def _hadb_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _hadb_first(row, names, default=""):
+    row = row.to_dict() if isinstance(row, pd.Series) else dict(row or {})
+    low = {str(k).lower(): k for k in row.keys()}
+    for name in names:
+        if name in row and row.get(name) not in [None, "", "—", "nan", "NaN"]:
+            return row.get(name)
+        k = low.get(str(name).lower())
+        if k is not None and row.get(k) not in [None, "", "—", "nan", "NaN"]:
+            return row.get(k)
+    return default
+
+
+def _hadb_learning_dirs():
+    dirs = []
+    try:
+        dirs.append(Path("learning_data"))
+        dirs.append(Path.cwd() / "learning_data")
+        dirs.append(Path(__file__).resolve().parent / "learning_data")
+    except Exception:
+        pass
+    out = []
+    seen = set()
+    for d in dirs:
+        s = str(d)
+        if s not in seen:
+            seen.add(s)
+            out.append(d)
+    return out
+
+
+def _hadb_read_csv(name):
+    for base in _hadb_learning_dirs():
+        try:
+            p = base / name
+            if p.exists():
+                return pd.read_csv(p), str(p)
+        except Exception:
+            continue
+    return pd.DataFrame(), ""
+
+
+def _hadb_data_freshness_rows():
+    rows = []
+    today = pd.Timestamp(datetime.now().date())
+    for name in ["Pitch.csv", "Batter.csv", "TeamOffense.csv", "Bullpen.csv", "graded_history.csv"]:
+        df, path = _hadb_read_csv(name)
+        row = {"File": name, "Rows": len(df) if isinstance(df, pd.DataFrame) else 0, "Path": path or "missing"}
+        if df is None or df.empty:
+            row.update({"Max Date": "", "Age Days": "", "Freshness": "MISSING", "Note": "file not loaded"})
+            rows.append(row)
+            continue
+        date_cols = [c for c in df.columns if c.lower() in {"date", "game_date", "gamedate"} or "date" in c.lower()]
+        if date_cols:
+            s = pd.to_datetime(df[date_cols[0]], errors="coerce")
+            if s.notna().any():
+                max_date = pd.Timestamp(s.max().date())
+                age = int((today - max_date).days)
+                if age <= 2:
+                    fresh = "CURRENT"
+                elif age <= 7:
+                    fresh = "WATCH"
+                else:
+                    fresh = "STALE"
+                row.update({"Max Date": str(max_date.date()), "Age Days": age, "Freshness": fresh, "Note": f"dated by {date_cols[0]}"})
+            else:
+                row.update({"Max Date": "", "Age Days": "", "Freshness": "UNKNOWN", "Note": f"{date_cols[0]} could not parse"})
+        else:
+            row.update({"Max Date": "", "Age Days": "", "Freshness": "NO_DATE_COLUMN", "Note": "season/team snapshot; refresh manually when source updates"})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def render_learning_data_freshness_panel():
+    st.markdown('<div class="section-title-pro">Learning Data Freshness Check</div>', unsafe_allow_html=True)
+    st.caption("Read-only. This protects projections by warning when embedded CSVs are old instead of silently trusting stale files.")
+    fresh = _hadb_data_freshness_rows()
+    if fresh is None or fresh.empty:
+        st.info("No learning_data CSVs found yet.")
+        return
+    stale = int(fresh["Freshness"].astype(str).isin(["STALE", "MISSING"]).sum()) if "Freshness" in fresh else 0
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Files Checked", len(fresh))
+    c2.metric("Stale/Missing", stale)
+    c3.metric("Freshness Version", HISTORICAL_ACTUALS_DB_VERSION.split("_")[-1])
+    st.dataframe(fresh, use_container_width=True, hide_index=True)
+
+
+def _hadb_parse_pick(pick_text, fallback_line=np.nan):
+    raw = str(pick_text or "").strip()
+    side = ""
+    line = _hadb_num(fallback_line, np.nan)
+    up = raw.upper().replace("OVER", "O").replace("UNDER", "U")
+    parts = up.replace("—", " ").replace("-", " ").split()
+    if parts:
+        if parts[0].startswith("O"):
+            side = "OVER"
+        elif parts[0].startswith("U"):
+            side = "UNDER"
+    for tok in parts[1:]:
+        v = _hadb_num(tok, np.nan)
+        if np.isfinite(v):
+            line = v
+            break
+    return side, line, raw
+
+
+def _hadb_ip_to_outs(ip_value):
+    try:
+        s = str(ip_value)
+        if "." in s:
+            whole, frac = s.split(".", 1)
+            whole_i = int(float(whole or 0))
+            frac_i = int(str(frac)[:1] or 0)
+            if frac_i in (1, 2):
+                return whole_i * 3 + frac_i
+        v = float(ip_value)
+        return int(round(v * 3))
+    except Exception:
+        return np.nan
+
+
+def _hadb_result(side, line, actual, existing=""):
+    ex = str(existing or "").upper().strip()
+    if ex in {"WIN", "W"}:
+        return "WIN"
+    if ex in {"LOSS", "LOSE", "L"}:
+        return "LOSS"
+    if ex in {"PUSH", "VOID", "NL", "NO LINE", "NO_LINE"}:
+        return ex.replace("NO_LINE", "NO LINE")
+    if side in {"OVER", "UNDER"} and np.isfinite(line) and np.isfinite(actual):
+        if actual == line:
+            return "PUSH"
+        return "WIN" if ((actual > line) if side == "OVER" else (actual < line)) else "LOSS"
+    return ""
+
+
+def _hadb_market(row, source):
+    text = " ".join(str(_hadb_first(row, [c], "")) for c in ["market", "Market", "prop_type", "Prop Type", "type", "Type"]).upper()
+    pick = str(_hadb_first(row, ["Pick", "pick", "Decision", "Final Decision"], "")).upper()
+    if "MONEY" in text or " ML" in pick:
+        return "ML"
+    if "COVER" in text or "CVR" in pick or "RUN LINE" in text:
+        return "COVER"
+    if "OUT" in text:
+        return "PO"
+    if "SCORE" in text:
+        return "SCORE"
+    if "K" in text or _hadb_first(row, ["Actual_K", "Actual K", "actual_k"], "") != "":
+        return "K"
+    if "Pitch.csv" in source:
+        return "PITCHER_START"
+    return text or "UNKNOWN"
+
+
+def _hadb_flags(row):
+    pieces = []
+    for k, v in (row.to_dict() if isinstance(row, pd.Series) else dict(row or {})).items():
+        lk = str(k).lower()
+        if any(word in lk for word in ["flag", "brain", "tier", "grade", "risk", "support", "confidence label", "side check"]):
+            sv = str(v or "").strip()
+            if sv and sv not in {"nan", "NaN", "—"}:
+                pieces.append(f"{k}: {sv}")
+    return "; ".join(pieces[:12])
+
+
+def _hadb_normalize_row(row, source):
+    market = _hadb_market(row, source)
+    pick_raw = _hadb_first(row, ["Pick", "pick", "Decision", "Final Decision", "ML Card Best Play"], "")
+    side, parsed_line, raw_pick = _hadb_parse_pick(pick_raw, _hadb_first(row, ["Line", "line", "final_line", "UD/Line"], np.nan))
+    actual_k = _hadb_num(_hadb_first(row, ["Actual_K", "Actual K", "actual_k", "K"], np.nan), np.nan)
+    actual_ip = _hadb_first(row, ["Actual_IP", "Actual IP", "actual_ip", "IP"], "")
+    actual_bf = _hadb_num(_hadb_first(row, ["Actual BF", "actual_bf", "BF"], np.nan), np.nan)
+    actual_pitches = _hadb_num(_hadb_first(row, ["Pitches", "Pitch Count", "actual_pitches"], np.nan), np.nan)
+    actual_er = _hadb_num(_hadb_first(row, ["Actual ER", "actual_er", "ER"], np.nan), np.nan)
+    actual_h = _hadb_num(_hadb_first(row, ["Actual H", "actual_h", "H"], np.nan), np.nan)
+    actual_bb = _hadb_num(_hadb_first(row, ["Actual BB", "actual_bb", "BB"], np.nan), np.nan)
+    actual_hr = _hadb_num(_hadb_first(row, ["Actual HR", "actual_hr", "HR"], np.nan), np.nan)
+    projection = _hadb_num(_hadb_first(row, [
+        "Projection", "projection", "K PROJ", "APP97 True K Projection", "Final K Projection",
+        "PROJ", "Projected", "ML Score Brain Run Gap", "Score Edge"
+    ], np.nan), np.nan)
+    line = parsed_line
+    actual = np.nan
+    if market == "K":
+        actual = actual_k
+    elif market == "PO":
+        actual = _hadb_num(_hadb_first(row, ["Actual Outs", "actual_outs"], np.nan), np.nan)
+        if not np.isfinite(actual):
+            actual = _hadb_ip_to_outs(actual_ip)
+    elif market == "PITCHER_START":
+        actual = actual_k
+    result = _hadb_result(side, line, actual, _hadb_first(row, ["Result", "graded_result", "Graded Result"], ""))
+    edge = np.nan
+    if np.isfinite(projection) and np.isfinite(line) and side in {"OVER", "UNDER"}:
+        edge = projection - line if side == "OVER" else line - projection
+    date = str(_hadb_first(row, ["Date", "date", "game_date", "Game Date"], ""))[:10]
+    pitcher = str(_hadb_first(row, ["Pitcher", "pitcher", "Player", "player"], "")).strip()
+    team = str(_hadb_first(row, ["Team", "team"], "")).upper().strip()
+    matchup = str(_hadb_first(row, ["Matchup", "matchup"], "")).strip()
+    if not matchup and team:
+        opp = str(_hadb_first(row, ["Opponent", "opponent"], "")).upper().strip()
+        matchup = f"{team} vs {opp}" if opp else team
+    return {
+        "Date": date,
+        "Market": market,
+        "Entity": pitcher or team or str(_hadb_first(row, ["Pick", "Team"], "")),
+        "Pitcher": pitcher,
+        "Team": team,
+        "Matchup": matchup,
+        "Side": side,
+        "Line": "" if not np.isfinite(line) else float(line),
+        "Projection": "" if not np.isfinite(projection) else round(float(projection), 3),
+        "Edge": "" if not np.isfinite(edge) else round(float(edge), 3),
+        "Actual": "" if not np.isfinite(actual) else float(actual),
+        "Actual K": "" if not np.isfinite(actual_k) else float(actual_k),
+        "Actual IP": actual_ip,
+        "Actual BF": "" if not np.isfinite(actual_bf) else float(actual_bf),
+        "Pitches": "" if not np.isfinite(actual_pitches) else float(actual_pitches),
+        "ER": "" if not np.isfinite(actual_er) else float(actual_er),
+        "H": "" if not np.isfinite(actual_h) else float(actual_h),
+        "BB": "" if not np.isfinite(actual_bb) else float(actual_bb),
+        "HR": "" if not np.isfinite(actual_hr) else float(actual_hr),
+        "Result": result,
+        "Pick Raw": raw_pick,
+        "Flags": _hadb_flags(row),
+        "Source": source,
+        "Historical Actuals Version": HISTORICAL_ACTUALS_DB_VERSION,
+    }
+
+
+def load_historical_actuals_database():
+    rows = []
+    sources = []
+    for filename in ["graded_history.csv", "Pitch.csv"]:
+        df, path = _hadb_read_csv(filename)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            sources.append({"file": filename, "path": path, "rows": len(df)})
+            for _, rr in df.iterrows():
+                rows.append(_hadb_normalize_row(rr, filename))
+    try:
+        result_log = load_json(RESULT_LOG, []) if "load_json" in globals() and "RESULT_LOG" in globals() else []
+        if isinstance(result_log, list) and result_log:
+            sources.append({"file": "RESULT_LOG", "path": str(RESULT_LOG), "rows": len(result_log)})
+            for rr in result_log:
+                if isinstance(rr, dict):
+                    rows.append(_hadb_normalize_row(rr, "RESULT_LOG"))
+    except Exception:
+        pass
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        key_cols = [c for c in ["Date", "Market", "Entity", "Matchup", "Side", "Line", "Actual"] if c in out.columns]
+        if key_cols:
+            out = out.drop_duplicates(subset=key_cols, keep="last")
+    try:
+        st.session_state["historical_actuals_sources"] = sources
+    except Exception:
+        pass
+    return out
+
+
+def _hadb_bucket_line(v):
+    x = _hadb_num(v, np.nan)
+    if not np.isfinite(x):
+        return "NO_LINE"
+    if x < 3:
+        return "2.5"
+    if x < 4:
+        return "3.5"
+    if x < 5:
+        return "4.5"
+    if x < 6:
+        return "5.5"
+    if x < 7:
+        return "6.5"
+    return "7.5+"
+
+
+def _hadb_winrate_table(df, group_cols):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df[df["Result"].isin(["WIN", "LOSS"])].copy()
+    if d.empty:
+        return pd.DataFrame()
+    d["Win"] = d["Result"].eq("WIN").astype(float)
+    out = d.groupby(group_cols, dropna=False).agg(
+        Plays=("Result", "count"),
+        Wins=("Win", "sum"),
+        Win_Rate=("Win", "mean"),
+        Avg_Edge=("Edge", lambda s: pd.to_numeric(s, errors="coerce").mean()),
+        Avg_Projection_Error=("Projection Error", lambda s: pd.to_numeric(s, errors="coerce").mean()),
+        Missed_By_One_Rate=("Missed By One", "mean"),
+    ).reset_index()
+    out["Wins"] = out["Wins"].astype(int)
+    out["Win_Rate"] = (out["Win_Rate"] * 100).round(1)
+    out["Missed_By_One_Rate"] = (out["Missed_By_One_Rate"] * 100).round(1)
+    out["Avg_Edge"] = out["Avg_Edge"].round(2)
+    out["Avg_Projection_Error"] = out["Avg_Projection_Error"].round(2)
+    return out.sort_values(["Plays", "Win_Rate"], ascending=[False, False])
+
+
+def build_post_slate_calibration_report(actuals=None):
+    df = actuals if isinstance(actuals, pd.DataFrame) else load_historical_actuals_database()
+    if df is None or df.empty:
+        return {}
+    d = df.copy()
+    for c in ["Line", "Projection", "Actual", "Edge"]:
+        d[c] = pd.to_numeric(d.get(c), errors="coerce")
+    d["Projection Error"] = d["Projection"] - d["Actual"]
+    d["Abs Projection Error"] = (d["Projection"] - d["Actual"]).abs()
+    d["Missed By One"] = ((d["Actual"] - d["Line"]).abs() <= 1.0) & d["Result"].eq("LOSS")
+    d["Line Bucket"] = d["Line"].apply(_hadb_bucket_line)
+    flag_rows = []
+    graded = d[d["Result"].isin(["WIN", "LOSS"])].copy()
+    if not graded.empty and "Flags" in graded.columns:
+        for _, rr in graded.iterrows():
+            flags = [x.strip() for x in str(rr.get("Flags") or "").split(";") if x.strip()]
+            if not flags:
+                flags = [str(rr.get("Pick Raw") or "").strip() or "NO_FLAG"]
+            for flag in flags[:8]:
+                flag_rows.append({"Flag": flag[:80], "Market": rr.get("Market"), "Win": 1 if rr.get("Result") == "WIN" else 0})
+    flags_df = pd.DataFrame(flag_rows)
+    if not flags_df.empty:
+        flag_summary = flags_df.groupby(["Market", "Flag"], dropna=False).agg(
+            Plays=("Win", "count"),
+            Win_Rate=("Win", "mean"),
+        ).reset_index()
+        flag_summary["Win_Rate"] = (flag_summary["Win_Rate"] * 100).round(1)
+        flag_summary["Recommendation"] = np.where(
+            (flag_summary["Plays"] >= 8) & (flag_summary["Win_Rate"] >= 58), "TRUST MORE",
+            np.where((flag_summary["Plays"] >= 8) & (flag_summary["Win_Rate"] <= 45), "DOWNGRADE/IGNORE", "TRACK")
+        )
+        flag_summary = flag_summary.sort_values(["Plays", "Win_Rate"], ascending=[False, False])
+    else:
+        flag_summary = pd.DataFrame()
+    return {
+        "actuals": d,
+        "market": _hadb_winrate_table(d, ["Market"]),
+        "side": _hadb_winrate_table(d, ["Market", "Side"]),
+        "line_bucket": _hadb_winrate_table(d, ["Market", "Line Bucket", "Side"]),
+        "flags": flag_summary,
+        "version": HISTORICAL_ACTUALS_DB_VERSION,
+    }
+
+
+def render_historical_actuals_calibration_panel():
+    st.markdown('<div class="section-title-pro">Historical Actuals / Post-Slate Calibration</div>', unsafe_allow_html=True)
+    st.caption("Support-only. This normalizes graded K/PO/ML/cover/score results and shows which buckets or flags helped after the slate.")
+    render_learning_data_freshness_panel()
+    actuals = load_historical_actuals_database()
+    sources = st.session_state.get("historical_actuals_sources", [])
+    if sources:
+        st.dataframe(pd.DataFrame(sources), use_container_width=True, hide_index=True)
+    if actuals is None or actuals.empty:
+        st.info("No historical actuals loaded yet. Add learning_data/graded_history.csv or grade today's board.")
+        return
+    report = build_post_slate_calibration_report(actuals)
+    d = report.get("actuals", actuals)
+    g = d[d["Result"].isin(["WIN", "LOSS"])] if "Result" in d.columns else pd.DataFrame()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Actual Rows", len(d))
+    c2.metric("Graded Plays", len(g))
+    c3.metric("Markets", d["Market"].nunique() if "Market" in d else 0)
+    c4.metric("Overall Win %", f"{(g['Result'].eq('WIN').mean()*100):.1f}%" if not g.empty else "—")
+    tabs = st.tabs(["Market", "Line Buckets", "Flags Help/Hurt", "Clean Actuals"])
+    with tabs[0]:
+        st.dataframe(report.get("market", pd.DataFrame()), use_container_width=True, hide_index=True)
+        st.dataframe(report.get("side", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with tabs[1]:
+        st.dataframe(report.get("line_bucket", pd.DataFrame()), use_container_width=True, hide_index=True)
+    with tabs[2]:
+        flags = report.get("flags", pd.DataFrame())
+        if flags is None or flags.empty:
+            st.info("No rich flag columns found yet. Future K/PO/ML graded rows with brain/tier/risk fields will populate this.")
+        else:
+            st.dataframe(flags, use_container_width=True, hide_index=True)
+    with tabs[3]:
+        cols = [c for c in [
+            "Date", "Market", "Entity", "Matchup", "Side", "Line", "Projection", "Actual", "Result",
+            "Actual K", "Actual IP", "Actual BF", "Pitches", "ER", "H", "BB", "HR",
+            "Edge", "Projection Error", "Missed By One", "Flags", "Source"
+        ] if c in d.columns]
+        st.dataframe(d[cols] if cols else d, use_container_width=True, hide_index=True)
+
+
+_HADB_PREV_RENDER_LEARNING_LAB = render_learning_lab_tab if "render_learning_lab_tab" in globals() else None
+
+
+def render_learning_lab_tab(board=None):
+    if _HADB_PREV_RENDER_LEARNING_LAB is not None:
+        _HADB_PREV_RENDER_LEARNING_LAB(board)
+    try:
+        render_historical_actuals_calibration_panel()
+    except Exception as e:
+        st.info(f"Historical actuals calibration unavailable: {e}")
+
+
 APP98_LOSS_TARGET_K_VERSION = "APP98_LOSS_TARGET_K_AUDIT_ONLY_2026_07_26"
 APP98_PROMOTE_TO_PUBLIC_K_PROJ = False
 
@@ -42738,6 +43551,17 @@ def _kclean_main_df(df):
             "Proj IP": _kclean_pick(row, ["APP100 Projected IP", "IP Floor", "IP PROJ"], ""),
             "Edge": _kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], ""),
             "Pick": _kclean_display_decision(row),
+            "Slip Brain": _kclean_pick(row, ["K Slip Brain Flag"], ""),
+            "Slip Side": _kclean_pick(row, ["K Slip Brain Side"], ""),
+            "Slip Score": _kclean_pick(row, ["K Slip Brain Score"], ""),
+            "Slip Reason": _kclean_pick(row, ["K Slip Brain Reason"], ""),
+            "Arsenal Signal": _kclean_pick(row, ["K Arsenal Signal"], ""),
+            "Top Pitch": _kclean_pick(row, ["K Top Pitch Read", "APP100 Top Pitch"], ""),
+            "Ceiling Read": _kclean_pick(row, ["K Ceiling Read"], ""),
+            "Form Read": _kclean_pick(row, ["K L3/L10 Form Read"], ""),
+            "Heatmap/Foul": _kclean_pick(row, ["K Location/Foul Coverage"], ""),
+            "Stuff/Depth": _kclean_pick(row, ["K Stuff+/Depth Read"], ""),
+            "FI/Ensemble": _kclean_pick(row, ["K FI/Ensemble Read"], ""),
             "K Source": _kclean_pick(row, ["Winning File K Source", "Active K Pipeline", "File33 Projection Source"], ""),
             "External": _kclean_pick(row, ["External K Override"], ""),
             "Sim Side %": _kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], ""),
@@ -43236,6 +44060,13 @@ def render_kproj_tab(board):
             "Projection Data Gate", "Projection Data Issues", "Projection Data Cautions",
             "APP98 Loss Target Projection", "APP98 Loss Target Adjustment", "APP98 Loss Target Reason",
             "K Sim Pick", "K Sim True Prob %", "K Sim Current Side Prob %",
+            "K Slip Brain Flag", "K Slip Brain Side", "K Slip Brain Score",
+            "K Slip Over Support", "K Slip Under Support", "K Slip Brain Reason",
+            "K Arsenal Signal", "K Match K/Hand Read", "K Opp Whiff Read",
+            "K Mix K/Dmg Grade", "K Top Pitch Read", "K Ceiling Read",
+            "K L3/L10 Form Read", "K Location/Foul Coverage",
+            "K Stuff+/Depth Read", "K FI/Ensemble Read",
+            "K Slip Brain Version",
             "APP97 Lineup Status", "APP97 Opponent K Environment",
             "APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%",
             "APP97 Pitcher K Source", "APP97 Pitcher K% Warning",
@@ -43258,6 +44089,421 @@ def render_kproj_tab(board):
         show = df.copy()
         show["K Clean UI Version"] = K_CLEAN_SINGLE_BOARD_UI_VERSION
         st.dataframe(show[cols] if cols else show, use_container_width=True, hide_index=True)
+
+
+K_SLIP_BRAIN_VERSION = "K_SLIP_BRAIN_SUPPORT_FLAGS_2026_07_26"
+
+
+def _kslip_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _kslip_pick(row, keys, default=""):
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v not in (None, "", "—", "nan", "NaN"):
+                return v
+        except Exception:
+            pass
+    return default
+
+
+def _kslip_side(row):
+    txt = str(_kslip_pick(row, ["Decision", "Final Decision", "Model Lean", "APP97 Final Side"], "")).upper()
+    if "OVER" in txt or txt.strip() == "O":
+        return "OVER"
+    if "UNDER" in txt or txt.strip() == "U":
+        return "UNDER"
+    return ""
+
+
+def _kslip_pct(row, keys, default=np.nan):
+    v = _kslip_num(_kslip_pick(row, keys, np.nan), default)
+    if np.isfinite(v) and abs(v) <= 1.0:
+        v *= 100.0
+    return v
+
+
+def _kslip_profile(row):
+    line = _kslip_num(_kslip_pick(row, ["UD/Line", "Line", "Underdog Line"], np.nan), np.nan)
+    proj = _kslip_num(_kslip_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection"], np.nan), np.nan)
+    edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
+    active_side = _kslip_side(row)
+    pitcher_k = _kslip_pct(row, ["APP100 Pitcher K%", "APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K%"], np.nan)
+    opp_k = _kslip_pct(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Opp K%", "Opponent K% Used"], np.nan)
+    whiff = _kslip_pct(row, ["APP100 Whiff%", "Savant Custom Whiff%", "Official Savant Whiff%", "Whiff%", "Putaway/Whiff"], np.nan)
+    k9 = _kslip_num(_kslip_pick(row, ["APP100 Pitcher K/9", "APP97 Live Pitcher K/9", "Pitcher K/9 Used", "K/9"], np.nan), np.nan)
+    bb9 = _kslip_num(_kslip_pick(row, ["APP100 Pitcher BB/9", "APP97 Live Pitcher BB/9", "Pitcher BB/9 Used", "BB/9"], np.nan), np.nan)
+    fip = _kslip_num(_kslip_pick(row, ["APP100 Pitcher FIP", "APP97 Live Pitcher FIP", "Pitcher FIP Used", "FIP"], np.nan), np.nan)
+    bf = _kslip_num(_kslip_pick(row, ["APP100 Projected BF", "APP97 Reconciled Expected BF", "Exp BF", "Proj BF"], np.nan), np.nan)
+    sim_side = _kslip_num(_kslip_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], np.nan), np.nan)
+    ceiling = _kslip_num(_kslip_pick(row, ["Ceiling", "K Sim P90", "APP100 K P90"], np.nan), np.nan)
+    quality = _kslip_num(_kslip_pick(row, ["APP100 Projection Quality Score", "Quality Score"], np.nan), np.nan)
+    recent = str(_kslip_pick(row, ["APP100 Recent Skill", "Recent Skill"], "")).upper()
+    bf_quality = str(_kslip_pick(row, ["APP100 BF Coverage", "BF Quality"], "")).upper()
+    pitch_mix = str(_kslip_pick(row, ["APP100 Pitch Mix Coverage", "Pitch Mix"], "")).upper()
+    risks = " | ".join(str(_kslip_pick(row, [c], "")) for c in ["APP99 Loss Risks", "Loss Risks", "Reason", "APP100 Projection Quality Notes"]).upper()
+    top_pitch = str(_kslip_pick(row, ["APP100 Top Pitch", "Pitch Arsenal Top Pitch Used", "Top Pitch", "Primary Pitch"], "") or "")
+    top_usage = _kslip_num(_kslip_pick(row, ["APP100 Top Pitch Usage", "Pitch Arsenal Top Usage Used", "Top Pitch Usage"], np.nan), np.nan)
+    arsenal_score = _kslip_num(_kslip_pick(row, ["APP100 Arsenal Score", "APP88 Arsenal Matchup Score", "Pitch Mix Matchup Score"], np.nan), np.nan)
+    l10_avg = _kslip_num(_kslip_pick(row, ["L10 Avg", "Atlas L10 Avg K", "Trend L10 Avg", "Trend Weighted Avg 2.2"], np.nan), np.nan)
+    l3_avg = _kslip_num(_kslip_pick(row, ["Atlas L3 Avg K", "Trend L3 Avg 2.2", "L3 Avg", "Recent3 Avg K"], np.nan), np.nan)
+    match_k_hand = _kslip_pct(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment"], np.nan)
+    opp_whiff = _kslip_pct(row, ["Opponent Whiff%", "Opp Whiff%", "APP100 Opp Whiff%", "Team Whiff%"], np.nan)
+    hardhit = _kslip_pct(row, ["Savant Custom HardHit%", "Official Savant HardHit%"], np.nan)
+    barrel = _kslip_pct(row, ["Savant Custom Barrel%", "Official Savant Barrel%"], np.nan)
+    chase_zone = _kslip_pct(row, ["Chase Zone%", "Chase Zone %", "Out of Zone Swing%", "O-Swing%", "O Swing %"], np.nan)
+    edge_zone = _kslip_pct(row, ["Edge Zone%", "Edge%", "Shadow Zone%", "Shadow%"], np.nan)
+    heart_zone = _kslip_pct(row, ["Heart Zone%", "Heart%", "Meatball%", "Middle Zone%"], np.nan)
+    zone_pct = _kslip_pct(row, ["In Zone %", "Zone %", "Zone%"], np.nan)
+    foul_pct = _kslip_pct(row, ["Foul%", "Foul Ball%", "Foul Strike%", "Foul Workload%"], np.nan)
+    foul_per_pa = _kslip_num(_kslip_pick(row, ["Foul/PA", "Fouls per PA", "Foul Per PA"], np.nan), np.nan)
+    stuff_plus = _kslip_num(_kslip_pick(row, ["Stuff+", "Stuff Plus", "botStf", "PitchingBot Stuff", "PitchingBot Stuff+"], np.nan), np.nan)
+    pitching_plus = _kslip_num(_kslip_pick(row, ["Pitching+", "Pitching Plus", "botOvr", "PitchingBot Overall"], np.nan), np.nan)
+    command_plus = _kslip_num(_kslip_pick(row, ["Command+", "Command Plus", "botCmd", "PitchingBot Command"], np.nan), np.nan)
+    depth_ip = _kslip_num(_kslip_pick(row, ["Depth Chart IP", "FanGraphs DC IP", "Projected Season IP", "Projected IP"], np.nan), np.nan)
+    depth_gs = _kslip_num(_kslip_pick(row, ["Depth Chart GS", "FanGraphs DC GS", "Projected GS", "Projected Starts"], np.nan), np.nan)
+    fi_pc_avg = _kslip_num(_kslip_pick(row, ["1st Inn Pitch Count Avg", "FI Pitch Count Avg", "First Inning PC Avg"], np.nan), np.nan)
+    fi_bf_avg = _kslip_num(_kslip_pick(row, ["1st Inn BF Avg", "FI BF Avg", "First Inning BF Avg"], np.nan), np.nan)
+    fi_k_rate = _kslip_pct(row, ["1st Inn K%", "FI K%", "First Inning K%"], np.nan)
+    steamer_k = _kslip_num(_kslip_pick(row, ["Steamer K Projection", "Steamer K PROJ", "Steamer SO"], np.nan), np.nan)
+    zips_k = _kslip_num(_kslip_pick(row, ["ZiPS K Projection", "ZiPS K PROJ", "Zips SO"], np.nan), np.nan)
+    dc_k = _kslip_num(_kslip_pick(row, ["Depth Charts K Projection", "Depth Chart K Projection", "FG DC K PROJ"], np.nan), np.nan)
+    pecota_k = _kslip_num(_kslip_pick(row, ["PECOTA K Projection", "PECOTA K PROJ"], np.nan), np.nan)
+
+    over = 0
+    under = 0
+    reasons_over = []
+    reasons_under = []
+
+    def add_over(points, reason):
+        nonlocal over
+        over += points
+        reasons_over.append(reason)
+
+    def add_under(points, reason):
+        nonlocal under
+        under += points
+        reasons_under.append(reason)
+
+    if np.isfinite(pitcher_k):
+        if pitcher_k >= 33:
+            add_over(4, f"elite pitcher K% {pitcher_k:.1f}")
+        elif pitcher_k >= 27:
+            add_over(3, f"strong pitcher K% {pitcher_k:.1f}")
+        elif pitcher_k >= 24:
+            add_over(2, f"above-average pitcher K% {pitcher_k:.1f}")
+        elif pitcher_k <= 19:
+            add_under(3, f"low pitcher K% {pitcher_k:.1f}")
+        elif pitcher_k <= 21:
+            add_under(2, f"below-average pitcher K% {pitcher_k:.1f}")
+    if np.isfinite(whiff):
+        if whiff >= 34:
+            add_over(3, f"elite whiff {whiff:.1f}")
+        elif whiff >= 28:
+            add_over(2, f"whiff support {whiff:.1f}")
+        elif whiff <= 23:
+            add_under(2, f"low whiff {whiff:.1f}")
+    if np.isfinite(k9):
+        if k9 >= 10.5:
+            add_over(2, f"K/9 ceiling {k9:.1f}")
+        elif k9 >= 9.0:
+            add_over(1, f"K/9 support {k9:.1f}")
+        elif k9 <= 7.8:
+            add_under(1, f"low K/9 {k9:.1f}")
+    if np.isfinite(opp_k):
+        if opp_k >= 24:
+            add_over(3, f"opponent K% support {opp_k:.1f}")
+        elif opp_k >= 22.5:
+            add_over(1, f"opponent K% ok {opp_k:.1f}")
+        elif opp_k <= 20.8:
+            add_under(2, f"contact opponent {opp_k:.1f}")
+    if np.isfinite(bf):
+        if bf >= 21.0:
+            add_over(1, f"BF support {bf:.1f}")
+        elif bf <= 18.5:
+            add_under(1, f"thin BF {bf:.1f}")
+    if np.isfinite(fip):
+        if fip <= 3.20:
+            add_over(1, f"run-prevention support FIP {fip:.2f}")
+        elif fip >= 4.70:
+            add_under(1, f"damage/FIP risk {fip:.2f}")
+    if np.isfinite(bb9) and bb9 >= 3.7:
+        add_under(1, f"walk workload risk BB/9 {bb9:.1f}")
+    if "RECENT_SKILL_SUPPORT" in recent:
+        add_over(1, "recent skill support")
+    elif "RECENT_SKILL_CAUTION" in recent:
+        add_under(1, "recent skill caution")
+    if "PITCH_MIX_MATCHUP_READY" in pitch_mix:
+        add_over(1, "pitch-mix data ready")
+    if "THIN_BF" in bf_quality or "LOW_BF" in bf_quality:
+        add_under(1, bf_quality.lower())
+    if np.isfinite(ceiling) and np.isfinite(line) and ceiling >= line + 1.5:
+        add_over(2, f"ceiling clears line P90 {ceiling:g}")
+    if "CEILING CLEARS LINE" in risks or "P90" in risks:
+        add_over(2, "ceiling/upper-tail warning present")
+    if "LOW OFFICIAL PITCHER K" in risks or "LOW PITCHER K" in risks:
+        add_under(2, "low pitcher K risk already flagged")
+    if "CONTACT" in risks and "SUPPRESSION" in risks:
+        add_under(1, "contact-suppression warning")
+    if np.isfinite(edge):
+        if abs(edge) < 0.35:
+            add_under(1, "thin edge")
+        elif edge >= 0.85:
+            add_over(1, f"projection edge +{edge:.2f}")
+        elif edge <= -0.85:
+            add_under(1, f"under edge {edge:.2f}")
+    if np.isfinite(sim_side) and sim_side < 52 and active_side == "OVER":
+        add_under(1, f"thin over simulation {sim_side:.1f}%")
+    if np.isfinite(arsenal_score):
+        if arsenal_score >= 65:
+            add_over(2, f"arsenal matchup score {arsenal_score:.0f}")
+        elif arsenal_score <= 42:
+            add_under(2, f"arsenal matchup risk {arsenal_score:.0f}")
+    if np.isfinite(top_usage) and top_usage >= 35 and np.isfinite(arsenal_score) and arsenal_score >= 58:
+        add_over(1, f"top pitch {top_pitch or 'primary'} {top_usage:.0f}% supports")
+    if np.isfinite(hardhit) and hardhit >= 46:
+        add_under(1, f"hard-hit risk {hardhit:.1f}%")
+    if np.isfinite(barrel) and barrel >= 10:
+        add_under(1, f"barrel risk {barrel:.1f}%")
+    if np.isfinite(chase_zone) and chase_zone >= 31:
+        add_over(1, f"chase-zone support {chase_zone:.1f}%")
+    if np.isfinite(edge_zone) and edge_zone >= 43:
+        add_over(1, f"edge-zone support {edge_zone:.1f}%")
+    if np.isfinite(heart_zone) and heart_zone >= 31:
+        add_under(1, f"heart-zone damage risk {heart_zone:.1f}%")
+    if np.isfinite(foul_pct) and foul_pct >= 29:
+        add_under(1, f"foul workload risk {foul_pct:.1f}%")
+    if np.isfinite(foul_per_pa) and foul_per_pa >= 1.65:
+        add_under(1, f"foul workload {foul_per_pa:.2f}/PA")
+    if np.isfinite(stuff_plus):
+        if stuff_plus >= 112:
+            add_over(2, f"Stuff+ ceiling {stuff_plus:.0f}")
+        elif stuff_plus >= 104:
+            add_over(1, f"Stuff+ support {stuff_plus:.0f}")
+        elif stuff_plus <= 92:
+            add_under(1, f"Stuff+ risk {stuff_plus:.0f}")
+    if np.isfinite(pitching_plus):
+        if pitching_plus >= 108:
+            add_over(1, f"Pitching+ support {pitching_plus:.0f}")
+        elif pitching_plus <= 92:
+            add_under(1, f"Pitching+ risk {pitching_plus:.0f}")
+    if np.isfinite(command_plus) and command_plus <= 90:
+        add_under(1, f"Command+ workload risk {command_plus:.0f}")
+    if np.isfinite(depth_ip) and np.isfinite(depth_gs) and depth_gs > 0:
+        depth_ip_per_start = depth_ip / depth_gs
+        if depth_ip_per_start >= 5.6:
+            add_over(1, f"depth-chart workload {depth_ip_per_start:.1f} IP/start")
+        elif depth_ip_per_start <= 4.6:
+            add_under(1, f"depth-chart short leash {depth_ip_per_start:.1f} IP/start")
+    if np.isfinite(fi_pc_avg) and fi_pc_avg >= 20:
+        add_under(1, f"hot/long first inning PC {fi_pc_avg:.1f}")
+    if np.isfinite(fi_bf_avg) and fi_bf_avg >= 5.0:
+        add_under(1, f"first-inning traffic {fi_bf_avg:.1f} BF")
+    if np.isfinite(fi_k_rate) and fi_k_rate >= 30:
+        add_over(1, f"first-inning K jump {fi_k_rate:.1f}%")
+    ensemble_vals = [v for v in [steamer_k, zips_k, dc_k, pecota_k] if np.isfinite(v)]
+    if ensemble_vals and np.isfinite(line):
+        ens_avg = sum(ensemble_vals) / len(ensemble_vals)
+        if ens_avg >= line + 0.75:
+            add_over(1, f"projection ensemble over {ens_avg:.2f}")
+        elif ens_avg <= line - 0.75:
+            add_under(1, f"projection ensemble under {ens_avg:.2f}")
+
+    delta = over - under
+    flag = "BALANCED - USE MAIN PICK"
+    side = active_side or "TRACK"
+    score = 50 + delta * 7
+    chosen_reasons = []
+
+    # OG-loss recovery patterns from the comparison slate:
+    # 1) Do not fade upside on under/track-under when ceiling + K environment are live.
+    if active_side == "UNDER" and delta >= 2 and (over >= 5 or ("CEILING" in " ".join(reasons_over).upper())):
+        flag = "OVER WATCH - DO NOT FADE UPSIDE"
+        side = "OVER"
+        chosen_reasons = reasons_over[:5]
+    # 2) Protect unders when the over is only volume/thin-edge on a low-K pitcher.
+    elif active_side == "OVER" and delta <= -2 and under >= 5:
+        flag = "UNDER PROTECT - THIN OVER"
+        side = "UNDER"
+        chosen_reasons = reasons_under[:5]
+    elif over >= 9 and delta >= 4:
+        flag = "ELITE OVER CEILING"
+        side = "OVER"
+        chosen_reasons = reasons_over[:5]
+    elif under >= 8 and delta <= -4:
+        flag = "CONTACT UNDER SUPPORT"
+        side = "UNDER"
+        chosen_reasons = reasons_under[:5]
+    elif active_side == "UNDER" and over >= 5 and abs(delta) <= 1:
+        flag = "UNDER CONFLICT - UPSIDE PRESENT"
+        side = "TRACK"
+        chosen_reasons = (reasons_over[:3] + reasons_under[:2])
+    elif active_side == "OVER" and under >= 5 and abs(delta) <= 1:
+        flag = "OVER CONFLICT - CONTACT RISK"
+        side = "TRACK"
+        chosen_reasons = (reasons_under[:3] + reasons_over[:2])
+    else:
+        chosen_reasons = reasons_over[:3] if delta > 0 else reasons_under[:3] if delta < 0 else (reasons_over[:2] + reasons_under[:2])
+
+    if np.isfinite(quality):
+        if quality < 70:
+            score -= 8
+            chosen_reasons.append(f"data quality {quality:.0f}")
+        elif quality >= 82:
+            score += 3
+    score = int(max(0, min(100, score)))
+
+    if np.isfinite(arsenal_score):
+        arsenal_signal = "Elite Arsenal" if arsenal_score >= 70 else "Positive Arsenal" if arsenal_score >= 58 else "Balanced Arsenal" if arsenal_score >= 48 else "Arsenal Risk"
+    elif "READY" in pitch_mix:
+        arsenal_signal = "Arsenal Ready"
+    else:
+        arsenal_signal = "Arsenal Needed"
+    match_read = "—" if not np.isfinite(match_k_hand) else f"{match_k_hand:.1f}% vs hand"
+    opp_whiff_read = "not loaded" if not np.isfinite(opp_whiff) else f"{opp_whiff:.1f}%"
+    if over >= 8 and under <= 4:
+        mix_grade = "A / A"
+    elif over >= 6 and under <= 5:
+        mix_grade = "B+ / B"
+    elif under >= 7 and over <= 5:
+        mix_grade = "C / RISK"
+    else:
+        mix_grade = "B / B"
+    top_pitch_read = f"{top_pitch or 'Top pitch'} {top_usage:.0f}% use" if np.isfinite(top_usage) else (top_pitch or "top pitch not loaded")
+    ceiling_gap = ceiling - line if np.isfinite(ceiling) and np.isfinite(line) else np.nan
+    ceiling_read = "not loaded" if not np.isfinite(ceiling) else f"{ceiling:g}K ceiling ({ceiling_gap:+.1f} vs line)" if np.isfinite(ceiling_gap) else f"{ceiling:g}K ceiling"
+    if np.isfinite(l3_avg) and np.isfinite(l10_avg):
+        diff = l3_avg - l10_avg
+        form_read = f"L3 {l3_avg:.1f} vs L10 {l10_avg:.1f} ({diff:+.1f})"
+    elif np.isfinite(l10_avg):
+        form_read = f"L10 {l10_avg:.1f}"
+    else:
+        form_read = "recent K log not loaded"
+    location_loaded = any(_kslip_pick(row, [c], "") not in ("", "—") for c in ["Pitch Heatmap Signal", "Location Heatmap Signal", "Zone Location Signal", "In Zone %", "Zone %", "Chase Zone%", "Edge Zone%", "Heart Zone%"])
+    foul_loaded = any(_kslip_pick(row, [c], "") not in ("", "—") for c in ["Foul%", "Foul Ball%", "Foul Workload Signal", "Foul Out Workload", "Foul/PA"])
+    heat_parts = []
+    if np.isfinite(chase_zone): heat_parts.append(f"chase {chase_zone:.1f}%")
+    if np.isfinite(edge_zone): heat_parts.append(f"edge {edge_zone:.1f}%")
+    if np.isfinite(heart_zone): heat_parts.append(f"heart {heart_zone:.1f}%")
+    if np.isfinite(zone_pct): heat_parts.append(f"zone {zone_pct:.1f}%")
+    foul_parts = []
+    if np.isfinite(foul_pct): foul_parts.append(f"foul {foul_pct:.1f}%")
+    if np.isfinite(foul_per_pa): foul_parts.append(f"{foul_per_pa:.2f}/PA")
+    location_foul = f"heatmap {'; '.join(heat_parts) if heat_parts else ('loaded' if location_loaded else 'needed')} / foul workload {'; '.join(foul_parts) if foul_parts else ('loaded' if foul_loaded else 'needed')}"
+    stuff_bits = []
+    if np.isfinite(stuff_plus): stuff_bits.append(f"Stuff+ {stuff_plus:.0f}")
+    if np.isfinite(pitching_plus): stuff_bits.append(f"Pitching+ {pitching_plus:.0f}")
+    if np.isfinite(command_plus): stuff_bits.append(f"Command+ {command_plus:.0f}")
+    if np.isfinite(depth_ip) and np.isfinite(depth_gs) and depth_gs > 0:
+        stuff_bits.append(f"DC {depth_ip / depth_gs:.1f} IP/start")
+    elif np.isfinite(depth_ip):
+        stuff_bits.append(f"DC IP {depth_ip:.0f}")
+    stuff_depth_read = " / ".join(stuff_bits) if stuff_bits else "Stuff+/Depth Charts needed"
+    fi_bits = []
+    if np.isfinite(fi_pc_avg): fi_bits.append(f"1I PC {fi_pc_avg:.1f}")
+    if np.isfinite(fi_bf_avg): fi_bits.append(f"1I BF {fi_bf_avg:.1f}")
+    if np.isfinite(fi_k_rate): fi_bits.append(f"1I K {fi_k_rate:.1f}%")
+    if ensemble_vals:
+        fi_bits.append(f"ensemble {sum(ensemble_vals) / len(ensemble_vals):.2f}K ({len(ensemble_vals)})")
+    fi_ensemble_read = " / ".join(fi_bits) if fi_bits else "FI timing/ensemble needed"
+
+    return {
+        "K Slip Brain Flag": flag,
+        "K Slip Brain Side": side,
+        "K Slip Brain Score": score,
+        "K Slip Over Support": int(over),
+        "K Slip Under Support": int(under),
+        "K Slip Brain Reason": "; ".join(dict.fromkeys(chosen_reasons)) or "no strong slip-brain conflict",
+        "K Arsenal Signal": arsenal_signal,
+        "K Match K/Hand Read": match_read,
+        "K Opp Whiff Read": opp_whiff_read,
+        "K Mix K/Dmg Grade": mix_grade,
+        "K Top Pitch Read": top_pitch_read,
+        "K Ceiling Read": ceiling_read,
+        "K L3/L10 Form Read": form_read,
+        "K Location/Foul Coverage": location_foul,
+        "K Stuff+/Depth Read": stuff_depth_read,
+        "K FI/Ensemble Read": fi_ensemble_read,
+        "K Slip Brain Version": K_SLIP_BRAIN_VERSION,
+    }
+
+
+def _kslip_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    rows = []
+    for _, rr in out.iterrows():
+        try:
+            rows.append(_kslip_profile(rr.to_dict()))
+        except Exception as e:
+            rows.append({
+                "K Slip Brain Flag": "SLIP BRAIN ERROR",
+                "K Slip Brain Side": "",
+                "K Slip Brain Score": "",
+                "K Slip Over Support": "",
+                "K Slip Under Support": "",
+                "K Slip Brain Reason": str(e)[:120],
+                "K Arsenal Signal": "",
+                "K Match K/Hand Read": "",
+                "K Opp Whiff Read": "",
+                "K Mix K/Dmg Grade": "",
+                "K Top Pitch Read": "",
+                "K Ceiling Read": "",
+                "K L3/L10 Form Read": "",
+                "K Location/Foul Coverage": "",
+                "K Stuff+/Depth Read": "",
+                "K FI/Ensemble Read": "",
+                "K Slip Brain Version": K_SLIP_BRAIN_VERSION,
+            })
+    add = pd.DataFrame(rows, index=out.index)
+    for c in add.columns:
+        out[c] = add[c]
+    return out
+
+
+_KSLIP_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _KSLIP_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _kslip_apply(_KSLIP_PREV_BUILD_K(board))
+
+
+_KSLIP_PREV_RENDER_K = render_kproj_tab if "render_kproj_tab" in globals() else None
+
+
+def render_kproj_tab(board):
+    if _KSLIP_PREV_RENDER_K is not None:
+        _KSLIP_PREV_RENDER_K(board)
+    try:
+        df = build_kproj_table(board)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">K Slip Brain - OG Win Recovery Flags</div>', unsafe_allow_html=True)
+            st.caption("Decision support only. Does not change K projection, copy/paste slate, or official decision. Built to catch OG-style wins like Freeland U, Rasmussen O, and Reynaldo O.")
+            cols = [c for c in [
+                "Pitcher", "Matchup", "UD/Line", "K PROJ", "Decision",
+                "K Slip Brain Flag", "K Slip Brain Side", "K Slip Brain Score",
+                "K Slip Over Support", "K Slip Under Support", "K Slip Brain Reason",
+                "K Arsenal Signal", "K Match K/Hand Read", "K Opp Whiff Read",
+                "K Mix K/Dmg Grade", "K Top Pitch Read", "K Ceiling Read",
+                "K L3/L10 Form Read", "K Location/Foul Coverage",
+                "K Stuff+/Depth Read", "K FI/Ensemble Read",
+                "Pitcher K%", "Opponent K% vs Pitcher Hand", "APP100 Whiff%",
+                "APP100 Projected BF", "K Sim Current Side Prob %", "K Slip Brain Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"K Slip Brain unavailable: {e}")
 
 
 PO_BF_LEASH_CALIBRATION_VERSION = "PO_BF_LEASH_CALIBRATION_2026_07_26"
@@ -43539,6 +44785,176 @@ def _beta_projection_rows(board, market_kind="OUTS"):
     return _po_apply_bf_leash_calibration(df)
 
 
+def _po_card_safe(value, default="—"):
+    try:
+        if value in (None, "", "nan", "NaN", np.nan):
+            return default
+        return html.escape(str(value))
+    except Exception:
+        return default
+
+
+def _po_card_num(row, keys, digits=1, default="—"):
+    try:
+        v = _po_cal_num(_po_cal_txt(row, keys, ""), np.nan)
+        if not np.isfinite(v):
+            return default
+        if digits == 0:
+            return str(int(round(v)))
+        return f"{v:.{digits}f}"
+    except Exception:
+        return default
+
+
+def _po_card_matchup_teams(matchup):
+    try:
+        if "_kcard_split_matchup" in globals():
+            return _kcard_split_matchup(matchup)
+        txt = str(matchup or "").replace(" vs ", " @ ")
+        if "@" not in txt:
+            return "", ""
+        a, b = [x.strip().upper() for x in txt.split("@", 1)]
+        return a, b
+    except Exception:
+        return "", ""
+
+
+def _po_card_team_logo(team):
+    try:
+        if "_kcard_team_logo" in globals():
+            return _kcard_team_logo(team)
+        if "_ml_ui_logo" in globals():
+            return _ml_ui_logo(team)
+        if "ml_team_logo_url" in globals():
+            return ml_team_logo_url(team)
+    except Exception:
+        pass
+    return ""
+
+
+def _po_card_chip(label, value, tone=""):
+    return f"<div class='poc-chip {tone}'><span>{html.escape(str(label))}</span><b>{_po_card_safe(value)}</b></div>"
+
+
+def _po_render_player_cards(df, board=None, limit=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    try:
+        import streamlit.components.v1 as components
+        show = df.copy()
+        if limit:
+            show = show.head(int(limit))
+        cards = []
+        for _, rr in show.iterrows():
+            row = rr.to_dict()
+            pitcher = str(_po_cal_txt(row, ["Pitcher"], "Pitcher"))
+            matchup = str(_po_cal_txt(row, ["Matchup"], ""))
+            away, home = _po_card_matchup_teams(matchup)
+            logo_team = away or home
+            if board and "_kcard_board_lookup" in globals() and "_kcard_pitcher_team" in globals() and "_kcard_opp_team" in globals():
+                try:
+                    lookup = _kcard_board_lookup(board)
+                    key = _tpl_norm_name(pitcher) if "_tpl_norm_name" in globals() else pitcher.lower().strip()
+                    p = lookup.get(key, {})
+                    logo_team = _kcard_pitcher_team(row, p) or logo_team
+                    opp = _kcard_opp_team(row, p) or (home if logo_team == away else away)
+                except Exception:
+                    opp = home if logo_team == away else away
+            else:
+                opp = home if logo_team == away else away
+            logo_url = _po_card_team_logo(logo_team)
+            logo_html = f"<img class='poc-logo' src='{html.escape(logo_url)}' />" if logo_url else f"<div class='poc-logo poc-fallback'>{html.escape((logo_team or 'MLB')[:3])}</div>"
+            side = str(_po_cal_txt(row, ["Beta Lean"], "TRACK")).upper()
+            tier = str(_po_cal_txt(row, ["PO Official Tier"], side or "TRACK"))
+            tier_cls = "good" if "OFFICIAL" in tier or "PLAYABLE" in tier else "warn" if "LEAN" in tier else "risk" if "TRACK" in tier or "PASS" in tier else ""
+            prob = _po_card_num(row, ["Beta Hit %", "PO Calibrated Hit %"], 1)
+            proj = _po_card_num(row, ["Beta Projection"], 1)
+            line = _po_card_num(row, ["UD Line"], 1)
+            edge = _po_card_num(row, ["Beta Edge"], 2)
+            ip = _po_card_num(row, ["Beta IP"], 2)
+            bf = _po_card_num(row, ["Beta BF"], 1)
+            pre = _po_card_num(row, ["Pre-PO Calibration Projection"], 1)
+            adj = _po_card_num(row, ["PO Calibration Adj Outs"], 2)
+            notes = _po_card_safe(_po_cal_txt(row, ["PO Calibration Notes", "Decision Note"], "No PO notes"))
+            do_not = _po_card_safe(_po_cal_txt(row, ["PO Do Not Bet Reason"], ""))
+            support = _po_card_safe(_po_cal_txt(row, ["PO Support Signals"], ""))
+            metrics = "".join([
+                _po_card_chip("Line", line),
+                _po_card_chip("Proj Outs", proj, "hot" if side == "OVER" else "cool" if side == "UNDER" else ""),
+                _po_card_chip("Edge", edge),
+                _po_card_chip("Hit %", prob),
+                _po_card_chip("BF", bf),
+                _po_card_chip("IP", ip),
+                _po_card_chip("Pre-Cal", pre),
+                _po_card_chip("Adj", adj),
+                _po_card_chip("Hook", _po_card_num(row, ["Recent Hook Rate"], 0)),
+                _po_card_chip("Deep", _po_card_num(row, ["Deep Start Rate"], 0)),
+                _po_card_chip("P/IP", _po_card_num(row, ["Pitch Efficiency P/IP"], 1)),
+                _po_card_chip("Damage", _po_cal_txt(row, ["Damage Risk Label"], "—")),
+                _po_card_chip("Stuff+", _po_card_num(row, ["Stuff+", "Stuff Plus", "botStf", "PitchingBot Stuff"], 0)),
+                _po_card_chip("Heart", _po_card_num(row, ["Heart Zone%", "Heart%", "Meatball%"], 1)),
+                _po_card_chip("Foul", _po_card_num(row, ["Foul%", "Foul Ball%", "Foul/PA"], 1)),
+                _po_card_chip("DC IP", _po_card_num(row, ["Depth Chart IP", "FanGraphs DC IP", "Projected Season IP"], 0)),
+            ])
+            signals = "".join([
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO BF Signal'], 'BF'))}</span>",
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Leash/Hook Signal'], 'LEASH'))}</span>",
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Pitch Efficiency Signal'], 'EFF'))}</span>",
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Damage Signal'], 'DAMAGE'))}</span>",
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Role/Sample Signal'], 'ROLE'))}</span>",
+            ])
+            cards.append(f"""
+              <article class="poc-card">
+                <div class="poc-head">
+                  <div class="poc-id">{logo_html}<div><h3>{html.escape(pitcher)}</h3><p>{html.escape(matchup)} · {html.escape(logo_team or '')} vs {html.escape(opp or '')}</p></div></div>
+                  <div class="poc-tier {tier_cls}">{html.escape(tier)}</div>
+                </div>
+                <div class="poc-hero">
+                  <div><span>Proj Outs</span><strong>{proj}</strong><small>{html.escape(side)} {line} · edge {edge}</small></div>
+                  <div><span>True Prob</span><strong>{prob}</strong><small>display support only</small></div>
+                </div>
+                <div class="poc-grid">{metrics}</div>
+                <div class="poc-signals">{signals}</div>
+                <div class="poc-note"><b>Calibration</b><br>{notes}</div>
+                <div class="poc-note muted"><b>Selector</b><br>{support or 'No extra support signals'}{('<br>' + do_not) if do_not else ''}</div>
+              </article>
+            """)
+        if not cards:
+            return
+        html_doc = f"""
+        <style>
+          body{{margin:0;background:transparent;color:#eef4ff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}}
+          .poc-wrap{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;padding:2px 0 12px;}}
+          .poc-card{{background:linear-gradient(180deg,#0d1421,#080b12);border:1px solid rgba(88,132,204,.34);border-radius:18px;padding:16px;box-shadow:0 14px 40px rgba(0,0,0,.28);}}
+          .poc-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px;}}
+          .poc-id{{display:flex;gap:10px;align-items:center;min-width:0;}}
+          .poc-logo{{width:42px;height:42px;object-fit:contain;border-radius:999px;background:#111827;border:1px solid rgba(255,255,255,.10);padding:4px;flex:0 0 auto;}}
+          .poc-fallback{{display:flex;align-items:center;justify-content:center;font-weight:900;color:#fff;box-sizing:border-box;}}
+          h3{{margin:0;font-size:1.18rem;line-height:1.05;font-weight:900;}}
+          p{{margin:4px 0 0;color:#9ba8bb;font-size:.78rem;}}
+          .poc-tier{{border:1px solid #64748b;border-radius:999px;padding:5px 9px;font-size:.72rem;font-weight:900;white-space:nowrap;color:#dbeafe;}}
+          .poc-tier.good{{border-color:#16a34a;color:#86efac;}} .poc-tier.warn{{border-color:#d97706;color:#fde68a;}} .poc-tier.risk{{border-color:#dc2626;color:#fecaca;}}
+          .poc-hero{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;}}
+          .poc-hero>div{{background:#101827;border:1px solid rgba(148,163,184,.18);border-radius:14px;padding:12px;}}
+          .poc-hero span,.poc-chip span{{display:block;color:#8390a3;font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.04em;}}
+          .poc-hero strong{{display:block;font-size:2.25rem;line-height:1;color:#38bdf8;margin:4px 0;}}
+          .poc-hero small{{color:#aeb8c8;font-size:.78rem;}}
+          .poc-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}}
+          .poc-chip{{background:#0b111d;border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:9px;min-height:48px;}}
+          .poc-chip b{{display:block;font-size:1.02rem;margin-top:3px;color:#f8fafc;}} .poc-chip.hot b{{color:#22c55e;}} .poc-chip.cool b{{color:#60a5fa;}}
+          .poc-signals{{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0;}}
+          .poc-signals span{{border:1px solid rgba(56,189,248,.26);background:rgba(14,165,233,.10);border-radius:999px;padding:5px 8px;font-size:.68rem;color:#bae6fd;font-weight:800;}}
+          .poc-note{{border-top:1px solid rgba(148,163,184,.16);padding-top:9px;margin-top:8px;color:#cbd5e1;font-size:.78rem;line-height:1.35;}}
+          .poc-note b{{color:#f8fafc;}} .poc-note.muted{{color:#94a3b8;}}
+          @media(max-width:560px){{.poc-wrap{{grid-template-columns:1fr;}}.poc-grid{{grid-template-columns:repeat(2,1fr);}}.poc-hero strong{{font-size:2rem;}}}}
+        </style>
+        <div class="poc-wrap">{''.join(cards)}</div>
+        """
+        components.html(html_doc, height=max(780, min(26000, 500 * max(1, len(cards)))), scrolling=False)
+    except Exception as e:
+        st.info(f"Pitching Outs cards unavailable: {e}")
+
+
 _PO_CAL_PREV_RENDER_PO = render_beta_pitching_outs_tab if "render_beta_pitching_outs_tab" in globals() else None
 
 
@@ -43560,8 +44976,489 @@ def render_beta_pitching_outs_tab(board):
                 "PO History Loss Pattern", "PO Calibration Notes", "PO Calibration Version"
             ] if c in df.columns]
             st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+            st.markdown('<div class="section-title-pro">Pitching Outs Player Cards</div>', unsafe_allow_html=True)
+            st.caption("Card view for slip building. Shows workload, BF/leash, pitch efficiency, damage risk, and selector support without changing K decisions or copy/paste slate.")
+            _po_render_player_cards(df, board=board)
     except Exception as e:
         st.info(f"Pitching Outs BF/leash calibration unavailable: {e}")
+
+
+ADVANCED_DAILY_FEED_VERSION = "ADVANCED_DAILY_FEEDS_SUPPORT_ONLY_2026_07_26"
+ADVANCED_DAILY_FEED_FILE = os.path.join(STORAGE_DIR, "advanced_daily_support_feeds.csv")
+ADVANCED_TRUE_ACTUALS_FILE = os.path.join(STORAGE_DIR, "advanced_true_actuals.csv")
+ADVANCED_POST_SLATE_REPORT_FILE = os.path.join(STORAGE_DIR, "post_slate_flag_calibration_report.csv")
+
+ADVANCED_DAILY_FEED_COLUMNS = [
+    "Date", "Pitcher", "Team", "Opponent", "Hand",
+    "Lineup Status", "Confirmed Lineup Source", "Confirmed Lineup Count",
+    "Chase Zone%", "Edge Zone%", "Heart Zone%", "Zone %",
+    "Foul%", "Foul/PA", "Foul Workload Signal",
+    "Stuff+", "Pitching+", "Command+", "botStf", "botOvr", "botCmd",
+    "Depth Chart IP", "Depth Chart GS", "Projected Season IP", "Projected Starts",
+    "1st Inn Pitch Count Avg", "1st Inn BF Avg", "1st Inn K%",
+    "Steamer K Projection", "ZiPS K Projection", "Depth Charts K Projection", "PECOTA K Projection",
+    "Feed Source", "Feed Notes",
+]
+
+ADVANCED_TRUE_ACTUALS_COLUMNS = [
+    "Date", "Pitcher", "Opponent", "Hand", "Line", "Projection", "Side",
+    "Actual K", "Actual IP", "Actual BF", "Pitches", "ER", "H", "BB", "HR",
+    "Result", "Feed Source", "Notes",
+]
+
+
+def _adv_norm_name(value):
+    try:
+        return _tpl_norm_name(value)
+    except Exception:
+        try:
+            return normalize_name(value)
+        except Exception:
+            return str(value or "").strip().lower()
+
+
+def _adv_read_csv_file(path):
+    try:
+        if path and os.path.exists(path):
+            return pd.read_csv(path)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _adv_parse_csv(uploaded_file=None, text="", template_cols=None):
+    frames = []
+    try:
+        if uploaded_file is not None:
+            frames.append(pd.read_csv(uploaded_file))
+    except Exception:
+        pass
+    if text and str(text).strip():
+        try:
+            from io import StringIO
+            frames.append(pd.read_csv(StringIO(str(text).strip())))
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame(columns=template_cols or [])
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    if "Pitcher" not in out.columns:
+        for c in ["Player", "Name", "pitcher"]:
+            if c in out.columns:
+                out["Pitcher"] = out[c]
+                break
+    for c in template_cols or []:
+        if c not in out.columns:
+            out[c] = ""
+    return out
+
+
+def _adv_save_csv_append(path, df, subset=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return {"saved": 0, "path": path, "message": "No rows to save."}
+    out = df.copy()
+    try:
+        old = _adv_read_csv_file(path)
+        if isinstance(old, pd.DataFrame) and not old.empty:
+            out = pd.concat([old, out], ignore_index=True, sort=False)
+        if subset:
+            keep = [c for c in subset if c in out.columns]
+            if keep:
+                out = out.drop_duplicates(subset=keep, keep="last")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        out.to_csv(path, index=False)
+        return {"saved": int(len(df)), "total": int(len(out)), "path": path, "message": f"Saved {len(df)} rows."}
+    except Exception as e:
+        return {"saved": 0, "path": path, "error": str(e)[:180]}
+
+
+def _adv_feed_lookup():
+    df = _adv_read_csv_file(ADVANCED_DAILY_FEED_FILE)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty or "Pitcher" not in df.columns:
+        return {}
+    d = df.copy()
+    d["_adv_name"] = d["Pitcher"].astype(str).map(_adv_norm_name)
+    if "Date" not in d.columns:
+        d["Date"] = ""
+    d["_adv_date"] = d["Date"].astype(str)
+    lookup = {}
+    for _, rr in d.iterrows():
+        row = rr.to_dict()
+        name = row.get("_adv_name")
+        if not name:
+            continue
+        lookup[name] = row
+    return lookup
+
+
+def _adv_apply_daily_feed(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    lookup = _adv_feed_lookup()
+    if not lookup:
+        out = df.copy()
+        out["Advanced Feed Status"] = "NO_ADVANCED_FEED"
+        out["Advanced Feed Version"] = ADVANCED_DAILY_FEED_VERSION
+        return out
+    out = df.copy()
+    rows = []
+    merge_cols = [c for c in ADVANCED_DAILY_FEED_COLUMNS if c not in ["Pitcher", "Date", "Team", "Opponent", "Hand"]]
+    for _, rr in out.iterrows():
+        row = rr.to_dict()
+        key = _adv_norm_name(row.get("Pitcher") or row.get("pitcher") or row.get("Player"))
+        feed = lookup.get(key, {})
+        status = "ADVANCED_FEED_MATCHED" if feed else "NO_ADVANCED_FEED_MATCH"
+        add = {"Advanced Feed Status": status, "Advanced Feed Version": ADVANCED_DAILY_FEED_VERSION}
+        if feed:
+            for c in merge_cols:
+                v = feed.get(c)
+                if v not in (None, "", "—") and not (isinstance(v, float) and pd.isna(v)):
+                    add[c] = v
+            add["Advanced Feed Source"] = feed.get("Feed Source", "advanced daily CSV")
+            add["Advanced Feed Notes"] = feed.get("Feed Notes", "")
+        rows.append(add)
+    add_df = pd.DataFrame(rows, index=out.index)
+    for c in add_df.columns:
+        out[c] = add_df[c]
+    try:
+        # Recompute support-only slip flags after optional advanced columns land.
+        # This does not change K PROJ, side, line, or copy/paste slate.
+        if "K PROJ" in out.columns and "_kslip_apply" in globals():
+            out = _kslip_apply(out)
+    except Exception:
+        pass
+    return out
+
+
+_ADV_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _ADV_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _adv_apply_daily_feed(_ADV_PREV_BUILD_K(board))
+
+
+_ADV_PREV_BETA_ROWS = _beta_projection_rows if "_beta_projection_rows" in globals() else None
+
+
+def _beta_projection_rows(board, market_kind="OUTS"):
+    df = _ADV_PREV_BETA_ROWS(board, market_kind) if _ADV_PREV_BETA_ROWS is not None else pd.DataFrame()
+    if str(market_kind).upper() == "OUTS":
+        return _adv_apply_daily_feed(df)
+    return df
+
+
+_ADV_PREV_TRUE_ACTUALS = build_true_actuals_dataset if "build_true_actuals_dataset" in globals() else None
+
+
+def _adv_combined_true_actuals():
+    frames = []
+    try:
+        base = _ADV_PREV_TRUE_ACTUALS() if _ADV_PREV_TRUE_ACTUALS is not None else pd.DataFrame()
+        if isinstance(base, pd.DataFrame) and not base.empty:
+            frames.append(base)
+    except Exception:
+        pass
+    manual = _adv_read_csv_file(ADVANCED_TRUE_ACTUALS_FILE)
+    if isinstance(manual, pd.DataFrame) and not manual.empty:
+        frames.append(manual)
+    if not frames:
+        return pd.DataFrame(columns=ADVANCED_TRUE_ACTUALS_COLUMNS)
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    if "Pitcher" in out.columns:
+        out["_adv_name"] = out["Pitcher"].astype(str).map(_adv_norm_name)
+    return out
+
+
+def build_true_actuals_dataset():
+    out = _adv_combined_true_actuals()
+    try:
+        if isinstance(out, pd.DataFrame) and not out.empty:
+            clean = out.drop(columns=[c for c in ["_adv_name"] if c in out.columns], errors="ignore")
+            clean.to_csv(TRUE_ACTUALS_DATASET_FILE, index=False)
+            return clean
+    except Exception:
+        pass
+    return out
+
+
+def _adv_side_from_row(row):
+    side = str(_tpl_first(row, ["Side", "Decision", "Pick", "K Slip Brain Side"], "") if "_tpl_first" in globals() else row.get("Side", "")).upper()
+    if "OVER" in side or side == "O":
+        return "OVER"
+    if "UNDER" in side or side == "U":
+        return "UNDER"
+    return ""
+
+
+def _adv_grade_k_result(side, line, actual_k):
+    try:
+        line = float(line)
+        actual = float(actual_k)
+    except Exception:
+        return ""
+    if side == "OVER":
+        return "WIN" if actual > line else "LOSS" if actual <= line else ""
+    if side == "UNDER":
+        return "WIN" if actual < line else "LOSS" if actual >= line else ""
+    return ""
+
+
+def build_post_slate_flag_calibration_report(board=None):
+    try:
+        kdf = build_kproj_table(board) if board is not None and "build_kproj_table" in globals() else pd.DataFrame()
+        actuals = _adv_combined_true_actuals()
+        if kdf is None or not isinstance(kdf, pd.DataFrame) or kdf.empty or actuals.empty:
+            return pd.DataFrame()
+        actuals = actuals.copy()
+        actuals["_adv_name"] = actuals.get("Pitcher", pd.Series(dtype=str)).astype(str).map(_adv_norm_name)
+        actual_map = {}
+        for _, ar in actuals.iterrows():
+            key = ar.get("_adv_name")
+            if key:
+                actual_map[key] = ar.to_dict()
+        rows = []
+        signal_cols = [c for c in [
+            "K Slip Brain Flag", "K Arsenal Signal", "K Location/Foul Coverage",
+            "K Stuff+/Depth Read", "K FI/Ensemble Read", "APP100 BF Coverage",
+            "APP100 Pitch Mix Coverage", "APP100 Recent Skill", "Projection Data Gate",
+            "Advanced Feed Status",
+        ] if c in kdf.columns]
+        for _, rr in kdf.iterrows():
+            row = rr.to_dict()
+            key = _adv_norm_name(row.get("Pitcher") or row.get("pitcher") or row.get("Player"))
+            ar = actual_map.get(key)
+            if not ar:
+                continue
+            side = _adv_side_from_row(row)
+            line = _tpl_num(_tpl_first(row, ["UD/Line", "Line", "Underdog Line"], None), None)
+            proj = _tpl_num(_tpl_first(row, ["K PROJ", "Final K Projection", "Official K PROJ"], None), None)
+            actual_k = _tpl_num(_tpl_first(ar, ["Actual K", "actual", "Actual"], None), None)
+            result = str(_tpl_first(ar, ["Result"], "")).upper()
+            if result not in ["WIN", "LOSS"] and actual_k is not None:
+                result = _adv_grade_k_result(side, line, actual_k)
+            if result not in ["WIN", "LOSS"]:
+                continue
+            err = "" if actual_k is None or proj is None else round(float(actual_k) - float(proj), 2)
+            for c in signal_cols:
+                sig = str(row.get(c) or "")
+                if not sig:
+                    sig = "BLANK"
+                rows.append({
+                    "Signal Column": c,
+                    "Signal": sig[:140],
+                    "Pitcher": row.get("Pitcher"),
+                    "Line": line,
+                    "Projection": proj,
+                    "Side": side,
+                    "Actual K": actual_k,
+                    "Result": result,
+                    "Projection Error": err,
+                    "Actual IP": _tpl_first(ar, ["Actual IP"], ""),
+                    "Actual BF": _tpl_first(ar, ["Actual BF"], ""),
+                    "Pitches": _tpl_first(ar, ["Pitches", "Actual Pitches"], ""),
+                    "ER": _tpl_first(ar, ["ER", "Actual ER"], ""),
+                    "H": _tpl_first(ar, ["H", "Actual Hits"], ""),
+                    "BB": _tpl_first(ar, ["BB", "Actual BB"], ""),
+                    "HR": _tpl_first(ar, ["HR", "Actual HR"], ""),
+                    "Report Version": ADVANCED_DAILY_FEED_VERSION,
+                })
+        if not rows:
+            return pd.DataFrame()
+        detail = pd.DataFrame(rows)
+        summary = detail.groupby(["Signal Column", "Signal"], dropna=False, as_index=False).agg(
+            Plays=("Result", "count"),
+            Wins=("Result", lambda s: int((s.astype(str) == "WIN").sum())),
+            Losses=("Result", lambda s: int((s.astype(str) == "LOSS").sum())),
+            Avg_Error=("Projection Error", lambda s: round(pd.to_numeric(s, errors="coerce").mean(), 2) if pd.to_numeric(s, errors="coerce").notna().any() else ""),
+        )
+        summary["Win Rate %"] = (summary["Wins"] / summary["Plays"].replace(0, 1) * 100).round(1)
+        summary = summary.sort_values(["Losses", "Plays"], ascending=False)
+        try:
+            summary.to_csv(ADVANCED_POST_SLATE_REPORT_FILE, index=False)
+        except Exception:
+            pass
+        return summary
+    except Exception as e:
+        return pd.DataFrame([{"Signal Column": "ERROR", "Signal": str(e)[:180], "Plays": 0}])
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _adv_savant_pitch_level_zone_foul(pitcher_id, days=365):
+    """Public Baseball Savant pitch-level pull for support-only heatmap/foul fields."""
+    out = {
+        "status": "NO_ID",
+        "rows": 0,
+        "Chase Zone%": "",
+        "Edge Zone%": "",
+        "Heart Zone%": "",
+        "Zone %": "",
+        "Foul%": "",
+        "Foul/PA": "",
+        "Feed Notes": "",
+    }
+    if not pitcher_id:
+        return out
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=int(days or 365))
+        params = {
+            "all": "true",
+            "player_type": "pitcher",
+            "pitchers_lookup[]": str(int(float(pitcher_id))),
+            "game_date_gt": start.strftime("%Y-%m-%d"),
+            "game_date_lt": end.strftime("%Y-%m-%d"),
+            "type": "details",
+        }
+        r = requests.get(
+            "https://baseballsavant.mlb.com/statcast_search/csv",
+            params=params,
+            timeout=35,
+            headers={"User-Agent": "Mozilla/5.0 MLBKPropEngine AdvancedFeed"},
+        )
+        if r.status_code != 200 or not str(r.text or "").strip():
+            out["status"] = f"HTTP_{r.status_code}"
+            out["Feed Notes"] = f"Savant pitch-level fetch failed HTTP {r.status_code}"
+            return out
+        df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+        if df is None or df.empty or "description" not in df.columns:
+            out["status"] = "NO_ROWS"
+            out["Feed Notes"] = "Savant returned no pitch rows"
+            return out
+        desc = df["description"].astype(str).str.lower()
+        n = len(df)
+        out["rows"] = int(n)
+        swing_desc = {
+            "swinging_strike", "swinging_strike_blocked", "foul_tip", "foul", "foul_bunt",
+            "missed_bunt", "hit_into_play", "hit_into_play_no_out", "hit_into_play_score",
+        }
+        swing_mask = desc.isin(swing_desc)
+        foul_mask = desc.isin(["foul", "foul_tip", "foul_bunt"])
+        if "zone" in df.columns:
+            zone = pd.to_numeric(df["zone"], errors="coerce")
+            in_zone = zone.isin([1, 2, 3, 4, 5, 6, 7, 8, 9])
+            out_zone = zone.isin([11, 12, 13, 14])
+            heart = zone.isin([5])
+            edge = zone.isin([1, 3, 7, 9, 11, 12, 13, 14])
+            out["Zone %"] = round(float(in_zone.mean() * 100), 1) if n else ""
+            out["Heart Zone%"] = round(float(heart.mean() * 100), 1) if n else ""
+            out["Edge Zone%"] = round(float(edge.mean() * 100), 1) if n else ""
+            out["Chase Zone%"] = round(float((out_zone & swing_mask).sum() / max(int(out_zone.sum()), 1) * 100), 1) if int(out_zone.sum()) else ""
+        out["Foul%"] = round(float(foul_mask.mean() * 100), 1) if n else ""
+        if "game_pk" in df.columns and "at_bat_number" in df.columns:
+            pa = df[["game_pk", "at_bat_number"]].dropna().drop_duplicates()
+            if len(pa):
+                out["Foul/PA"] = round(float(foul_mask.sum() / len(pa)), 2)
+        out["status"] = "SUCCESS"
+        out["Feed Notes"] = f"Auto Savant pitch-level {int(n)} rows, {int(days or 365)}d"
+        return out
+    except Exception as e:
+        out["status"] = "ERROR"
+        out["Feed Notes"] = f"Savant pitch-level unavailable: {str(e)[:160]}"
+        return out
+
+
+def auto_save_savant_advanced_feed_from_board(board=None, days=365):
+    try:
+        kdf = build_kproj_table(board) if board is not None and "build_kproj_table" in globals() else pd.DataFrame()
+        if kdf is None or not isinstance(kdf, pd.DataFrame) or kdf.empty:
+            return {"saved": 0, "message": "No K board rows loaded."}
+        rows = []
+        for _, rr in kdf.iterrows():
+            row = rr.to_dict()
+            pitcher = row.get("Pitcher") or row.get("pitcher") or row.get("Player")
+            if not pitcher:
+                continue
+            pid = None
+            try:
+                if "_savant_pitcher_id_from_row" in globals():
+                    pid = _savant_pitcher_id_from_row(row)
+            except Exception:
+                pid = None
+            if not pid:
+                try:
+                    pid = _mlb_search_player_id_by_name(str(pitcher)) if "_mlb_search_player_id_by_name" in globals() else None
+                except Exception:
+                    pid = None
+            rec = _adv_savant_pitch_level_zone_foul(pid, days=days)
+            rows.append({
+                "Date": str(_tpl_first(row, ["Date", "date"], california_now().strftime("%Y-%m-%d")) if "california_now" in globals() else ""),
+                "Pitcher": pitcher,
+                "Team": _tpl_first(row, ["Team", "Pitcher Team"], ""),
+                "Opponent": _tpl_first(row, ["Opponent", "Matchup"], ""),
+                "Hand": _tpl_first(row, ["Pitcher Hand", "Hand", "Throws"], ""),
+                "Chase Zone%": rec.get("Chase Zone%", ""),
+                "Edge Zone%": rec.get("Edge Zone%", ""),
+                "Heart Zone%": rec.get("Heart Zone%", ""),
+                "Zone %": rec.get("Zone %", ""),
+                "Foul%": rec.get("Foul%", ""),
+                "Foul/PA": rec.get("Foul/PA", ""),
+                "Foul Workload Signal": "FOUL_WORKLOAD_READY" if rec.get("status") == "SUCCESS" else "FOUL_WORKLOAD_NEEDED",
+                "Feed Source": "Baseball Savant Statcast Search CSV",
+                "Feed Notes": rec.get("Feed Notes", rec.get("status", "")),
+            })
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return {"saved": 0, "message": "No pitcher rows matched for Savant advanced feed."}
+        return _adv_save_csv_append(ADVANCED_DAILY_FEED_FILE, df, subset=["Date", "Pitcher"])
+    except Exception as e:
+        return {"saved": 0, "error": str(e)[:180]}
+
+
+def render_advanced_daily_data_hub(board=None):
+    st.markdown('<div class="section-title-pro">Advanced Daily Data Feeds</div>', unsafe_allow_html=True)
+    st.caption("Support-only. These feeds add flags and calibration reads; they do not overwrite K PROJ, pitcher K%, PO projection math, or copy/paste slate.")
+    a, b, c = st.columns(3)
+    try:
+        diag = get_rotowire_lineup_diagnostics() if "get_rotowire_lineup_diagnostics" in globals() else {}
+        a.metric("Lineups", str(diag.get("status", "MLB/backup")))
+        b.metric("Transport", str(diag.get("transport", "AUTO")))
+        c.metric("Teams", str(diag.get("team_count", diag.get("parsed_teams", 0))))
+    except Exception:
+        a.metric("Lineups", "AUTO READY")
+        b.metric("Transport", "MLB/RW/FP")
+        c.metric("Teams", "—")
+    with st.expander("Auto-fill from Baseball Savant pitch-level data", expanded=False):
+        st.caption("Pulls public Statcast Search CSV for loaded pitchers and saves heatmap/foul fields into the advanced support feed. This does not change K projection or pitcher K%.")
+        days = st.number_input("Savant lookback days", min_value=30, max_value=730, value=365, step=15, key="adv_savant_days")
+        if st.button("Auto Save Savant Heatmap/Foul Feed For Loaded Pitchers", use_container_width=True, key="auto_save_savant_heatmap_foul"):
+            st.write(auto_save_savant_advanced_feed_from_board(board, days=int(days)))
+    with st.expander("Daily support feed CSV: heatmap, foul, Stuff+, Depth Charts, FI timing, ensemble", expanded=False):
+        tmpl = pd.DataFrame([{col: "" for col in ADVANCED_DAILY_FEED_COLUMNS}])
+        st.download_button("Download advanced daily feed template", tmpl.to_csv(index=False), file_name="advanced_daily_support_feeds_template.csv", mime="text/csv", key="adv_daily_template")
+        upload = st.file_uploader("Upload advanced daily feed CSV", type=["csv"], key="adv_daily_feed_upload")
+        text = st.text_area("Or paste advanced daily feed CSV", height=120, key="adv_daily_feed_text")
+        parsed = _adv_parse_csv(upload, text, ADVANCED_DAILY_FEED_COLUMNS)
+        if not parsed.empty:
+            st.dataframe(parsed.head(30), use_container_width=True, hide_index=True)
+        if st.button("Save Advanced Daily Support Feed", use_container_width=True, key="save_adv_daily_feed"):
+            st.write(_adv_save_csv_append(ADVANCED_DAILY_FEED_FILE, parsed, subset=["Date", "Pitcher"]))
+        current = _adv_read_csv_file(ADVANCED_DAILY_FEED_FILE)
+        if not current.empty:
+            st.caption("Current saved advanced feed")
+            st.dataframe(current.tail(80), use_container_width=True, hide_index=True)
+    with st.expander("True actuals CSV: every graded play/start", expanded=False):
+        tmpl = pd.DataFrame([{col: "" for col in ADVANCED_TRUE_ACTUALS_COLUMNS}])
+        st.download_button("Download true actuals template", tmpl.to_csv(index=False), file_name="advanced_true_actuals_template.csv", mime="text/csv", key="adv_actuals_template")
+        upload = st.file_uploader("Upload true actuals CSV", type=["csv"], key="adv_true_actuals_upload")
+        text = st.text_area("Or paste true actuals CSV", height=120, key="adv_true_actuals_text")
+        parsed = _adv_parse_csv(upload, text, ADVANCED_TRUE_ACTUALS_COLUMNS)
+        if not parsed.empty:
+            st.dataframe(parsed.head(30), use_container_width=True, hide_index=True)
+        if st.button("Save True Actuals Feed", use_container_width=True, key="save_adv_true_actuals"):
+            st.write(_adv_save_csv_append(ADVANCED_TRUE_ACTUALS_FILE, parsed, subset=["Date", "Pitcher", "Line", "Side"]))
+        current = _adv_read_csv_file(ADVANCED_TRUE_ACTUALS_FILE)
+        if not current.empty:
+            st.caption("Current saved true actuals")
+            st.dataframe(current.tail(100), use_container_width=True, hide_index=True)
+    st.markdown("### Post-Slate Flag Calibration")
+    report = build_post_slate_flag_calibration_report(board)
+    if isinstance(report, pd.DataFrame) and not report.empty:
+        st.dataframe(report, use_container_width=True, hide_index=True)
+        st.download_button("Download post-slate flag report", report.to_csv(index=False), file_name="post_slate_flag_calibration_report.csv", mime="text/csv", key="download_adv_post_slate")
+    else:
+        st.info("Post-slate flag report needs current K board rows plus saved true actuals/result grades.")
 
 
 tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -43615,6 +45512,7 @@ with tab_learning_lab:
 
 with tab_calibration:
     render_calibration_audit_tab()
+    render_advanced_daily_data_hub(board)
 
 with tab2:
     st.markdown('<div class="section-title-pro">All Players</div>', unsafe_allow_html=True)
