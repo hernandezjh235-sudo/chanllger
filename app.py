@@ -2570,13 +2570,13 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 # - Used only when MLB confirmed lineup is not available yet
 # - Falls back safely to the internal MLB projected lineup engine
 # =========================
-ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True  # expected-lineup consensus; MLB confirmed always overrides
+ROTOWIRE_EXPECTED_LINEUPS_ENABLED = False  # legacy-safe mode: external lineup pages are manual/audit only
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_WIDGETS_LINEUPS_URL = "https://www.widgets.rotowire.com/baseball/daily-lineups.php"
 ROTOGRINDERS_LINEUPS_URL = "https://rotogrinders.com/lineups/mlb"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
 ROTOWIRE_MANUAL_LINEUPS_FILE = os.path.join(STORAGE_DIR, "rotowire_manual_lineups.csv")
-ROTOWIRE_AUTO_PULL_VERSION = "MULTI_SOURCE_LINEUP_PULL_ROTOWIRE_ROTOGRINDERS_2026_07_26"
+ROTOWIRE_AUTO_PULL_VERSION = "LEGACY_SAFE_INTERNAL_LINEUPS_NO_AUTO_EXTERNAL_2026_07_26"
 LINEUP_CACHE_MAX_HOURS = 30
 # Railway/cloud IPs can occasionally receive a thin/blocked page from RotoWire.
 # Direct RotoWire is ALWAYS attempted first. Jina Reader is only a transport fallback
@@ -3435,7 +3435,7 @@ def get_rotowire_expected_lineups_bundle():
     provider_counts = {"ROTOWIRE": len(lineups or {}), "ROTOGRINDERS": 0, "MANUAL": 0}
     rg_payload = {}
     rg_lineups = {}
-    if sum(1 for v in (lineups or {}).values() if len(v or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS) < 10:
+    if ROTOWIRE_EXPECTED_LINEUPS_ENABLED and sum(1 for v in (lineups or {}).values() if len(v or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS) < 10:
         try:
             rg_payload = _rotogrinders_fetch_lineups_payload() or {}
             rg_raw = rg_payload.get("text", "") or ""
@@ -40317,7 +40317,8 @@ def render_moneyline_edge_tab(board, dates=None):
         _MLUI_PREV_RENDER_ML(board, dates)
 
 
-APP98_LOSS_TARGET_K_VERSION = "APP98_LOSS_TARGET_K_CALIBRATION_2026_07_26"
+APP98_LOSS_TARGET_K_VERSION = "APP98_LOSS_TARGET_K_AUDIT_ONLY_2026_07_26"
+APP98_PROMOTE_TO_PUBLIC_K_PROJ = False
 
 
 def _app98_num(value, default=np.nan):
@@ -40439,16 +40440,19 @@ def _app98_apply_k(df):
     out = pd.DataFrame(rows)
     try:
         final_series = pd.to_numeric(out["APP98 Loss Target Projection"], errors="coerce")
-        for c in ["K PROJ", "Final K Projection", "Official K PROJ", "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection"]:
-            if c in out.columns:
-                old = pd.to_numeric(out[c], errors="coerce")
-                out[c] = final_series.where(final_series.notna(), old).round(2)
-        line = pd.to_numeric(out.get("UD/Line", out.get("Line")), errors="coerce")
-        edge = (final_series - line).round(2)
-        for c in ["Edge", "Edge Gap", "Official K Edge", "Final K Edge", "Line-Aware Smart Edge"]:
-            if c in out.columns:
-                out[c] = edge
-        out["APP98 Final Projection Guard"] = "LOCKED_APP98_LOSS_TARGET"
+        if APP98_PROMOTE_TO_PUBLIC_K_PROJ:
+            for c in ["K PROJ", "Final K Projection", "Official K PROJ", "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection"]:
+                if c in out.columns:
+                    old = pd.to_numeric(out[c], errors="coerce")
+                    out[c] = final_series.where(final_series.notna(), old).round(2)
+            line = pd.to_numeric(out.get("UD/Line", out.get("Line")), errors="coerce")
+            edge = (final_series - line).round(2)
+            for c in ["Edge", "Edge Gap", "Official K Edge", "Final K Edge", "Line-Aware Smart Edge"]:
+                if c in out.columns:
+                    out[c] = edge
+            out["APP98 Final Projection Guard"] = "LOCKED_APP98_LOSS_TARGET"
+        else:
+            out["APP98 Final Projection Guard"] = "AUDIT_ONLY_PUBLIC_K_UNCHANGED"
     except Exception:
         pass
     return out
@@ -40745,8 +40749,8 @@ def _app99_has_value(row, keys):
 
 def _app99_right_wins_row(row):
     line = _app99_num(_app99_text(row, ["UD/Line", "Line", "Underdog Line"]), np.nan)
-    proj = _app99_num(_app99_text(row, ["APP98 Loss Target Projection", "K PROJ", "Final K Projection"]), np.nan)
-    edge = _app99_num(_app99_text(row, ["APP98 Loss Target Edge", "Official K Edge", "Edge Gap"]), np.nan)
+    proj = _app99_num(_app99_text(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection", "APP98 Loss Target Projection"]), np.nan)
+    edge = _app99_num(_app99_text(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"]), np.nan)
     if not np.isfinite(edge) and np.isfinite(proj) and np.isfinite(line):
         edge = proj - line
 
@@ -40882,7 +40886,7 @@ def _kclean_pick(row, keys, default=""):
 
 
 def _kclean_side_label(row):
-    side = str(_kclean_pick(row, ["APP98 Loss Target Side", "APP97 Final Side", "APP88 Final Side"], "")).upper()
+    side = str(_kclean_pick(row, ["APP97 Final Side", "APP88 Final Side", "APP98 Loss Target Side"], "")).upper()
     if side in {"OVER", "UNDER"}:
         return side
     text = str(_kclean_pick(row, ["Decision", "Final Decision", "Model Lean"], "")).upper()
@@ -40895,7 +40899,7 @@ def _kclean_side_label(row):
 
 def _kclean_display_decision(row):
     side = _kclean_side_label(row)
-    edge = _app98_num(_kclean_pick(row, ["APP98 Loss Target Edge", "Official K Edge", "Edge Gap"], np.nan), np.nan) if "_app98_num" in globals() else np.nan
+    edge = _app98_num(_kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], np.nan), np.nan) if "_app98_num" in globals() else np.nan
     reason = str(row.get("APP98 Loss Target Reason") or "").lower()
     gate = str(row.get("APP99 Right Wins Gate") or "").upper()
     if not side:
@@ -40925,8 +40929,8 @@ def _kclean_main_df(df):
             "Pitcher": _kclean_pick(row, ["Pitcher", "pitcher", "Player"], ""),
             "Matchup": _kclean_pick(row, ["Matchup", "matchup"], ""),
             "Line": _kclean_pick(row, ["UD/Line", "Line", "Underdog Line"], ""),
-            "K Projection": _kclean_pick(row, ["APP98 Loss Target Projection", "K PROJ", "Final K Projection"], ""),
-            "Edge": _kclean_pick(row, ["APP98 Loss Target Edge", "Official K Edge", "Edge Gap"], ""),
+            "K Projection": _kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection", "APP98 Loss Target Projection"], ""),
+            "Edge": _kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], ""),
             "Pick": _kclean_display_decision(row),
             "Sim Side %": _kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], ""),
             "Lineup": _kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], ""),
