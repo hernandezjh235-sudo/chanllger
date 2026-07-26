@@ -31980,7 +31980,12 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
         market_terms = [
             "1st inning pitch count", "first inning pitch count", "1st-inning pitch count",
             "first-inning pitch count", "1st inning pitches", "first inning pitches",
-            "inning 1 pitch count", "1st inn pitch count"
+            "inning 1 pitch count", "1st inn pitch count", "1st inn pitches",
+            "1st inn. pitch count", "1st inn. pitches", "1st inning pitches thrown",
+            "first inning pitches thrown", "pitcher 1st inning pitch count",
+            "pitcher first inning pitch count", "pitcher 1st inning pitches",
+            "pitcher first inning pitches", "1i pitch count", "1i pitches",
+            "1 inn pitch count", "1 inn pitches"
         ]
         bad_terms = [
             "pitching outs", "pitcher outs", "outs recorded", "recorded outs",
@@ -32199,6 +32204,19 @@ def _beta_fetch_underdog_pitcher_market(player_name, market_kind):
         low = str(blob or "").lower()
         if any(b in low for b in bad_terms):
             return False
+        compact = re.sub(r"[^a-z0-9]+", "", low)
+        if mk in ["FI_PITCHES", "FIRST_INNING_PITCH_COUNT", "1ST_INNING_PITCH_COUNT"]:
+            fi_patterns = [
+                "1stinningpitchcount", "firstinningpitchcount",
+                "1stinningpitches", "firstinningpitches",
+                "1stinnpitchcount", "1stinnpitches",
+                "inning1pitchcount", "inning1pitches",
+                "pitcher1stinningpitchcount", "pitcherfirstinningpitchcount",
+                "pitcher1stinningpitches", "pitcherfirstinningpitches",
+                "1ipitchcount", "1ipitches", "1innpitchcount", "1innpitches",
+            ]
+            if any(x in compact for x in fi_patterns):
+                return True
         # Outs can safely infer from 10.5+ pitcher prop lines when player matches strongly.
         if mk == "OUTS" and line is not None and line >= 10.5:
             if not any(x in low for x in [
@@ -43240,6 +43258,310 @@ def render_kproj_tab(board):
         show = df.copy()
         show["K Clean UI Version"] = K_CLEAN_SINGLE_BOARD_UI_VERSION
         st.dataframe(show[cols] if cols else show, use_container_width=True, hide_index=True)
+
+
+PO_BF_LEASH_CALIBRATION_VERSION = "PO_BF_LEASH_CALIBRATION_2026_07_26"
+
+
+def _po_cal_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        x = float(str(value).replace("%", "").replace(",", "").strip())
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _po_cal_txt(row, keys, default=""):
+    try:
+        for k in keys:
+            if isinstance(row, dict) and k in row:
+                v = row.get(k)
+                if v not in (None, "", "—", "nan", "NaN"):
+                    return str(v)
+    except Exception:
+        pass
+    return default
+
+
+def _po_cal_pitcher_history_bias(pitcher):
+    """Small Pitching-Outs-only correction from the saved PO loss/grade file."""
+    out = {
+        "PO History Sample": 0,
+        "PO History Avg Error": "",
+        "PO History Bias Adj Outs": 0.0,
+        "PO History Loss Pattern": "",
+    }
+    try:
+        if "PO_LOSS_RESULT_FILE" not in globals() or not os.path.exists(PO_LOSS_RESULT_FILE):
+            return out
+        hist = pd.read_csv(PO_LOSS_RESULT_FILE)
+        if hist is None or hist.empty:
+            return out
+        key = _tpl_norm_name(pitcher) if "_tpl_norm_name" in globals() else str(pitcher or "").lower().strip()
+        if not key:
+            return out
+        names = hist.get("Pitcher", pd.Series(dtype=str)).astype(str)
+        if "_tpl_norm_name" in globals():
+            d = hist[names.map(_tpl_norm_name).eq(key)].copy()
+        else:
+            d = hist[names.str.lower().str.strip().eq(key)].copy()
+        if d.empty:
+            return out
+        actual = pd.to_numeric(d.get("Actual Outs"), errors="coerce")
+        proj = pd.to_numeric(d.get("Beta Projection"), errors="coerce")
+        err = (actual - proj).dropna()
+        if err.empty:
+            return out
+        avg_err = float(err.tail(12).mean())
+        # Keep this as a small nudge only; the daily BF/leash read still drives the board.
+        adj = max(-0.65, min(0.65, avg_err * 0.18))
+        losses = d[d.get("PO Result", "").astype(str).eq("LOSS")] if "PO Result" in d.columns else pd.DataFrame()
+        pattern = ""
+        if not losses.empty and "PO Loss Reason" in losses.columns:
+            pattern = str(losses["PO Loss Reason"].tail(8).mode().iloc[0]) if not losses["PO Loss Reason"].tail(8).mode().empty else ""
+        out.update({
+            "PO History Sample": int(len(d)),
+            "PO History Avg Error": round(avg_err, 2),
+            "PO History Bias Adj Outs": round(adj, 2),
+            "PO History Loss Pattern": pattern,
+        })
+        return out
+    except Exception as e:
+        out["PO History Loss Pattern"] = f"history unavailable: {str(e)[:80]}"
+        return out
+
+
+def _po_cal_profile(row):
+    proj = _po_cal_num(row.get("Beta Projection"), np.nan)
+    line = _po_cal_num(row.get("UD Line"), np.nan)
+    side = _po_cal_txt(row, ["Beta Lean"], "").upper()
+    beta_ip = _po_cal_num(row.get("Beta IP"), np.nan)
+    beta_bf = _po_cal_num(row.get("Beta BF"), np.nan)
+    original_ip = _po_cal_num(row.get("Original IP"), np.nan)
+    conf = _po_cal_num(row.get("IP Confidence"), 50.0)
+    hook = _po_cal_num(row.get("Recent Hook Rate"), np.nan)
+    deep = _po_cal_num(row.get("Deep Start Rate"), np.nan)
+    ppi = _po_cal_num(row.get("Pitch Efficiency P/IP"), np.nan)
+    vol = _po_cal_num(row.get("IP Volatility Score"), 50.0)
+    damage_score = _po_cal_num(row.get("Damage Risk Score"), np.nan)
+    damage_label = _po_cal_txt(row, ["Damage Risk Label", "Damage Risk Note"], "").upper()
+    flags = _po_cal_txt(row, ["Beta Flags", "IP Debug", "PO Experience Guardrail"], "").upper()
+    pitcher = _po_cal_txt(row, ["Pitcher"], "")
+    hist = _po_cal_pitcher_history_bias(pitcher)
+
+    adj = 0.0
+    notes = []
+
+    if np.isfinite(beta_bf):
+        if beta_bf >= 23.5:
+            bf_signal = "FULL_BF_SUPPORT"
+            adj += 0.22
+        elif beta_bf >= 20.5:
+            bf_signal = "NORMAL_BF"
+        elif beta_bf >= 17.5:
+            bf_signal = "THIN_BF"
+            adj -= 0.18
+        else:
+            bf_signal = "LOW_BF_RISK"
+            adj -= 0.38
+    else:
+        bf_signal = "BF_UNKNOWN"
+        adj -= 0.16
+    notes.append(bf_signal)
+
+    if np.isfinite(hook) and hook >= 45:
+        hook_signal = "HIGH_HOOK_RISK"
+        adj -= 0.42
+    elif np.isfinite(hook) and hook >= 34:
+        hook_signal = "MED_HOOK_RISK"
+        adj -= 0.20
+    elif np.isfinite(deep) and deep >= 55:
+        hook_signal = "FULL_LEASH_SUPPORT"
+        adj += 0.34
+    elif np.isfinite(deep) and deep >= 42:
+        hook_signal = "LEASH_OK"
+        adj += 0.12
+    else:
+        hook_signal = "LEASH_NEUTRAL"
+    notes.append(hook_signal)
+
+    if np.isfinite(ppi):
+        if ppi >= 18.2:
+            eff_signal = "POOR_PITCH_EFFICIENCY"
+            adj -= 0.26
+        elif ppi <= 15.6:
+            eff_signal = "EFFICIENT_PITCH_PROFILE"
+            adj += 0.16
+        else:
+            eff_signal = "AVG_PITCH_EFFICIENCY"
+    else:
+        eff_signal = "PITCH_EFF_UNKNOWN"
+    notes.append(eff_signal)
+
+    if "HIGH" in damage_label or (np.isfinite(damage_score) and damage_score >= 65):
+        damage_signal = "HIGH_DAMAGE_RISK"
+        adj -= 0.36
+    elif "MED" in damage_label or (np.isfinite(damage_score) and damage_score >= 50):
+        damage_signal = "MED_DAMAGE_RISK"
+        adj -= 0.18
+    elif "LOW" in damage_label or (np.isfinite(damage_score) and damage_score <= 35):
+        damage_signal = "LOW_DAMAGE_RISK"
+        adj += 0.10
+    else:
+        damage_signal = "DAMAGE_NEUTRAL"
+    notes.append(damage_signal)
+
+    if any(x in flags for x in ["OPENER", "BULK", "PITCH_LIMIT", "TANDEM", "NON_TRADITIONAL_ROLE", "ROLE_RISK", "ROOKIE"]):
+        role_signal = "ROLE_OR_SAMPLE_GUARDRAIL"
+        adj -= 0.34
+    else:
+        role_signal = "ROLE_NORMAL"
+    notes.append(role_signal)
+
+    if np.isfinite(conf):
+        if conf < 45:
+            conf_signal = "LOW_PO_CONFIDENCE"
+            adj -= 0.22
+        elif conf >= 68:
+            conf_signal = "STRONG_PO_CONFIDENCE"
+            adj += 0.12
+        else:
+            conf_signal = "PO_CONFIDENCE_OK"
+    else:
+        conf_signal = "PO_CONFIDENCE_UNKNOWN"
+        adj -= 0.10
+    notes.append(conf_signal)
+
+    if np.isfinite(vol) and vol >= 68:
+        notes.append("HIGH_IP_VOLATILITY")
+        adj -= 0.12
+
+    hist_adj = _po_cal_num(hist.get("PO History Bias Adj Outs"), 0.0)
+    if np.isfinite(hist_adj) and abs(hist_adj) > 0:
+        adj += hist_adj
+        notes.append(f"HISTORY_BIAS {hist_adj:+.2f}")
+
+    # Side-aware anti-loss guardrails.
+    edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
+    if np.isfinite(edge) and abs(edge) < 1.25:
+        notes.append("THIN_EDGE_GUARDRAIL")
+        adj *= 0.55
+    if side == "UNDER" and hook_signal in ["FULL_LEASH_SUPPORT", "LEASH_OK"] and np.isfinite(deep) and deep >= 42:
+        adj += 0.22
+        notes.append("UNDER_DURABLE_STARTER_PROTECTION")
+    if side == "OVER" and hook_signal in ["HIGH_HOOK_RISK", "MED_HOOK_RISK"]:
+        adj -= 0.20
+        notes.append("OVER_HOOK_PROTECTION")
+
+    adj = round(max(-1.35, min(1.35, adj)), 2)
+    calibrated = round(float(proj) + adj, 1) if np.isfinite(proj) else np.nan
+    cal_edge = round(calibrated - float(line), 2) if np.isfinite(calibrated) and np.isfinite(line) else np.nan
+
+    if np.isfinite(cal_edge):
+        cal_side = "OVER" if cal_edge > 0 else "UNDER" if cal_edge < 0 else "PASS"
+        try:
+            if "_beta_outs_final_decision" in globals():
+                cal_side, cal_gap, cal_prob, cal_note = _beta_outs_final_decision(calibrated, float(line), row)
+            else:
+                cal_gap = cal_edge
+                cal_prob = ""
+                cal_note = "calibrated edge only"
+        except Exception:
+            cal_gap = cal_edge
+            cal_prob = ""
+            cal_note = "calibrated decision fallback"
+    else:
+        cal_side, cal_gap, cal_prob, cal_note = "NO LINE", np.nan, "", "missing line/projection"
+
+    return {
+        "Pre-PO Calibration Projection": row.get("Beta Projection", ""),
+        "Pre-PO Calibration Lean": row.get("Beta Lean", ""),
+        "Pre-PO Calibration Edge": row.get("Beta Edge", ""),
+        "PO Calibrated Projection": calibrated if np.isfinite(calibrated) else "",
+        "PO Calibration Adj Outs": adj,
+        "PO Calibrated Edge": cal_gap if np.isfinite(_po_cal_num(cal_gap, np.nan)) else "",
+        "PO Calibrated Lean": cal_side,
+        "PO Calibrated Hit %": cal_prob if cal_prob not in (None, np.nan) else "",
+        "PO Calibrated Decision Note": cal_note,
+        "PO BF Signal": bf_signal,
+        "PO Leash/Hook Signal": hook_signal,
+        "PO Pitch Efficiency Signal": eff_signal,
+        "PO Damage Signal": damage_signal,
+        "PO Role/Sample Signal": role_signal,
+        "PO Confidence Signal": conf_signal,
+        "PO Calibration Notes": "; ".join(dict.fromkeys(notes)),
+        "PO Calibration Version": PO_BF_LEASH_CALIBRATION_VERSION,
+        **hist,
+    }
+
+
+def _po_apply_bf_leash_calibration(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    profiles = []
+    for _, rr in out.iterrows():
+        row = rr.to_dict()
+        try:
+            profiles.append(_po_cal_profile(row))
+        except Exception as e:
+            profiles.append({
+                "PO Calibration Version": PO_BF_LEASH_CALIBRATION_VERSION,
+                "PO Calibration Notes": f"calibration unavailable: {str(e)[:100]}",
+            })
+    add = pd.DataFrame(profiles, index=out.index)
+    for c in add.columns:
+        out[c] = add[c]
+
+    # Promote calibrated PO-only columns, preserving the original fields above.
+    cal_proj = pd.to_numeric(out.get("PO Calibrated Projection"), errors="coerce")
+    if "Beta Projection" in out.columns:
+        out["Beta Projection"] = cal_proj.where(cal_proj.notna(), pd.to_numeric(out["Beta Projection"], errors="coerce")).round(1)
+    if "Beta Outs" in out.columns:
+        out["Beta Outs"] = out["Beta Projection"]
+    if "Beta IP" in out.columns:
+        out["Beta IP"] = (pd.to_numeric(out["Beta Projection"], errors="coerce") / 3.0).round(2)
+    for dst, src in [("Beta Lean", "PO Calibrated Lean"), ("Beta Edge", "PO Calibrated Edge"), ("Beta Hit %", "PO Calibrated Hit %"), ("Decision Note", "PO Calibrated Decision Note")]:
+        if src in out.columns:
+            out[dst] = out[src].where(out[src].astype(str).str.len() > 0, out.get(dst, ""))
+    return out
+
+
+_PO_CAL_PREV_ROWS = _beta_projection_rows if "_beta_projection_rows" in globals() else None
+
+
+def _beta_projection_rows(board, market_kind="OUTS"):
+    df = _PO_CAL_PREV_ROWS(board, market_kind) if _PO_CAL_PREV_ROWS is not None else pd.DataFrame()
+    if str(market_kind).upper() != "OUTS":
+        return df
+    return _po_apply_bf_leash_calibration(df)
+
+
+_PO_CAL_PREV_RENDER_PO = render_beta_pitching_outs_tab if "render_beta_pitching_outs_tab" in globals() else None
+
+
+def render_beta_pitching_outs_tab(board):
+    if _PO_CAL_PREV_RENDER_PO is not None:
+        _PO_CAL_PREV_RENDER_PO(board)
+    try:
+        df = _beta_projection_rows(board, "OUTS")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">Pitching Outs BF / Leash Calibration</div>', unsafe_allow_html=True)
+            st.caption("Pitching Outs only. Uses expected BF, pitch-count efficiency, hook/deep-start tendency, damage risk, role/sample guardrails, and saved PO grade history.")
+            cols = [c for c in [
+                "Pitcher", "Matchup", "UD Line", "Pre-PO Calibration Projection", "Beta Projection",
+                "PO Calibration Adj Outs", "Beta Lean", "Beta Edge", "Beta Hit %",
+                "PO BF Signal", "PO Leash/Hook Signal", "PO Pitch Efficiency Signal",
+                "PO Damage Signal", "PO Role/Sample Signal", "PO Confidence Signal",
+                "Beta BF", "Recent Hook Rate", "Deep Start Rate", "Pitch Efficiency P/IP",
+                "Damage Risk Label", "IP Confidence", "PO History Sample", "PO History Avg Error",
+                "PO History Loss Pattern", "PO Calibration Notes", "PO Calibration Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Pitching Outs BF/leash calibration unavailable: {e}")
 
 
 tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
