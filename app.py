@@ -2574,11 +2574,15 @@ ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True  # expected-lineup consensus; MLB confi
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_WIDGETS_LINEUPS_URL = "https://www.widgets.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
+ROTOWIRE_MANUAL_LINEUPS_FILE = os.path.join(STORAGE_DIR, "rotowire_manual_lineups.csv")
+ROTOWIRE_AUTO_PULL_VERSION = "ROTOWIRE_AUTO_PULL_HARDENED_2026_07_26"
+LINEUP_CACHE_MAX_HOURS = 30
 # Railway/cloud IPs can occasionally receive a thin/blocked page from RotoWire.
 # Direct RotoWire is ALWAYS attempted first. Jina Reader is only a transport fallback
 # for the same public RotoWire page; it is never treated as an independent lineup source.
 ROTOWIRE_READER_FALLBACK_ENABLED = True
 ROTOWIRE_READER_URL = "https://r.jina.ai/http://www.rotowire.com/baseball/daily-lineups.php"
+ROTOWIRE_READER_URL_HTTPS = "https://r.jina.ai/http://r.jina.ai/http://https://www.rotowire.com/baseball/daily-lineups.php"
 
 ROTOWIRE_TEAM_ALIASES = {
     "AZ": "ARI", "ARZ": "ARI",
@@ -2608,6 +2612,133 @@ def _rw_clean_name(name):
         if name.endswith(token):
             name = name[: -len(token)].strip()
     return name
+
+def _rotowire_manual_status_to_source(status):
+    s = str(status or "").upper()
+    if "CONFIRMED" in s or "LOCKED" in s or "OFFICIAL" in s:
+        return "ROTOWIRE_CONFIRMED_LINEUP"
+    return "ROTOWIRE_EXPECTED_LINEUP"
+
+def _rotowire_load_manual_lineups():
+    try:
+        if os.path.exists(ROTOWIRE_MANUAL_LINEUPS_FILE):
+            df = pd.read_csv(ROTOWIRE_MANUAL_LINEUPS_FILE)
+            return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def _rotowire_save_manual_lineups(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return {"saved": 0, "path": ROTOWIRE_MANUAL_LINEUPS_FILE, "reason": "empty"}
+        out = df.copy()
+        # Flexible headers: accept Team/TEAM, Batter/Player/Name, Hand/Bats, Position/Pos.
+        rename = {}
+        for c in list(out.columns):
+            low = str(c).strip().lower()
+            if low in {"team", "team_abbr", "abbr"}:
+                rename[c] = "Team"
+            elif low in {"order", "#", "batting_order", "battingorder"}:
+                rename[c] = "Order"
+            elif low in {"batter", "player", "name", "hitter"}:
+                rename[c] = "Batter"
+            elif low in {"hand", "bats", "bat_side", "batside"}:
+                rename[c] = "Hand"
+            elif low in {"position", "pos"}:
+                rename[c] = "Position"
+            elif low in {"status", "lineup_status", "source"}:
+                rename[c] = "Status"
+        out = out.rename(columns=rename)
+        if "Team" not in out.columns or "Batter" not in out.columns:
+            return {"saved": 0, "path": ROTOWIRE_MANUAL_LINEUPS_FILE, "error": "Need Team and Batter columns"}
+        if "Order" not in out.columns:
+            out["Order"] = out.groupby(out["Team"].astype(str).map(_rw_norm_team_abbr)).cumcount() + 1
+        if "Hand" not in out.columns:
+            out["Hand"] = ""
+        if "Position" not in out.columns:
+            out["Position"] = ""
+        if "Status" not in out.columns:
+            out["Status"] = "Expected Lineup"
+        out["Team"] = out["Team"].astype(str).map(_rw_norm_team_abbr)
+        out["Batter"] = out["Batter"].astype(str).map(_rw_clean_name)
+        out["Order"] = pd.to_numeric(out["Order"], errors="coerce")
+        out = out[out["Team"].astype(str).str.len().between(2, 4)]
+        out = out[out["Batter"].astype(str).str.len() >= 3]
+        out = out.sort_values(["Team", "Order"], na_position="last")
+        out = out.drop_duplicates(["Team", "Batter"], keep="first")
+        out.to_csv(ROTOWIRE_MANUAL_LINEUPS_FILE, index=False)
+        teams = int(out["Team"].nunique()) if "Team" in out.columns else 0
+        return {"saved": len(out), "teams": teams, "path": ROTOWIRE_MANUAL_LINEUPS_FILE}
+    except Exception as e:
+        return {"saved": 0, "path": ROTOWIRE_MANUAL_LINEUPS_FILE, "error": str(e)[:160]}
+
+def _rotowire_manual_lineups_dict():
+    df = _rotowire_load_manual_lineups()
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    rows_by_team = {}
+    try:
+        d = df.copy()
+        d["Team"] = d["Team"].astype(str).map(_rw_norm_team_abbr)
+        d["Order"] = pd.to_numeric(d.get("Order"), errors="coerce")
+        d = d.sort_values(["Team", "Order"], na_position="last")
+        for team, group in d.groupby("Team", sort=False):
+            rows = []
+            for i, (_, rr) in enumerate(group.head(9).iterrows(), start=1):
+                hand = str(rr.get("Hand") or "").upper().strip()
+                rows.append({
+                    "Order": int(rr.get("Order")) if pd.notna(rr.get("Order")) else i,
+                    "Batter": _rw_clean_name(rr.get("Batter")),
+                    "Position": str(rr.get("Position") or "").upper().strip() or None,
+                    "Hand": hand if hand in {"L", "R", "S"} else None,
+                    "Lineup Source": _rotowire_manual_status_to_source(rr.get("Status")),
+                    "Manual RotoWire Override": "YES",
+                })
+            if len(rows) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
+                rows_by_team[_rw_norm_team_abbr(team)] = rows[:9]
+    except Exception:
+        return {}
+    return rows_by_team
+
+def _rotowire_payload_signal(txt):
+    try:
+        raw = str(txt or "")
+        low = raw.lower()
+        marker_count = low.count("expected lineup") + low.count("confirmed lineup")
+        if marker_count >= 2:
+            return True, marker_count, "lineup markers"
+        team_count = len(set(re.findall(r"\b(ARI|ATL|BAL|BOS|CHC|CHW|CIN|CLE|COL|DET|HOU|KC|LAA|LAD|MIA|MIL|MIN|NYM|NYY|ATH|OAK|PHI|PIT|SD|SEA|SF|STL|TB|TEX|TOR|WSH|WAS)\b", raw.upper())))
+        pos_count = len(re.findall(r"\b(C|1B|2B|3B|SS|LF|CF|RF|DH)\b", raw.upper()))
+        name_like = len(re.findall(r"\b[A-Z][a-z]+\s+[A-Z][a-zA-Z.'-]+\b", raw))
+        ok = len(raw) >= 4500 and team_count >= 4 and pos_count >= 24 and name_like >= 35
+        return ok, marker_count, f"teams={team_count}; positions={pos_count}; names={name_like}"
+    except Exception as e:
+        return False, 0, f"signal error: {e}"
+
+def _rotowire_curl_fetch(url, headers=None, timeout=24):
+    try:
+        import subprocess
+        h = headers or {}
+        cmd = [
+            "curl", "-L", "--compressed", "--http1.1", "--tlsv1.2",
+            "--max-time", str(int(timeout)),
+            "-A", str(h.get("User-Agent") or "Mozilla/5.0"),
+            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "-H", "Accept-Language: en-US,en;q=0.9",
+            str(url),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=int(timeout) + 4)
+        txt = res.stdout or ""
+        return {
+            "ok": res.returncode == 0 and bool(txt),
+            "text": txt,
+            "status_code": res.returncode,
+            "url": url,
+            "error": (res.stderr or "")[:240],
+        }
+    except Exception as e:
+        return {"ok": False, "text": "", "status_code": None, "url": url, "error": str(e)[:240]}
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _rotowire_fetch_daily_lineups_payload():
@@ -2644,41 +2775,61 @@ def _rotowire_fetch_daily_lineups_payload():
     targets = [
         (ROTOWIRE_WIDGETS_LINEUPS_URL, "ROTOWIRE_WIDGETS"),
         (ROTOWIRE_DAILY_LINEUPS_URL, "DIRECT_ROTOWIRE"),
+        (ROTOWIRE_DAILY_LINEUPS_URL + "?view=lineups", "DIRECT_ROTOWIRE_VIEW_LINEUPS"),
     ]
     for url, transport in targets:
         for headers in headers_pool:
             try:
                 r = requests.get(url, timeout=18, headers=headers, allow_redirects=True)
                 txt = r.text or ""
-                marker_count = txt.lower().count("expected lineup") + txt.lower().count("confirmed lineup")
-                if r.status_code < 400 and len(txt) >= 7000 and marker_count >= 2:
+                signal_ok, marker_count, signal_note = _rotowire_payload_signal(txt)
+                if r.status_code < 400 and signal_ok:
                     payload.update({
                         "text": txt, "transport": transport, "status": "SUCCESS",
                         "http_status": r.status_code, "bytes": len(txt), "error": "; ".join(errors)[:700],
+                        "auto_pull_signal": signal_note,
+                        "auto_pull_version": ROTOWIRE_AUTO_PULL_VERSION,
                         "url": str(r.url),
                     })
                     return payload
-                errors.append(f"{transport} HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}")
+                errors.append(f"{transport} HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}; {signal_note}")
             except Exception as exc:
                 errors.append(f"{transport} error: {type(exc).__name__}: {exc}")
-
-    if ROTOWIRE_READER_FALLBACK_ENABLED:
-        try:
-            r = requests.get(ROTOWIRE_READER_URL, timeout=22, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain,text/markdown,*/*"})
-            txt = r.text or ""
-            marker_count = txt.lower().count("expected lineup") + txt.lower().count("confirmed lineup")
-            if r.status_code < 400 and len(txt) >= 5000 and marker_count >= 2:
+            curl = _rotowire_curl_fetch(url, headers=headers, timeout=24)
+            txt = curl.get("text") or ""
+            signal_ok, marker_count, signal_note = _rotowire_payload_signal(txt)
+            if curl.get("ok") and signal_ok:
                 payload.update({
-                    "text": txt, "transport": "ROTOWIRE_VIA_READER", "status": "SUCCESS",
-                    "http_status": r.status_code, "bytes": len(txt), "error": "; ".join(errors)[:700],
-                    "url": ROTOWIRE_READER_URL,
+                    "text": txt, "transport": transport + "_CURL", "status": "SUCCESS",
+                    "http_status": curl.get("status_code"), "bytes": len(txt), "error": "; ".join(errors)[:700],
+                    "auto_pull_signal": signal_note,
+                    "auto_pull_version": ROTOWIRE_AUTO_PULL_VERSION,
+                    "url": str(curl.get("url") or url),
                 })
                 return payload
-            errors.append(f"reader HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}")
-        except Exception as exc:
-            errors.append(f"reader error: {type(exc).__name__}: {exc}")
+            if txt or curl.get("error"):
+                errors.append(f"{transport}_CURL rc={curl.get('status_code')}; bytes={len(txt)}; lineup_markers={marker_count}; {signal_note}; {curl.get('error')}")
 
-    payload.update({"status": "FAILED", "error": "; ".join(errors)[:900]})
+    if ROTOWIRE_READER_FALLBACK_ENABLED:
+        for reader_url in [ROTOWIRE_READER_URL, ROTOWIRE_READER_URL_HTTPS]:
+            try:
+                r = requests.get(reader_url, timeout=22, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain,text/markdown,*/*"})
+                txt = r.text or ""
+                signal_ok, marker_count, signal_note = _rotowire_payload_signal(txt)
+                if r.status_code < 400 and signal_ok:
+                    payload.update({
+                        "text": txt, "transport": "ROTOWIRE_VIA_READER", "status": "SUCCESS",
+                        "http_status": r.status_code, "bytes": len(txt), "error": "; ".join(errors)[:700],
+                        "auto_pull_signal": signal_note,
+                        "auto_pull_version": ROTOWIRE_AUTO_PULL_VERSION,
+                        "url": reader_url,
+                    })
+                    return payload
+                errors.append(f"reader HTTP {r.status_code}; bytes={len(txt)}; lineup_markers={marker_count}; {signal_note}")
+            except Exception as exc:
+                errors.append(f"reader error: {type(exc).__name__}: {exc}")
+
+    payload.update({"status": "FAILED", "error": "; ".join(errors)[:1200], "auto_pull_version": ROTOWIRE_AUTO_PULL_VERSION})
     return payload
 
 def _rotowire_fetch_daily_lineups_html():
@@ -3120,12 +3271,26 @@ def get_rotowire_expected_lineups_bundle():
     payload = _rotowire_fetch_daily_lineups_payload() or {}
     raw = payload.get("text", "") or ""
     lineups = _rotowire_extract_lineups_from_html(raw) if raw else {}
+    manual_lineups = _rotowire_manual_lineups_dict()
+    if manual_lineups:
+        # Auto RotoWire has priority. Manual RotoWire rows only fill teams the
+        # live fetch/parser did not produce.
+        lineups = dict(lineups or {})
+        for team, rows in manual_lineups.items():
+            team = _rw_norm_team_abbr(team)
+            if len(lineups.get(team, []) or []) < ROTOWIRE_LINEUP_MIN_VALID_HITTERS and len(rows or []) >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS:
+                lineups[_rw_norm_team_abbr(team)] = rows[:9]
     team_counts = {str(k): len(v or []) for k, v in (lineups or {}).items()}
     parsed_teams = sum(1 for v in team_counts.values() if v >= ROTOWIRE_LINEUP_MIN_VALID_HITTERS)
     status = dict(payload)
     status.pop("text", None)
+    status["manual_override_file"] = ROTOWIRE_MANUAL_LINEUPS_FILE
+    status["manual_override_teams"] = len(manual_lineups or {})
     status["parsed_teams"] = parsed_teams
     status["team_counts"] = team_counts
+    if manual_lineups and payload.get("status") != "SUCCESS" and parsed_teams >= 1:
+        status["status"] = "SUCCESS"
+        status["transport"] = "MANUAL_ROTOWIRE_BACKUP+" + str(status.get("transport") or "FETCH")
     if payload.get("status") == "SUCCESS" and parsed_teams < 2:
         status["status"] = "PARSE_FAILED"
         status["error"] = ((status.get("error") or "") + "; RotoWire page fetched but lineup parser found too few teams").strip("; ")
@@ -3773,7 +3938,22 @@ def lineup_cache_key(game_pk, opp_side, pitcher_hand):
 def get_cached_lineup_rows(game_pk, opp_side, pitcher_hand):
     cache = load_json(LINEUP_CACHE_FILE, {})
     rec = cache.get(lineup_cache_key(game_pk, opp_side, pitcher_hand))
-    return rec.get("rows", []) if rec else []
+    if not rec:
+        return []
+    try:
+        saved = str(rec.get("saved_at") or "")
+        saved_dt = datetime.fromisoformat(saved.replace("Z", "+00:00"))
+        age_hours = (datetime.now(saved_dt.tzinfo) - saved_dt).total_seconds() / 3600.0
+        if age_hours > LINEUP_CACHE_MAX_HOURS:
+            return []
+    except Exception:
+        return []
+    rows = rec.get("rows", []) if isinstance(rec, dict) else []
+    # Only re-use true/official lineups from cache. Never let an old projected
+    # lineup masquerade as today's RotoWire/confirmed 1-9.
+    if rows and not any("CONFIRMED" in str(r.get("Lineup Source", "")).upper() or "OFFICIAL" in str(r.get("Lineup Source", "")).upper() for r in rows if isinstance(r, dict)):
+        return []
+    return rows[:9]
 
 def set_cached_lineup_rows(game_pk, opp_side, pitcher_hand, rows):
     if not rows:
@@ -39370,7 +39550,9 @@ def _app97_apply(df, board=None):
         row = rr.to_dict()
         name = str(row.get("Pitcher") or "").strip()
         p = lookup.get(name.lower(), {})
-        pid = _app97_pitcher_id(p)
+        board_pid = _app97_pitcher_id(p)
+        pid = board_pid
+        pid_source = "BOARD_ID" if board_pid else "NAME_SEARCH"
         if not pid and "_mlb_search_player_id_by_name" in globals():
             try:
                 pid = _mlb_search_player_id_by_name(name)
@@ -39385,7 +39567,21 @@ def _app97_apply(df, board=None):
         # Current pitcher talent: live MLB season first, existing model second.
         model_pk = _app97_pct(row.get("Pitcher K%"), None)
         live_pk = _app97_pct(live.get("season_k_pct"), None)
-        pitcher_k = live_pk if live_pk is not None else model_pk
+        pitcher_k_warning = []
+        trusted_live_pk = live_pk
+        live_bf = _app97_num(live.get("season_bf"), None) if isinstance(live, dict) else None
+        if live_pk is not None:
+            if live_pk < 6.0 or live_pk > 48.0:
+                pitcher_k_warning.append(f"live K% outside sanity range: {live_pk:.1f}")
+            if model_pk is not None and abs(live_pk - model_pk) >= 10.0:
+                pitcher_k_warning.append(f"live/model K% mismatch: live {live_pk:.1f} vs model {model_pk:.1f}")
+            if not board_pid:
+                pitcher_k_warning.append("pitcher id came from name search; verify identity")
+            if live_bf is not None and live_bf < 35:
+                pitcher_k_warning.append(f"small live BF sample: {live_bf:.0f}")
+        if trusted_live_pk is not None and any(x.startswith("live K% outside") or x.startswith("live/model") for x in pitcher_k_warning) and model_pk is not None:
+            trusted_live_pk = None
+        pitcher_k = trusted_live_pk if trusted_live_pk is not None else model_pk
         if pitcher_k is None:
             pitcher_k = APP97_LEAGUE_K_PCT
 
@@ -39447,7 +39643,9 @@ def _app97_apply(df, board=None):
             "APP97 Baseline K Projection": round(old_proj,2),
             "APP97 Live Pitcher K%": round(pitcher_k,1),
             "APP97 Raw MLB Season Pitcher K%": round(live_pk,1) if live_pk is not None else np.nan,
-            "APP97 Pitcher K Source": "MLB CURRENT SEASON" if live_pk is not None else "MODEL FALLBACK",
+            "APP97 Pitcher K Source": "MLB CURRENT SEASON" if trusted_live_pk is not None else "MODEL FALLBACK" if model_pk is not None else "LEAGUE FALLBACK",
+            "APP97 Pitcher ID Source": pid_source if pid else "MISSING",
+            "APP97 Pitcher K% Warning": "; ".join(pitcher_k_warning) or "OK",
             "APP97 Pitcher Season Fetch Status": live.get("season_status","UNAVAILABLE") if isinstance(live,dict) else "UNAVAILABLE",
             "APP97 Pitcher GameLog Fetch Status": live.get("gamelog_status","UNAVAILABLE") if isinstance(live,dict) else "UNAVAILABLE",
             "APP97 Pitcher Player ID": pid if pid else np.nan,
@@ -39479,9 +39677,12 @@ def _app97_apply(df, board=None):
         # Synchronize the *display/audit* fields with the current APP97 source of truth.
         # Keep historical baseline columns intact, but do not let the mobile card show
         # a stale season/recent blend after APP97 successfully fetched current MLB data.
-        if live_pk is not None:
-            out.at[idx, "Pitcher K%"] = round(live_pk / 100.0, 4)
+        if trusted_live_pk is not None:
+            out.at[idx, "Pitcher K%"] = round(trusted_live_pk / 100.0, 4)
             out.at[idx, "APP97 Pitcher K% Display Source"] = "CURRENT MLB SEASON"
+        elif model_pk is not None:
+            out.at[idx, "Pitcher K%"] = round(model_pk / 100.0, 4)
+            out.at[idx, "APP97 Pitcher K% Display Source"] = "MODEL FALLBACK_AFTER_SANITY"
         else:
             out.at[idx, "APP97 Pitcher K% Display Source"] = "MODEL FALLBACK"
         out.at[idx, "Exp BF"] = round(bf, 2)
@@ -39679,6 +39880,86 @@ def render_kproj_tab(board):
     except Exception: pass
 
 
+def _rotowire_parse_manual_upload(uploaded_file=None, text=""):
+    frames = []
+    try:
+        if uploaded_file is not None:
+            frames.append(pd.read_csv(uploaded_file))
+    except Exception:
+        pass
+    try:
+        if text and str(text).strip():
+            from io import StringIO
+            frames.append(pd.read_csv(StringIO(str(text).strip())))
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def _render_rotowire_manual_lineup_panel():
+    st.markdown('<div class="section-title-pro">RotoWire Auto Lineup Pull / Diagnostics</div>', unsafe_allow_html=True)
+    st.caption("Auto-pull is the primary lineup source. Manual CSV is only an emergency backup if RotoWire blocks the server or returns a thin page.")
+    if st.button("Auto Pull RotoWire Lineups Now", key="auto_pull_rotowire_lineups_now", use_container_width=True):
+        try:
+            get_rotowire_expected_lineups_bundle.clear()
+            _rotowire_fetch_daily_lineups_payload.clear()
+        except Exception:
+            pass
+        diag_now = get_rotowire_lineup_diagnostics() if "get_rotowire_lineup_diagnostics" in globals() else {}
+        st.write({k: v for k, v in diag_now.items() if k != "text"})
+    template = pd.DataFrame([
+        {"Team": "TB", "Order": 1, "Position": "DH", "Batter": "Yandy Diaz", "Hand": "R", "Status": "Expected Lineup"},
+        {"Team": "TB", "Order": 2, "Position": "1B", "Batter": "Jonathan Aranda", "Hand": "L", "Status": "Expected Lineup"},
+        {"Team": "COL", "Order": 1, "Position": "RF", "Batter": "Jake McCarthy", "Hand": "L", "Status": "Expected Lineup"},
+    ])
+    st.download_button(
+        "Download emergency RotoWire CSV template",
+        template.to_csv(index=False),
+        file_name="rotowire_manual_lineups_template.csv",
+        mime="text/csv",
+        key="download_rotowire_manual_lineup_template",
+        use_container_width=True,
+    )
+    upload = st.file_uploader("Emergency backup: upload RotoWire lineup CSV", type=["csv"], key="rotowire_manual_lineup_upload")
+    text = st.text_area("Emergency backup: or paste RotoWire lineup CSV", height=110, key="rotowire_manual_lineup_text")
+    parsed = _rotowire_parse_manual_upload(upload, text)
+    if isinstance(parsed, pd.DataFrame) and not parsed.empty:
+        st.dataframe(parsed.head(40), use_container_width=True, hide_index=True)
+    if st.button("Save Emergency Manual RotoWire Lineups", key="save_rotowire_manual_lineups", use_container_width=True):
+        status = _rotowire_save_manual_lineups(parsed)
+        try:
+            get_rotowire_expected_lineups_bundle.clear()
+            _rotowire_fetch_daily_lineups_payload.clear()
+        except Exception:
+            pass
+        st.write(status)
+    current = _rotowire_load_manual_lineups()
+    diag = get_rotowire_lineup_diagnostics() if "get_rotowire_lineup_diagnostics" in globals() else {}
+    d1, d2, d3 = st.columns(3)
+    d1.metric("RotoWire Status", str(diag.get("status", "UNKNOWN")))
+    d2.metric("Transport", str(diag.get("transport", "NONE"))[:24])
+    d3.metric("Auto Parsed Teams", int(diag.get("parsed_teams", 0) or 0))
+    if isinstance(current, pd.DataFrame) and not current.empty:
+        with st.expander("Current manual RotoWire lineups", expanded=False):
+            st.dataframe(current, use_container_width=True, hide_index=True)
+    with st.expander("RotoWire fetch diagnostics", expanded=False):
+        st.write({k: v for k, v in diag.items() if k != "text"})
+
+
+_RW_MANUAL_PREV_RENDER_K = render_kproj_tab if "render_kproj_tab" in globals() else None
+
+
+def render_kproj_tab(board):
+    try:
+        _render_rotowire_manual_lineup_panel()
+    except Exception as e:
+        st.info(f"RotoWire manual lineup panel unavailable: {e}")
+    if _RW_MANUAL_PREV_RENDER_K is not None:
+        _RW_MANUAL_PREV_RENDER_K(board)
+
+
 _PCX_PREV_RENDER_PO = render_beta_pitching_outs_tab if "render_beta_pitching_outs_tab" in globals() else None
 def render_beta_pitching_outs_tab(board):
     if _PCX_PREV_RENDER_PO is not None:
@@ -39711,6 +39992,831 @@ def render_first_inning_pitch_count_tab(board):
     cols=[c for c in ["Pitcher","Matchup","Pitcher Class","Sample Class","Experience Gate","UD Line","Projection","Pick","Edge","Hit %","Median","P10-P90","Expected BF 1st","Expected Pitches/PA","1-2-3 Inning %","L5 FI Avg","L10 FI Avg","Season FI Avg","FI Samples","Top4 K%","Lineup Confirmed","FI Experience Confidence","FI Experience-Adjusted Confidence","Line Status"] if c in df.columns]
     st.dataframe(df[cols],use_container_width=True,hide_index=True)
     with st.expander("1st Inning Model Debug",expanded=False): st.dataframe(df,use_container_width=True,hide_index=True)
+
+
+MONEYLINE_VISUAL_CARD_UI_VERSION = "MONEYLINE_VISUAL_CARD_UI_2026_07_26"
+
+
+def _mlui_safe(value):
+    try:
+        return html.escape(str(value if value not in (None, "", "nan", "NaN") else "—"))
+    except Exception:
+        return "—"
+
+
+def _mlui_float(value, default=0.0):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _mlui_row_card(row):
+    row = row.to_dict() if isinstance(row, pd.Series) else dict(row or {})
+    away, home = _mlcard_matchup_teams(row) if "_mlcard_matchup_teams" in globals() else ("AWAY", "HOME")
+    away_win = _mlui_float(row.get("ML Card Away Win %") or row.get("ML Sim Away Win %") or row.get("Away Model %"), 50.0)
+    home_win = _mlui_float(row.get("ML Card Home Win %") or row.get("ML Sim Home Win %") or row.get("Home Model %"), 100.0 - away_win)
+    total = max(away_win + home_win, 1.0)
+    away_w = max(4.0, min(96.0, away_win / total * 100.0))
+    home_w = max(4.0, min(96.0, home_win / total * 100.0))
+    away_runs = row.get("ML Card Away Projected Runs") or row.get("Away Projected Runs") or "—"
+    home_runs = row.get("ML Card Home Projected Runs") or row.get("Home Projected Runs") or "—"
+    best = row.get("ML Card Best Play") or row.get("ML Final Pick") or row.get("Pick") or "—"
+    best_prob = row.get("ML Card Best Play Prob %") or row.get("ML Sim Pick %") or row.get("ML True Win Confidence %") or "—"
+    rating = row.get("ML Card Rating") or row.get("ML Official Tier") or row.get("Status") or "TRACK"
+    cover = row.get("ML Card Cover Lean") or "—"
+    cover_prob = row.get("ML Card Cover Prob %") or "—"
+    total_pick = row.get("ML Card Total Pick") or "—"
+    total_prob = row.get("ML Card Total Prob %") or "—"
+    price = row.get("ML Card Market Price") or row.get("ML Sim Fair Odds") or row.get("ML Card Fair Odds") or "—"
+    away_sp = row.get("Away SP") or "—"
+    home_sp = row.get("Home SP") or "—"
+    badge_class = "elite" if "ELITE" in str(rating).upper() else "high" if "HIGH" in str(rating).upper() else "medium" if "MEDIUM" in str(rating).upper() else "track"
+    return f"""
+    <div class="ml-edge-card">
+      <div class="ml-card-top">
+        <div class="ml-game-time">{_mlui_safe(row.get('Start Time') or row.get('Game Time') or '')}</div>
+        <div class="ml-rating {badge_class}">{_mlui_safe(rating)}</div>
+      </div>
+      <div class="ml-teams">
+        <div class="ml-team">
+          <div class="ml-logo">{_mlui_safe(away[:3])}</div>
+          <div class="ml-team-name">{_mlui_safe(away)}</div>
+          <div class="ml-sp">{_mlui_safe(away_sp)}</div>
+        </div>
+        <div class="ml-vs">vs</div>
+        <div class="ml-team right">
+          <div class="ml-logo">{_mlui_safe(home[:3])}</div>
+          <div class="ml-team-name">{_mlui_safe(home)}</div>
+          <div class="ml-sp">{_mlui_safe(home_sp)}</div>
+        </div>
+      </div>
+      <div class="ml-win-row">
+        <span>{away_win:.0f}%</span>
+        <div class="ml-winbar"><div class="away" style="width:{away_w:.1f}%"></div><div class="home" style="width:{home_w:.1f}%"></div></div>
+        <span>{home_win:.0f}%</span>
+      </div>
+      <div class="ml-runs">
+        <div><span>{_mlui_safe(away)}</span><strong>{_mlui_safe(away_runs)}</strong><small>{_mlui_safe(price)}</small></div>
+        <div><span>{_mlui_safe(home)}</span><strong>{_mlui_safe(home_runs)}</strong><small></small></div>
+      </div>
+      <div class="ml-best">
+        <span>BEST PLAY</span>
+        <strong>{_mlui_safe(best)}</strong>
+        <b>{_mlui_safe(best_prob)}%</b>
+      </div>
+      <div class="ml-mini-grid">
+        <div><strong>{_mlui_safe(total_pick)}</strong><span>{_mlui_safe(total_prob)}%</span></div>
+        <div><strong>{_mlui_safe(cover)}</strong><span>{_mlui_safe(cover_prob)}%</span></div>
+      </div>
+    </div>
+    """
+
+
+def _render_moneyline_visual_cards(df, max_cards=12):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    st.markdown("""
+    <style>
+    .ml-card-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px;margin:12px 0 18px}
+    .ml-edge-card{background:#070b14;border:1px solid #16335f;border-radius:18px;padding:16px;color:#eaf2ff;box-shadow:0 0 18px rgba(40,95,190,.18)}
+    .ml-card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .ml-game-time{font-size:12px;color:#7e8da7}
+    .ml-rating{font-size:12px;font-weight:800;border-radius:999px;padding:5px 10px;border:1px solid #385bff;color:#a9c2ff;background:#101a38}
+    .ml-rating.elite{border-color:#f2d24b;color:#ffe982;background:#352b07}.ml-rating.high{border-color:#5b80ff}.ml-rating.medium{border-color:#2d80ff;color:#8fc3ff}.ml-rating.track{border-color:#42506a;color:#c5ccda}
+    .ml-teams{display:grid;grid-template-columns:1fr 34px 1fr;align-items:center;gap:8px}
+    .ml-team{text-align:left}.ml-team.right{text-align:right}.ml-logo{display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;border-radius:50%;background:#111a2d;border:1px solid #293e68;font-weight:900;color:#ffffff}
+    .ml-team-name{font-weight:800;font-size:15px;margin-top:7px}.ml-sp{font-size:11px;color:#8c98ad;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ml-vs{text-align:center;color:#364056;font-size:11px}
+    .ml-win-row{display:grid;grid-template-columns:42px 1fr 42px;gap:8px;align-items:center;margin:13px 0;color:#d8e5ff;font-weight:700;font-size:13px}.ml-win-row span:last-child{text-align:right}
+    .ml-winbar{height:4px;border-radius:999px;display:flex;overflow:hidden;background:#1b2232}.ml-winbar .away{background:#245cff}.ml-winbar .home{background:#ff335f}
+    .ml-runs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:8px 0 12px}.ml-runs div{background:#0b1120;border:1px solid #16243d;border-radius:12px;padding:10px}.ml-runs span{display:block;color:#8a96aa;font-size:12px;font-weight:800}.ml-runs strong{font-size:32px;line-height:1.0}.ml-runs small{display:block;color:#42e083;margin-top:2px}
+    .ml-best{border:1px solid #1c62be;border-radius:14px;padding:12px;display:grid;grid-template-columns:1fr auto;gap:4px;align-items:end;background:#080e1d}.ml-best span{grid-column:1/3;color:#7f8da5;font-size:10px;font-weight:800;letter-spacing:.08em}.ml-best strong{font-size:25px}.ml-best b{font-size:24px;color:#f2f6ff}
+    .ml-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.ml-mini-grid div{border:1px solid #193e78;border-radius:12px;padding:10px;background:#0b1120}.ml-mini-grid strong{display:block;font-size:13px}.ml-mini-grid span{font-size:12px;color:#9db9e8}
+    </style>
+    """, unsafe_allow_html=True)
+    try:
+        d = df.copy()
+        if "ML Card Rating Score" in d.columns:
+            d["_sort"] = pd.to_numeric(d["ML Card Rating Score"], errors="coerce").fillna(-999)
+            d = d.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+        cards = "\n".join(_mlui_row_card(r) for _, r in d.head(int(max_cards)).iterrows())
+        st.markdown(f'<div class="ml-card-wrap">{cards}</div>', unsafe_allow_html=True)
+    except Exception as e:
+        st.info(f"Moneyline visual cards unavailable: {e}")
+
+
+_MLUI_PREV_RENDER_ML = render_moneyline_edge_tab if "render_moneyline_edge_tab" in globals() else None
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown('<div class="section-title-pro">Moneyline Edge Cards</div>', unsafe_allow_html=True)
+    try:
+        df = ml_build_board(board)
+        _render_moneyline_visual_cards(df)
+    except Exception as e:
+        st.info(f"Moneyline card UI unavailable: {e}")
+    if _MLUI_PREV_RENDER_ML is not None:
+        _MLUI_PREV_RENDER_ML(board, dates)
+
+
+APP98_LOSS_TARGET_K_VERSION = "APP98_LOSS_TARGET_K_CALIBRATION_2026_07_26"
+
+
+def _app98_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _app98_side(row, proj, line):
+    text = " ".join(str(row.get(c) or "") for c in ["Decision", "Final Decision", "APP97 Final Side", "Model Lean"]).upper()
+    if "OVER" in text:
+        return "OVER"
+    if "UNDER" in text:
+        return "UNDER"
+    if np.isfinite(proj) and np.isfinite(line):
+        return "OVER" if proj > line else "UNDER" if proj < line else "PUSH"
+    return ""
+
+
+def _app98_loss_target_row(row):
+    proj = _app98_num(row.get("APP97 True K Projection"), _app98_num(row.get("K PROJ"), np.nan))
+    line = _app98_num(row.get("UD/Line"), _app98_num(row.get("Line"), np.nan))
+    if not np.isfinite(proj) or not np.isfinite(line):
+        return {"APP98 Loss Target Projection": proj if np.isfinite(proj) else "", "APP98 Loss Target Adjustment": 0.0, "APP98 Loss Target Reason": "missing projection/line", "APP98 Version": APP98_LOSS_TARGET_K_VERSION}
+
+    side = _app98_side(row, proj, line)
+    opp_k = _app98_num(row.get("APP97 Opponent K Environment"), _app98_num(row.get("APP88 Batter Lineup K%"), _app98_num(row.get("Lineup K%"), _app98_num(row.get("Opponent K% Used"), np.nan))))
+    pitcher_k = _app98_num(row.get("APP97 Live Pitcher K%"), _app98_num(row.get("Pitcher K% Used"), _app98_num(row.get("Pitcher K%"), np.nan)))
+    sim_side_prob = _app98_num(row.get("K Sim Current Side Prob %"), _app98_num(row.get("K Sim True Prob %"), np.nan))
+    p90 = _app98_num(row.get("K Sim P90"), _app98_num(row.get("Ceiling"), np.nan))
+    interaction = str(row.get("APP97 K Interaction Label") or row.get("APP97 Current Matchup Read") or "").upper()
+    warning = str(row.get("APP97 Pitcher K% Warning") or "").upper()
+    lineup_status = str(row.get("APP97 Lineup Status") or row.get("Lineup") or row.get("Projection Source") or "").upper()
+    whiff = _app98_num(row.get("APP85 PutAway Rate"), _app98_num(row.get("Putaway/Whiff"), _app98_num(row.get("Atlas Putaway Used"), np.nan)))
+
+    reasons = []
+    adjustment = 0.0
+
+    if side == "OVER":
+        risk = 0
+        if line >= 5.5:
+            risk += 1; reasons.append("high over line")
+        if np.isfinite(opp_k) and opp_k < 21.0:
+            risk += 1; reasons.append(f"low opponent/lineup K {opp_k:.1f}%")
+        if "CONTACT" in interaction or "SUPPRESSION" in interaction:
+            risk += 1; reasons.append("contact-suppression interaction")
+        if np.isfinite(sim_side_prob) and sim_side_prob < 61.0:
+            risk += 1; reasons.append(f"thin sim side prob {sim_side_prob:.1f}%")
+        if warning and warning != "OK":
+            risk += 1; reasons.append("pitcher K% warning")
+        if "CONFIRMED" not in lineup_status and line >= 5.5:
+            risk += 1; reasons.append("lineup not confirmed on high line")
+        if np.isfinite(whiff) and whiff < 25.0 and line >= 5.5:
+            risk += 1; reasons.append(f"modest whiff {whiff:.1f}%")
+        if risk >= 4:
+            adjustment = -0.65
+        elif risk == 3:
+            adjustment = -0.40
+        elif risk == 2 and proj - line < 0.85:
+            adjustment = -0.25
+        else:
+            adjustment = 0.0
+
+    elif side == "UNDER":
+        risk = 0
+        if np.isfinite(pitcher_k) and pitcher_k >= 26.5:
+            risk += 1; reasons.append(f"high pitcher K% {pitcher_k:.1f}%")
+        if np.isfinite(p90) and p90 >= line + 2.0:
+            risk += 1; reasons.append(f"ceiling clears line P90 {p90:.0f}")
+        if np.isfinite(sim_side_prob) and sim_side_prob < 58.0:
+            risk += 1; reasons.append(f"thin under sim prob {sim_side_prob:.1f}%")
+        if np.isfinite(whiff) and whiff >= 31.0:
+            risk += 1; reasons.append(f"high whiff {whiff:.1f}%")
+        if "FAVORABLE" in interaction:
+            risk += 1; reasons.append("favorable K interaction")
+        if risk >= 3:
+            adjustment = 0.55
+        elif risk == 2 and line <= 6.5:
+            adjustment = 0.32
+        else:
+            adjustment = 0.0
+
+    final = max(0.0, min(15.0, proj + adjustment))
+    edge = final - line
+    if edge > 0:
+        final_side = "OVER"
+    elif edge < 0:
+        final_side = "UNDER"
+    else:
+        final_side = "PUSH"
+    if not reasons:
+        reasons = ["no loss-target adjustment"]
+    return {
+        "APP98 Loss Target Projection": round(final, 2),
+        "APP98 Loss Target Adjustment": round(adjustment, 2),
+        "APP98 Loss Target Edge": round(edge, 2),
+        "APP98 Loss Target Side": final_side,
+        "APP98 Loss Target Reason": "; ".join(dict.fromkeys(reasons)),
+        "APP98 Version": APP98_LOSS_TARGET_K_VERSION,
+    }
+
+
+def _app98_apply_k(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_app98_loss_target_row(row))
+        except Exception as e:
+            row["APP98 Version"] = APP98_LOSS_TARGET_K_VERSION
+            row["APP98 Loss Target Reason"] = f"app98 error: {str(e)[:100]}"
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    try:
+        final_series = pd.to_numeric(out["APP98 Loss Target Projection"], errors="coerce")
+        for c in ["K PROJ", "Final K Projection", "Official K PROJ", "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection"]:
+            if c in out.columns:
+                old = pd.to_numeric(out[c], errors="coerce")
+                out[c] = final_series.where(final_series.notna(), old).round(2)
+        line = pd.to_numeric(out.get("UD/Line", out.get("Line")), errors="coerce")
+        edge = (final_series - line).round(2)
+        for c in ["Edge", "Edge Gap", "Official K Edge", "Final K Edge", "Line-Aware Smart Edge"]:
+            if c in out.columns:
+                out[c] = edge
+        out["APP98 Final Projection Guard"] = "LOCKED_APP98_LOSS_TARGET"
+    except Exception:
+        pass
+    return out
+
+
+_APP98_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _APP98_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _app98_apply_k(_APP98_PREV_BUILD_K(board))
+
+
+_APP98_PREV_RENDER_K = render_kproj_tab if "render_kproj_tab" in globals() else None
+
+
+def render_kproj_tab(board):
+    if _APP98_PREV_RENDER_K is not None:
+        _APP98_PREV_RENDER_K(board)
+    try:
+        df = build_kproj_table(board)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.markdown('<div class="section-title-pro">APP98 Loss-Target K Calibration</div>', unsafe_allow_html=True)
+            st.caption("Small final correction from recent graded losses: high-line over contact risk, thin simulated probability, suspicious pitcher K%, and under ceiling danger.")
+            cols = [c for c in [
+                "Pitcher", "Matchup", "UD/Line", "APP97 True K Projection", "APP98 Loss Target Projection",
+                "APP98 Loss Target Adjustment", "APP98 Loss Target Edge", "APP98 Loss Target Side",
+                "Decision", "K Sim Current Side Prob %", "APP97 K Interaction Label",
+                "APP97 Opponent K Environment", "APP97 Pitcher K% Warning",
+                "APP98 Loss Target Reason", "APP98 Version"
+            ] if c in df.columns]
+            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"APP98 loss-target calibration unavailable: {e}")
+
+
+# =============================================================================
+# K / PO REAL DATA OVERRIDES
+# Daily feed for the missing inputs that decide wins: umpire/zone, pitch mix,
+# leash/pitch limits, injury/role, and damage/traffic risk. This is applied
+# before APP99 so the Right-Wins gate can use it.
+# =============================================================================
+K_REAL_DATA_VERSION = "K_PO_REAL_DATA_OVERRIDES_2026_07_26"
+K_REAL_DATA_FILE = os.path.join(STORAGE_DIR, "k_po_real_data_overrides.csv")
+
+K_REAL_DATA_TEMPLATE_COLUMNS = [
+    "Pitcher", "Matchup", "Umpire", "Umpire K Factor", "Umpire Note",
+    "Called Strike Rate", "Walk Rate", "Zone K Boost",
+    "Pitch Mix Matchup", "Pitch Mix Matchup Score", "Pitch Mix Note",
+    "Top Pitch", "Top Pitch Usage", "Opponent Whiff vs Top Pitch",
+    "Whiff%", "CSW%", "SwStr%", "Chase%", "Velocity Delta",
+    "Leash Score", "Pitch Count Limit", "Expected Pitch Count",
+    "Role Flag", "Injury Flag", "Pitch Limit Flag", "Manager Hook Note",
+    "Damage Risk Label", "Damage Risk Score", "Damage Risk Note",
+    "Bullpen Status", "Bullpen Pitches 1D", "Bullpen Pitches 3D",
+    "Confirmed Lineup", "Confirmed Batter Count", "Notes"
+]
+
+
+def _kreal_norm(value):
+    try:
+        return normalize_name(value)
+    except Exception:
+        return str(value or "").strip().lower()
+
+
+def _kreal_load_overrides():
+    try:
+        if os.path.exists(K_REAL_DATA_FILE):
+            return pd.read_csv(K_REAL_DATA_FILE)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _kreal_save_overrides(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return {"saved": 0, "path": K_REAL_DATA_FILE}
+        out = df.copy()
+        if "Pitcher" not in out.columns:
+            return {"saved": 0, "error": "Missing Pitcher column", "path": K_REAL_DATA_FILE}
+        if "Matchup" not in out.columns:
+            out["Matchup"] = ""
+        out["_kreal_key"] = out["Pitcher"].astype(str).map(_kreal_norm) + "|" + out["Matchup"].astype(str).str.upper().str.strip()
+        old = _kreal_load_overrides()
+        if isinstance(old, pd.DataFrame) and not old.empty and "Pitcher" in old.columns:
+            if "Matchup" not in old.columns:
+                old["Matchup"] = ""
+            old["_kreal_key"] = old["Pitcher"].astype(str).map(_kreal_norm) + "|" + old["Matchup"].astype(str).str.upper().str.strip()
+            out = pd.concat([old, out], ignore_index=True, sort=False).drop_duplicates("_kreal_key", keep="last")
+        out = out.drop(columns=["_kreal_key"], errors="ignore")
+        out.to_csv(K_REAL_DATA_FILE, index=False)
+        return {"saved": len(out), "path": K_REAL_DATA_FILE, "version": K_REAL_DATA_VERSION}
+    except Exception as e:
+        return {"saved": 0, "error": str(e)[:160], "path": K_REAL_DATA_FILE}
+
+
+def _kreal_parse_uploaded(uploaded_file=None, text=""):
+    frames = []
+    try:
+        if uploaded_file is not None:
+            frames.append(pd.read_csv(uploaded_file))
+    except Exception:
+        pass
+    try:
+        if text and str(text).strip():
+            from io import StringIO
+            frames.append(pd.read_csv(StringIO(str(text).strip())))
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def _kreal_get_override(row, overrides):
+    if overrides is None or not isinstance(overrides, pd.DataFrame) or overrides.empty:
+        return {}
+    pitcher = _kreal_norm(row.get("Pitcher") or row.get("pitcher") or row.get("Player"))
+    matchup = str(row.get("Matchup") or row.get("matchup") or "").upper().strip()
+    if not pitcher:
+        return {}
+    try:
+        d = overrides.copy()
+        if "Pitcher" not in d.columns:
+            return {}
+        if "Matchup" not in d.columns:
+            d["Matchup"] = ""
+        d["_pitcher"] = d["Pitcher"].astype(str).map(_kreal_norm)
+        d["_matchup"] = d["Matchup"].astype(str).str.upper().str.strip()
+        exact = d[(d["_pitcher"] == pitcher) & (d["_matchup"] == matchup)]
+        if not exact.empty:
+            return exact.tail(1).iloc[0].drop(labels=["_pitcher", "_matchup"], errors="ignore").to_dict()
+        loose = d[d["_pitcher"] == pitcher]
+        if not loose.empty:
+            return loose.tail(1).iloc[0].drop(labels=["_pitcher", "_matchup"], errors="ignore").to_dict()
+    except Exception:
+        return {}
+    return {}
+
+
+def _kreal_first(override, keys):
+    for key in keys:
+        if key in override and override.get(key) not in (None, "", "—", "nan", "NaN"):
+            return override.get(key)
+    return None
+
+
+def _kreal_apply_row(row, override):
+    if not override:
+        row["K Real Data Override"] = "NO"
+        row["K Real Data Version"] = K_REAL_DATA_VERSION
+        return row
+    out = dict(row)
+    used = []
+
+    mapping = {
+        "Umpire": ["Umpire"],
+        "Umpire Factor": ["Umpire K Factor", "Zone K Boost"],
+        "Umpire Note": ["Umpire Note"],
+        "Called Strike Rate": ["Called Strike Rate"],
+        "Walk Rate": ["Walk Rate"],
+        "Pitch Mix Matchup": ["Pitch Mix Matchup", "Pitch Mix Note"],
+        "Pitch Mix Matchup Score": ["Pitch Mix Matchup Score"],
+        "Pitch Mix Matchup Label": ["Pitch Mix Matchup"],
+        "Pitch-Type Note": ["Pitch Mix Note"],
+        "Pitch Arsenal Top Pitch Used": ["Top Pitch"],
+        "Pitch Arsenal Top Usage Used": ["Top Pitch Usage"],
+        "Opponent Whiff%": ["Opponent Whiff vs Top Pitch"],
+        "Whiff%": ["Whiff%", "SwStr%"],
+        "Recent SwStr%": ["SwStr%"],
+        "Recent CSW%": ["CSW%"],
+        "Recent Chase%": ["Chase%"],
+        "Fastball Velo Delta": ["Velocity Delta"],
+        "Leash Score": ["Leash Score"],
+        "Pitch Count Limit": ["Pitch Count Limit"],
+        "Projected Pitch Count": ["Expected Pitch Count"],
+        "Role": ["Role Flag"],
+        "Injury Note": ["Injury Flag"],
+        "Pitch Limit Flag": ["Pitch Limit Flag", "Pitch Count Limit"],
+        "Role Note": ["Manager Hook Note", "Role Flag"],
+        "Manager Pull Risk": ["Manager Hook Note", "Role Flag", "Pitch Limit Flag"],
+        "Damage Risk Label": ["Damage Risk Label"],
+        "Damage Risk Score": ["Damage Risk Score"],
+        "Damage Risk Note": ["Damage Risk Note"],
+        "Bullpen Status": ["Bullpen Status"],
+        "Bullpen Pitches 1D": ["Bullpen Pitches 1D"],
+        "Bullpen Pitches 3D": ["Bullpen Pitches 3D"],
+        "Confirmed Batter Count": ["Confirmed Batter Count"],
+        "Lineup Source": ["Confirmed Lineup"],
+    }
+    for target, sources in mapping.items():
+        val = _kreal_first(override, sources)
+        if val is not None:
+            out[target] = val
+            used.append(target)
+
+    confirmed = str(override.get("Confirmed Lineup") or "").strip().upper()
+    if confirmed in {"Y", "YES", "TRUE", "1", "CONFIRMED"}:
+        out["APP97 Lineup Status"] = "CONFIRMED_REAL_DATA_OVERRIDE"
+    elif confirmed in {"N", "NO", "FALSE", "0", "PROJECTED"}:
+        out["APP97 Lineup Status"] = out.get("APP97 Lineup Status") or "PROJECTED_REAL_DATA_OVERRIDE"
+
+    out["K Real Data Override"] = "YES"
+    out["K Real Data Used"] = "; ".join(dict.fromkeys(used))
+    out["K Real Data Notes"] = override.get("Notes", "")
+    out["K Real Data Version"] = K_REAL_DATA_VERSION
+    return out
+
+
+def _kreal_apply_overrides(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    overrides = _kreal_load_overrides()
+    if overrides is None or overrides.empty:
+        out = df.copy()
+        out["K Real Data Override"] = "NO"
+        out["K Real Data Version"] = K_REAL_DATA_VERSION
+        return out
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        rows.append(_kreal_apply_row(row, _kreal_get_override(row, overrides)))
+    return pd.DataFrame(rows)
+
+
+_KREAL_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _KREAL_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _kreal_apply_overrides(_KREAL_PREV_BUILD_K(board))
+
+
+def _kreal_render_panel():
+    st.markdown("#### K / PO Real Data Overrides")
+    st.caption("Optional daily feed for umpire, pitch mix, leash, role/injury, damage risk, and bullpen context. Used by APP99; copy/paste slate stays clean.")
+    template = pd.DataFrame([{col: "" for col in K_REAL_DATA_TEMPLATE_COLUMNS}])
+    st.download_button("Download K/PO real-data template CSV", template.to_csv(index=False), file_name="k_po_real_data_template.csv", mime="text/csv", key="download_kreal_template")
+    upload = st.file_uploader("Upload K/PO real-data CSV", type=["csv"], key="kreal_upload")
+    text = st.text_area("Or paste K/PO real-data CSV", height=100, key="kreal_text")
+    parsed = _kreal_parse_uploaded(upload, text)
+    if not parsed.empty:
+        st.dataframe(parsed.head(25), use_container_width=True, hide_index=True)
+    if st.button("Save K/PO Real Data Overrides", use_container_width=True, key="save_kreal_overrides"):
+        st.write(_kreal_save_overrides(parsed))
+    current = _kreal_load_overrides()
+    if isinstance(current, pd.DataFrame) and not current.empty:
+        with st.expander("Current K/PO real-data overrides", expanded=False):
+            st.dataframe(current.tail(50), use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# APP99 RIGHT-WINS DATA GATE
+# Final audit layer for missing inputs that usually cause losses.
+# It does not overwrite K PROJ. It flags Fire/Lean/Track readiness using:
+# confirmed lineup, pitcher K% sanity, whiff/stuff, pitch mix coverage,
+# leash/IP risk, bad-game damage risk, umpire/zone, and sim probability.
+# =============================================================================
+APP99_RIGHT_WINS_VERSION = "APP99_RIGHT_WINS_DATA_GATE_2026_07_26"
+
+
+def _app99_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _app99_text(row, keys):
+    for key in keys:
+        try:
+            value = row.get(key)
+            if value not in (None, "", "—", "nan", "NaN"):
+                return str(value)
+        except Exception:
+            pass
+    return ""
+
+
+def _app99_has_value(row, keys):
+    txt = _app99_text(row, keys)
+    if txt:
+        return True
+    val = _app99_num(_app99_text(row, keys), np.nan)
+    return bool(np.isfinite(val))
+
+
+def _app99_right_wins_row(row):
+    line = _app99_num(_app99_text(row, ["UD/Line", "Line", "Underdog Line"]), np.nan)
+    proj = _app99_num(_app99_text(row, ["APP98 Loss Target Projection", "K PROJ", "Final K Projection"]), np.nan)
+    edge = _app99_num(_app99_text(row, ["APP98 Loss Target Edge", "Official K Edge", "Edge Gap"]), np.nan)
+    if not np.isfinite(edge) and np.isfinite(proj) and np.isfinite(line):
+        edge = proj - line
+
+    lineup_status = _app99_text(row, ["APP97 Lineup Status", "Lineup Source", "Projection Source", "Lineup"]).upper()
+    k_warning = _app99_text(row, ["APP97 Pitcher K% Warning"]).upper()
+    pitcher_k_src = _app99_text(row, ["APP97 Pitcher K Source", "APP97 Pitcher ID Source", "Pitcher K% Source"]).upper()
+    interaction = _app99_text(row, ["APP97 K Interaction Label", "APP97 Current Matchup Read", "APP98 Loss Target Reason"]).upper()
+    sim_prob = _app99_num(_app99_text(row, ["K Sim Current Side Prob %", "K Sim True Prob %"]), np.nan)
+    whiff = _app99_num(_app99_text(row, ["APP85 PutAway Rate", "Putaway/Whiff", "Atlas Putaway Used", "Whiff%", "Recent SwStr%"]), np.nan)
+    if np.isfinite(whiff) and whiff <= 1.0:
+        whiff *= 100.0
+    pitch_mix_txt = _app99_text(row, ["Pitch Mix Matchup Label", "Pitch Mix Matchup", "APP88 Whiff Interaction Adjustment", "Whiff Interaction Note", "Pitch Arsenal Matchup"]).upper()
+    leash_txt = _app99_text(row, ["IP Confidence", "Beta Flags", "Pitch Count Trend", "APP97 BF Reconciliation", "Volume Miss Label", "Manager Pull Risk"]).upper()
+    damage_txt = _app99_text(row, ["Damage Risk Label", "Damage Risk Note", "Traffic Label", "Bad Game Risk", "Projected WHIP"]).upper()
+    ump_txt = _app99_text(row, ["Umpire", "Umpire K Boost", "Zone Boost", "Called Strike Boost", "APP Umpire Zone"]).upper()
+
+    score = 100
+    missing = []
+    risks = []
+
+    if not any(x in lineup_status for x in ["CONFIRMED", "ROTO", "ACTUAL"]):
+        score -= 14
+        missing.append("confirmed lineup")
+    if k_warning and k_warning not in {"OK", "NAN"}:
+        score -= 16
+        risks.append("pitcher K% warning")
+    if "MISSING" in pitcher_k_src or "FALLBACK" in pitcher_k_src:
+        score -= 6
+        missing.append("verified pitcher K%")
+    if not np.isfinite(whiff):
+        score -= 9
+        missing.append("whiff/stuff")
+    elif whiff < 21:
+        score -= 8
+        risks.append("low whiff/stuff")
+    elif whiff >= 30:
+        score += 4
+    if not pitch_mix_txt:
+        score -= 8
+        missing.append("pitch mix matchup")
+    elif any(x in pitch_mix_txt for x in ["BAD", "SUPPRESS", "CONTACT", "NEGATIVE"]):
+        score -= 9
+        risks.append("pitch mix/contact suppression")
+    if not ump_txt:
+        score -= 5
+        missing.append("umpire/zone")
+    if any(x in leash_txt for x in ["LOW", "HOOK", "LIMIT", "ROLE", "VOLATILITY", "SHORT"]):
+        score -= 12
+        risks.append("leash/role risk")
+    if any(x in damage_txt for x in ["HIGH", "RED", "BAD", "TRAFFIC", "WHIP"]):
+        score -= 10
+        risks.append("damage/traffic risk")
+    if np.isfinite(sim_prob):
+        if sim_prob < 58:
+            score -= 8
+            risks.append("thin simulation probability")
+        elif sim_prob >= 68:
+            score += 4
+    else:
+        score -= 4
+        missing.append("simulation probability")
+    if np.isfinite(edge):
+        if abs(edge) < 0.55:
+            score -= 14
+            risks.append("thin edge")
+        elif abs(edge) >= 1.15:
+            score += 4
+
+    score = int(max(0, min(100, round(score))))
+    if score >= 78 and len(risks) <= 1:
+        gate = "GREEN - PLAYABLE"
+    elif score >= 64 and len(risks) <= 3:
+        gate = "YELLOW - SELECTIVE"
+    elif score >= 52:
+        gate = "ORANGE - TRACK ONLY"
+    else:
+        gate = "RED - PASS/TRACK"
+
+    return {
+        "APP99 Right Wins Score": score,
+        "APP99 Right Wins Gate": gate,
+        "APP99 Missing Data": ", ".join(dict.fromkeys(missing)) or "none",
+        "APP99 Loss Risks": ", ".join(dict.fromkeys(risks)) or "none",
+        "APP99 Data Used": f"lineup={lineup_status or 'UNKNOWN'} | pitcherK={pitcher_k_src or 'UNKNOWN'} | whiff={'' if not np.isfinite(whiff) else round(whiff,1)} | sim={'' if not np.isfinite(sim_prob) else round(sim_prob,1)}",
+        "APP99 Version": APP99_RIGHT_WINS_VERSION,
+    }
+
+
+def _app99_apply_right_wins_gate(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    rows = []
+    for _, rr in out.iterrows():
+        try:
+            rows.append(_app99_right_wins_row(rr.to_dict()))
+        except Exception as e:
+            rows.append({
+                "APP99 Right Wins Score": 0,
+                "APP99 Right Wins Gate": "ERROR",
+                "APP99 Missing Data": "app99 error",
+                "APP99 Loss Risks": str(e)[:120],
+                "APP99 Data Used": "",
+                "APP99 Version": APP99_RIGHT_WINS_VERSION,
+            })
+    add = pd.DataFrame(rows, index=out.index)
+    for c in add.columns:
+        out[c] = add[c]
+    return out
+
+
+_APP99_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _APP99_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _app99_apply_right_wins_gate(_APP99_PREV_BUILD_K(board))
+
+
+K_CLEAN_SINGLE_BOARD_UI_VERSION = "K_CLEAN_SINGLE_BOARD_UI_2026_07_26"
+
+
+def _kclean_pick(row, keys, default=""):
+    for key in keys:
+        try:
+            val = row.get(key)
+            if val not in (None, "", "—", "nan", "NaN"):
+                return val
+        except Exception:
+            pass
+    return default
+
+
+def _kclean_side_label(row):
+    side = str(_kclean_pick(row, ["APP98 Loss Target Side", "APP97 Final Side", "APP88 Final Side"], "")).upper()
+    if side in {"OVER", "UNDER"}:
+        return side
+    text = str(_kclean_pick(row, ["Decision", "Final Decision", "Model Lean"], "")).upper()
+    if "OVER" in text:
+        return "OVER"
+    if "UNDER" in text:
+        return "UNDER"
+    return ""
+
+
+def _kclean_display_decision(row):
+    side = _kclean_side_label(row)
+    edge = _app98_num(_kclean_pick(row, ["APP98 Loss Target Edge", "Official K Edge", "Edge Gap"], np.nan), np.nan) if "_app98_num" in globals() else np.nan
+    reason = str(row.get("APP98 Loss Target Reason") or "").lower()
+    gate = str(row.get("APP99 Right Wins Gate") or "").upper()
+    if not side:
+        return "PASS"
+    if "RED" in gate:
+        return f"PASS {side}"
+    if "ORANGE" in gate:
+        return f"TRACK {side}"
+    if np.isfinite(edge):
+        abs_edge = abs(edge)
+        if "contact-suppression" in reason or "thin sim" in reason or "pitcher k% warning" in reason:
+            return f"TRACK {side}"
+        if abs_edge >= 1.00:
+            return f"FIRE {side}"
+        if abs_edge >= 0.55:
+            return f"LEAN {side}"
+    return f"PASS {side}"
+
+
+def _kclean_main_df(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        rows.append({
+            "Pitcher": _kclean_pick(row, ["Pitcher", "pitcher", "Player"], ""),
+            "Matchup": _kclean_pick(row, ["Matchup", "matchup"], ""),
+            "Line": _kclean_pick(row, ["UD/Line", "Line", "Underdog Line"], ""),
+            "K Projection": _kclean_pick(row, ["APP98 Loss Target Projection", "K PROJ", "Final K Projection"], ""),
+            "Edge": _kclean_pick(row, ["APP98 Loss Target Edge", "Official K Edge", "Edge Gap"], ""),
+            "Pick": _kclean_display_decision(row),
+            "Sim Side %": _kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], ""),
+            "Lineup": _kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], ""),
+            "Opp K%": _kclean_pick(row, ["APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used"], ""),
+            "Pitcher K%": _kclean_pick(row, ["APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%"], ""),
+            "Win Gate": _kclean_pick(row, ["APP99 Right Wins Gate"], ""),
+            "Win Score": _kclean_pick(row, ["APP99 Right Wins Score"], ""),
+            "Missing": _kclean_pick(row, ["APP99 Missing Data"], ""),
+            "Loss Risks": _kclean_pick(row, ["APP99 Loss Risks"], ""),
+            "Reason": _kclean_pick(row, ["APP98 Loss Target Reason", "APP97 K Interaction Label", "K Sim Note"], ""),
+        })
+    out = pd.DataFrame(rows)
+    try:
+        order = {"FIRE OVER": 0, "FIRE UNDER": 0, "LEAN OVER": 1, "LEAN UNDER": 1, "TRACK OVER": 2, "TRACK UNDER": 2, "PASS OVER": 3, "PASS UNDER": 3, "PASS": 4}
+        out["_sort_pick"] = out["Pick"].astype(str).map(lambda x: order.get(x, 9))
+        out["_sort_edge"] = pd.to_numeric(out["Edge"], errors="coerce").abs().fillna(-1)
+        out = out.sort_values(["_sort_pick", "_sort_edge"], ascending=[True, False]).drop(columns=["_sort_pick", "_sort_edge"])
+    except Exception:
+        pass
+    return out
+
+
+def _kclean_render_rotowire_status():
+    try:
+        diag = get_rotowire_lineup_diagnostics() if "get_rotowire_lineup_diagnostics" in globals() else {}
+        c1, c2, c3 = st.columns(3)
+        c1.metric("RotoWire", str(diag.get("status", "UNKNOWN")))
+        c2.metric("Transport", str(diag.get("transport", "NONE"))[:18])
+        c3.metric("Teams", int(diag.get("parsed_teams", 0) or 0))
+        with st.expander("RotoWire controls / diagnostics", expanded=False):
+            _render_rotowire_manual_lineup_panel()
+            try:
+                _kreal_render_panel()
+            except Exception as _kreal_e:
+                st.info(f"K/PO real-data override panel unavailable: {_kreal_e}")
+    except Exception as e:
+        st.info(f"RotoWire diagnostics unavailable: {e}")
+
+
+def render_kproj_tab(board):
+    st.markdown('<div class="section-title-pro">K Upside Board</div>', unsafe_allow_html=True)
+    st.caption("Single clean board. Historical calibration, ensemble, SOS, Monte Carlo, and loss-target outputs are rolled into this table; details are collapsed below.")
+    _kclean_render_rotowire_status()
+
+    df = build_kproj_table(board)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No K projection rows loaded yet.")
+        return
+
+    main = _kclean_main_df(df)
+    if main.empty:
+        st.info("No clean K rows available.")
+        return
+
+    try:
+        total = len(main)
+        fire = int(main["Pick"].astype(str).str.startswith("FIRE").sum())
+        lean = int(main["Pick"].astype(str).str.startswith("LEAN").sum())
+        track = int(main["Pick"].astype(str).str.startswith("TRACK").sum())
+        pass_ct = int(main["Pick"].astype(str).str.startswith("PASS").sum())
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Pitchers", total)
+        m2.metric("Fire", fire)
+        m3.metric("Lean", lean)
+        m4.metric("Track/Pass", track + pass_ct)
+    except Exception:
+        pass
+
+    st.dataframe(main, use_container_width=True, hide_index=True)
+
+    with st.expander("Full K audit details", expanded=False):
+        cols = [c for c in [
+            "Pitcher", "Matchup", "UD/Line", "RAW BASE_K", "APP97 True K Projection",
+            "APP98 Loss Target Projection", "APP98 Loss Target Adjustment", "APP98 Loss Target Reason",
+            "K Sim Pick", "K Sim True Prob %", "K Sim Current Side Prob %",
+            "APP97 Lineup Status", "APP97 Opponent K Environment", "APP97 Pitcher K% Warning",
+            "APP99 Right Wins Score", "APP99 Right Wins Gate", "APP99 Missing Data",
+            "APP99 Loss Risks", "APP99 Data Used",
+            "K Real Data Override", "K Real Data Used", "K Real Data Notes", "K Real Data Version",
+            "APP88 Batter Lineup K%", "APP85 PutAway Rate", "Atlas Grade", "Official Card Tier",
+            "APP98 Version", "APP99 Version", "K Clean UI Version"
+        ] if c in df.columns]
+        show = df.copy()
+        show["K Clean UI Version"] = K_CLEAN_SINGLE_BOARD_UI_VERSION
+        st.dataframe(show[cols] if cols else show, use_container_width=True, hide_index=True)
 
 
 tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -39947,27 +41053,201 @@ def build_better_miss_reason_analytics(results):
     out["Loss Rate %"] = ((out["Losses"] / out["Plays"].replace(0, 1)) * 100).round(1)
     return out.sort_values(["Losses", "Plays"], ascending=False)
 
+
+UNIFIED_ALL_MARKETS_GRADING_VERSION = "UNIFIED_K_PO_FI_ML_GRADING_2026_07_26"
+
+
+def _unified_actuals_from_k_result_log():
+    """Build a simple actuals table from graded K results for PO loss learning."""
+    rows = []
+    try:
+        for r in load_json(RESULT_LOG, []) or []:
+            if not isinstance(r, dict):
+                continue
+            pitcher = r.get("pitcher") or r.get("Pitcher")
+            actual_ip = r.get("actual_ip") or r.get("Actual IP")
+            actual_k = r.get("actual") or r.get("actual_k") or r.get("Actual K")
+            if not pitcher or actual_ip in (None, "", "—"):
+                continue
+            rows.append({
+                "Pitcher": pitcher,
+                "Actual K": actual_k,
+                "Actual IP": actual_ip,
+                "Actual Outs": _tpl_ip_to_outs(actual_ip) if "_tpl_ip_to_outs" in globals() else None,
+                "Source": "K_RESULT_LOG_ACTUAL_IP",
+            })
+    except Exception:
+        rows = []
+    return pd.DataFrame(rows)
+
+
+def build_projection_health_audit(board=None):
+    """Audit-only checklist for what is holding K, PO, and ML projections back."""
+    rows = []
+
+    def add(area, status, holding_back, fix):
+        rows.append({"Area": area, "Status": status, "Holding Back": holding_back, "Best Fix": fix})
+
+    try:
+        kdf = build_kproj_table(board) if "build_kproj_table" in globals() else pd.DataFrame()
+        total = int(len(kdf)) if isinstance(kdf, pd.DataFrame) else 0
+        confirmed = 0
+        if total:
+            src_cols = [c for c in ["Lineup Source", "Lineup Status", "APP97 Lineup Status", "Confirmed Lineup"] if c in kdf.columns]
+            if src_cols:
+                mask = pd.Series(False, index=kdf.index)
+                for c in src_cols:
+                    mask = mask | kdf[c].astype(str).str.upper().str.contains("CONFIRMED|ROTO|ACTUAL", na=False)
+                confirmed = int(mask.sum())
+        add("K Batter Lineups", f"{confirmed}/{total} confirmed or RotoWire-backed", "Projected/manual lineups still create wrong opponent K% spots.", "Use Auto Pull RotoWire daily, then refresh after confirmed lineups post.")
+
+        warning_count = 0
+        if total and "APP97 Pitcher K% Warning" in kdf.columns:
+            ok_mask = kdf["APP97 Pitcher K% Warning"].astype(str).str.upper().isin(["", "OK", "NAN"])
+            warning_count = int((~ok_mask).sum())
+        elif total:
+            warning_count = total
+        add("Pitcher K% Sanity", f"{warning_count} warning rows", "Wrong pitcher K% can push overs/unders the wrong way.", "Check APP97 Pitcher K% Warning and ID Source before locking plays.")
+
+        app98_adjusted = 0
+        if total and "APP98 Loss Target Adjustment" in kdf.columns:
+            app98_adjusted = int((pd.to_numeric(kdf["APP98 Loss Target Adjustment"], errors="coerce").fillna(0).abs() > 0).sum())
+        add("K Loss Targeting", f"{app98_adjusted}/{total} rows adjusted", "The model was losing too many high-line/contact-suppression and thin-edge spots.", "APP98 trims risky overs and boosts risky unders when loss flags stack up.")
+        if total and "APP99 Right Wins Gate" in kdf.columns:
+            gates = kdf["APP99 Right Wins Gate"].astype(str).str.upper()
+            green = int(gates.str.contains("GREEN", na=False).sum())
+            yellow = int(gates.str.contains("YELLOW", na=False).sum())
+            track = int(gates.str.contains("ORANGE|RED", na=False).sum())
+            add("K Right-Wins Gate", f"Green {green} | Yellow {yellow} | Track/Pass {track}", "Wins get hurt when thin data plays are treated the same as fully covered plays.", "Prioritize GREEN/YELLOW rows; use APP99 Missing Data and Loss Risks before playing TRACK rows.")
+        if total and "K Real Data Override" in kdf.columns:
+            loaded = int(kdf["K Real Data Override"].astype(str).str.upper().eq("YES").sum())
+            add("K/PO Real Data Overrides", f"{loaded}/{total} rows loaded", "Umpire, pitch mix, leash, injury/role, and damage flags need daily coverage.", "Use the K/PO real-data CSV panel inside K tab diagnostics when APP99 shows missing inputs.")
+    except Exception as e:
+        add("K Projection Audit", "ERROR", str(e)[:140], "Check K board build errors before trusting slate output.")
+
+    try:
+        po_df = _beta_projection_rows(board, "OUTS") if "_beta_projection_rows" in globals() else pd.DataFrame()
+        po_rows = int(len(po_df)) if isinstance(po_df, pd.DataFrame) else 0
+        low_conf = 0
+        if po_rows:
+            text_cols = [c for c in ["IP Confidence", "Beta Flags", "Decision Note", "Beta Lean"] if c in po_df.columns]
+            if text_cols:
+                combo = po_df[text_cols].astype(str).agg(" ".join, axis=1).str.upper()
+                low_conf = int(combo.str.contains("LOW|HOOK|ROLE|LIMIT|PASS|VOLATILITY|TRACK", na=False).sum())
+        add("Pitching Outs", f"{po_rows} rows | {low_conf} leash/risk flags", "PO is mostly an IP/leash problem, not a K problem.", "Use graded actual IP to tune hook, pitch-count, bad-game, and full-leash flags.")
+    except Exception as e:
+        add("Pitching Outs Audit", "ERROR", str(e)[:140], "Check beta outs board build.")
+
+    try:
+        ml_df = ml_build_board(board) if "ml_build_board" in globals() else pd.DataFrame()
+        ml_rows = int(len(ml_df)) if isinstance(ml_df, pd.DataFrame) else 0
+        pass_rows = 0
+        if ml_rows:
+            combo = ml_df.astype(str).agg(" ".join, axis=1).str.upper()
+            pass_rows = int(combo.str.contains("PASS|NO BET|LOW CONF|MISSING", na=False).sum())
+        add("Moneyline", f"{ml_rows} games | {pass_rows} pass/risk rows", "ML needs confirmed lineups, bullpen availability, starter confirmation, weather, and odds sanity.", "Keep ML real-data overrides fresh; grade saved ML picks with the unified button after finals.")
+    except Exception as e:
+        add("Moneyline Audit", "ERROR", str(e)[:140], "Check moneyline board build.")
+
+    add("Code Structure", "Large single-file app", "Many late wrapper overrides make old UI/logic easy to reappear.", "Next cleanup should split K, PO, ML, grading, and RotoWire into separate modules.")
+    return pd.DataFrame(rows)
+
+
+def grade_all_markets_with_diagnostics(board=None):
+    """One after-games action that grades K, Pitching Outs, FI pitch count, and ML."""
+    diag = {
+        "version": UNIFIED_ALL_MARKETS_GRADING_VERSION,
+        "K": {},
+        "Pitching Outs": {},
+        "First Inning Pitch Count": {},
+        "Moneyline": {},
+        "Learning Refresh": {},
+    }
+
+    try:
+        diag["K"] = grade_finished_games_with_diagnostics()
+    except Exception as e:
+        diag["K"] = {"graded": 0, "message": f"K grade failed: {e}"}
+
+    try:
+        po_df = _beta_projection_rows(board, "OUTS") if "_beta_projection_rows" in globals() else pd.DataFrame()
+        po_actuals = _unified_actuals_from_k_result_log()
+        if "grade_pitching_outs_loss_lab" in globals() and isinstance(po_actuals, pd.DataFrame) and not po_actuals.empty:
+            diag["Pitching Outs"] = grade_pitching_outs_loss_lab(po_df, po_actuals)
+        else:
+            diag["Pitching Outs"] = _beta_grade_saved_board(po_df, "OUTS") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "Pitching Outs grader unavailable."}
+    except Exception as e:
+        diag["Pitching Outs"] = {"graded": 0, "message": f"Pitching Outs grade failed: {e}"}
+
+    try:
+        fi_df = build_first_inning_pitch_count_board(board) if "build_first_inning_pitch_count_board" in globals() else pd.DataFrame()
+        diag["First Inning Pitch Count"] = _beta_grade_saved_board(fi_df, "FI_PITCHES") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "FI grader unavailable."}
+    except Exception as e:
+        diag["First Inning Pitch Count"] = {"graded": 0, "message": f"FI pitch count grade failed: {e}"}
+
+    try:
+        diag["Moneyline"] = _ow_grade_moneyline_saved() if "_ow_grade_moneyline_saved" in globals() else {"graded": 0, "reason": "moneyline_grader_unavailable"}
+    except Exception as e:
+        diag["Moneyline"] = {"graded": 0, "message": f"Moneyline grade failed: {e}"}
+
+    try:
+        results = load_json(RESULT_LOG, [])
+        if "build_k_v72_learning_profiles" in globals():
+            build_k_v72_learning_profiles(results=results, save=True)
+        if "sync_graded_history_csv_from_result_log" in globals():
+            sync_graded_history_csv_from_result_log()
+        if "rebuild_manager_pull_learning_from_results_v11_21" in globals():
+            rebuild_manager_pull_learning_from_results_v11_21(results=results, merge_existing=True)
+        try:
+            st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(results))
+        except Exception:
+            pass
+        diag["Learning Refresh"] = {"status": "OK", "result_log_rows": len(results)}
+    except Exception as e:
+        diag["Learning Refresh"] = {"status": "ERROR", "message": str(e)[:160]}
+
+    try:
+        diag["Projection Health"] = build_projection_health_audit(board).to_dict("records")
+    except Exception as e:
+        diag["Projection Health"] = [{"Area": "Projection Health", "Status": "ERROR", "Holding Back": str(e)[:140], "Best Fix": "Open board diagnostics."}]
+    return diag
+
+
 with tab5:
     st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
-    if st.button("✅ AFTER GAMES — Grade Results + Update Learning", use_container_width=True):
-        diag = grade_finished_games_with_diagnostics()
-        graded = diag.get("graded", 0)
+    if st.button("✅ AFTER GAMES — Grade ALL Markets + Update Learning", use_container_width=True):
+        diag = grade_all_markets_with_diagnostics(board)
+        k_graded = int((diag.get("K") or {}).get("graded", 0) or 0)
+        po_graded = int((diag.get("Pitching Outs") or {}).get("graded", 0) or 0)
+        fi_graded = int((diag.get("First Inning Pitch Count") or {}).get("graded", 0) or 0)
+        ml_graded = int((diag.get("Moneyline") or {}).get("graded", 0) or 0)
+        graded = k_graded + po_graded + fi_graded + ml_graded
 
         if graded > 0:
-            st.success(f"✅ After-game grading complete: graded {graded} finished official snapshots and updated learning.")
+            st.success(f"✅ After-game grading complete: K {k_graded} | PO {po_graded} | FI {fi_graded} | ML {ml_graded}. Learning refreshed.")
         else:
-            st.warning("⚠️ After-game grading ran, but graded 0 snapshots.")
+            st.warning("⚠️ After-game grading ran, but graded 0 rows. Check saved boards, finals, or actual IP/result availability.")
 
         st.write({
-            "Saved snapshots found": diag.get("saved_snapshots"),
-            "Ungraded before grading": diag.get("ungraded_before"),
-            "Already graded before": diag.get("already_graded_before"),
-            "Missing game_pk or pitcher_id": diag.get("missing_game_or_pitcher_id"),
-            "Results before": diag.get("results_before"),
-            "Results after": diag.get("results_after"),
+            "K": diag.get("K"),
+            "Pitching Outs": diag.get("Pitching Outs"),
+            "First Inning Pitch Count": diag.get("First Inning Pitch Count"),
+            "Moneyline": diag.get("Moneyline"),
+            "Learning Refresh": diag.get("Learning Refresh"),
+            "Version": diag.get("version"),
         })
-        st.caption(f"PICK_LOG: {diag.get('pick_log_path')}")
-        st.caption(f"RESULT_LOG: {diag.get('result_log_path')}")
+        if diag.get("Projection Health"):
+            st.markdown('<div class="section-title-pro">Projection Health — What Is Holding It Back</div>', unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(diag.get("Projection Health")), use_container_width=True, hide_index=True)
+        st.caption(f"K PICK_LOG: {(diag.get('K') or {}).get('pick_log_path', PICK_LOG)}")
+        st.caption(f"K RESULT_LOG: {(diag.get('K') or {}).get('result_log_path', RESULT_LOG)}")
+
+    with st.expander("Projection Health Audit — current slate", expanded=False):
+        st.caption("Audit only. This does not change copy/paste slate output; it shows what data is still limiting K, PO, and ML confidence.")
+        try:
+            st.dataframe(build_projection_health_audit(board), use_container_width=True, hide_index=True)
+        except Exception as _health_e:
+            st.warning(f"Projection health audit failed: {_health_e}")
 
     st.markdown('<div class="section-title-pro">Manual Actual Results Import — Secure Fallback</div>', unsafe_allow_html=True)
     st.caption("Use this if automatic MLB grading returns 0 or if you want to verify outcomes manually. Save the official snapshot before games, then after games paste/upload actual results and grade.")
