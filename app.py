@@ -5413,6 +5413,41 @@ def pitcher_run_damage_profile(pitcher_id, recent_rows=None, statcast_profile=No
         profile["notes"].append(f"Season run-damage unavailable: {e}")
 
     try:
+        sp = statcast_profile or {}
+        hard = safe_float(sp.get("hard_hit_pct"), None)
+        barrel = safe_float(sp.get("barrel_pct"), None)
+        xwoba = safe_float(sp.get("xwoba"), None)
+        ev = safe_float(sp.get("avg_exit_velocity"), None)
+        if hard is not None:
+            profile["available"] = True
+            profile["savant_hard_hit_pct"] = hard * 100.0 if hard <= 1 else hard
+            if hard >= 0.45:
+                add_score(5, f"Official Savant hard-hit risk {hard*100:.1f}%")
+            elif hard >= 0.40:
+                add_score(3, f"Official Savant elevated hard-hit {hard*100:.1f}%")
+        if barrel is not None:
+            profile["available"] = True
+            profile["savant_barrel_pct"] = barrel * 100.0 if barrel <= 1 else barrel
+            if barrel >= 0.105:
+                add_score(5, f"Official Savant barrel risk {barrel*100:.1f}%")
+            elif barrel >= 0.080:
+                add_score(3, f"Official Savant elevated barrels {barrel*100:.1f}%")
+        if xwoba is not None:
+            profile["available"] = True
+            profile["savant_xwoba"] = xwoba
+            if xwoba >= 0.350:
+                add_score(4, f"Official Savant xwOBA risk {xwoba:.3f}")
+            elif xwoba >= 0.325:
+                add_score(2, f"Official Savant elevated xwOBA {xwoba:.3f}")
+        if ev is not None:
+            profile["available"] = True
+            profile["savant_avg_exit_velocity"] = ev
+            if ev >= 91.0:
+                add_score(3, f"Official Savant exit velo risk {ev:.1f}")
+    except Exception as e:
+        profile["notes"].append(f"Savant run-damage unavailable: {e}")
+
+    try:
         ers, runs, hits, walks, homers, ips = [], [], [], [], [], []
         for r in (recent_rows or [])[:5]:
             er = safe_float(r.get("ER", r.get("Earned Runs")))
@@ -5880,7 +5915,20 @@ def apply_repeat_matchup_factor(k_rate, repeat_profile):
 # =========================
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_statcast_pitch_profile(pitcher_id, days=365):
-    empty = {"available": False, "message": "No pitcher id", "rows": 0, "csw": None, "whiff": None, "chase": None, "zone_contact": None, "pitch_mix": [], "pitch_type_profile": [], "putaway": None, "fastball_velo_season": None, "fastball_velo_recent": None, "fastball_velo_delta": None, "pitch_usage_trend": None, "pitch_usage_note": None, "first_strike_pct": None, "csw_recent_30": None, "csw_recent_30_pitches": 0, "csw_recent_45": None, "csw_recent_45_pitches": 0}
+    empty = {
+        "available": False, "message": "No pitcher id", "rows": 0,
+        "csw": None, "whiff": None, "chase": None, "zone_contact": None,
+        "pitch_mix": [], "pitch_type_profile": [], "putaway": None,
+        "fastball_velo_season": None, "fastball_velo_recent": None, "fastball_velo_delta": None,
+        "pitch_usage_trend": None, "pitch_usage_note": None, "first_strike_pct": None,
+        "csw_recent_30": None, "csw_recent_30_pitches": 0,
+        "csw_recent_45": None, "csw_recent_45_pitches": 0,
+        "savant_k_pct": None, "savant_bb_pct": None, "swing_pct": None, "zone_pct": None,
+        "avg_exit_velocity": None, "hard_hit_pct": None, "barrel_pct": None,
+        "sweet_spot_pct": None, "avg_launch_angle": None, "xwoba": None, "woba": None,
+        "batted_balls": 0, "plate_appearances": 0,
+        "official_source": "Baseball Savant Statcast CSV",
+    }
     if not pitcher_id:
         return empty
     end = datetime.now()
@@ -6003,6 +6051,73 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
         except Exception:
             first_strike_pct = None
 
+        savant_k_pct = None
+        savant_bb_pct = None
+        swing_pct = None
+        zone_pct = None
+        avg_exit_velocity = None
+        hard_hit_pct = None
+        barrel_pct = None
+        sweet_spot_pct = None
+        avg_launch_angle = None
+        xwoba = None
+        woba = None
+        batted_balls = 0
+        plate_appearances = 0
+        try:
+            swing_pct = float(swing_mask.mean()) if len(df) else None
+            if "zone" in df.columns:
+                zone_num = pd.to_numeric(df["zone"], errors="coerce")
+                zone_pct = float(zone_num.isin([1, 2, 3, 4, 5, 6, 7, 8, 9]).mean())
+
+            if "launch_speed" in df.columns:
+                ls = pd.to_numeric(df["launch_speed"], errors="coerce")
+                bbe = df[ls.notna()].copy()
+                batted_balls = int(len(bbe))
+                if batted_balls:
+                    avg_exit_velocity = float(ls[ls.notna()].mean())
+                    hard_hit_pct = float((ls[ls.notna()] >= 95.0).mean())
+                    if "launch_angle" in bbe.columns:
+                        la = pd.to_numeric(bbe["launch_angle"], errors="coerce")
+                        if la.notna().any():
+                            avg_launch_angle = float(la.mean())
+                            sweet_spot_pct = float(la.between(8, 32, inclusive="both").mean())
+                    if "launch_speed_angle" in bbe.columns:
+                        lsa = pd.to_numeric(bbe["launch_speed_angle"], errors="coerce")
+                        if lsa.notna().any():
+                            # Baseball Savant's launch_speed_angle classification uses 6 for barrels.
+                            barrel_pct = float((lsa == 6).mean())
+
+            if "estimated_woba_using_speedangle" in df.columns:
+                xw = pd.to_numeric(df["estimated_woba_using_speedangle"], errors="coerce")
+                if xw.notna().any():
+                    xwoba = float(xw.mean())
+            if "woba_value" in df.columns:
+                wv = pd.to_numeric(df["woba_value"], errors="coerce")
+                if wv.notna().any():
+                    woba = float(wv.mean())
+
+            key_cols = [c for c in ["game_pk", "at_bat_number"] if c in df.columns]
+            if len(key_cols) == 2 and "events" in df.columns:
+                pa_df = df.copy()
+                if "pitch_number" in pa_df.columns:
+                    pa_df["pitch_number_num"] = pd.to_numeric(pa_df["pitch_number"], errors="coerce")
+                    pa_df = pa_df.sort_values(key_cols + ["pitch_number_num"]).groupby(key_cols, as_index=False).tail(1)
+                else:
+                    pa_df = pa_df.groupby(key_cols, as_index=False).tail(1)
+                events = pa_df["events"].astype(str).str.lower()
+                valid_pa = events.notna() & ~events.isin(["", "nan", "none"])
+                plate_appearances = int(valid_pa.sum())
+                if plate_appearances >= 20:
+                    k_events = events.isin(["strikeout", "strikeout_double_play"])
+                    bb_events = events.isin(["walk", "intent_walk"])
+                    savant_k_pct = float(k_events.sum() / plate_appearances)
+                    savant_bb_pct = float(bb_events.sum() / plate_appearances)
+        except Exception:
+            savant_k_pct = savant_bb_pct = swing_pct = zone_pct = None
+            avg_exit_velocity = hard_hit_pct = barrel_pct = sweet_spot_pct = avg_launch_angle = xwoba = woba = None
+            batted_balls = plate_appearances = 0
+
         csw_recent_30 = None
         csw_recent_30_pitches = 0
         csw_recent_45 = None
@@ -6057,7 +6172,41 @@ def get_statcast_pitch_profile(pitcher_id, days=365):
                     "Pitches": int(row["Pitches"]),
                     "Swings": int(row["Swings"]),
                 })
-        return {"available": True, "message": "Real Statcast pitch-level data loaded", "rows": pitch_count, "csw": None if csw is None else float(csw), "whiff": None if whiff is None else float(whiff), "chase": None if chase is None else float(chase), "zone_contact": None if zone_contact is None else float(zone_contact), "pitch_mix": pitch_mix, "pitch_type_profile": pitch_type_profile, "fastball_velo_season": None if fastball_velo_season is None else round(float(fastball_velo_season), 2), "fastball_velo_recent": None if fastball_velo_recent is None else round(float(fastball_velo_recent), 2), "fastball_velo_delta": None if fastball_velo_delta is None else round(float(fastball_velo_delta), 2), "pitch_usage_trend": pitch_usage_trend or [], "pitch_usage_note": pitch_usage_note or "No meaningful recent pitch-usage shift", "first_strike_pct": None if first_strike_pct is None else float(first_strike_pct), "csw_recent_30": None if csw_recent_30 is None else float(csw_recent_30), "csw_recent_30_pitches": int(csw_recent_30_pitches or 0), "csw_recent_45": None if csw_recent_45 is None else float(csw_recent_45), "csw_recent_45_pitches": int(csw_recent_45_pitches or 0)}
+        return {
+            "available": True,
+            "message": "Real Baseball Savant Statcast pitch-level data loaded",
+            "official_source": "Baseball Savant Statcast CSV",
+            "rows": pitch_count,
+            "csw": None if csw is None else float(csw),
+            "whiff": None if whiff is None else float(whiff),
+            "chase": None if chase is None else float(chase),
+            "zone_contact": None if zone_contact is None else float(zone_contact),
+            "pitch_mix": pitch_mix,
+            "pitch_type_profile": pitch_type_profile,
+            "fastball_velo_season": None if fastball_velo_season is None else round(float(fastball_velo_season), 2),
+            "fastball_velo_recent": None if fastball_velo_recent is None else round(float(fastball_velo_recent), 2),
+            "fastball_velo_delta": None if fastball_velo_delta is None else round(float(fastball_velo_delta), 2),
+            "pitch_usage_trend": pitch_usage_trend or [],
+            "pitch_usage_note": pitch_usage_note or "No meaningful recent pitch-usage shift",
+            "first_strike_pct": None if first_strike_pct is None else float(first_strike_pct),
+            "csw_recent_30": None if csw_recent_30 is None else float(csw_recent_30),
+            "csw_recent_30_pitches": int(csw_recent_30_pitches or 0),
+            "csw_recent_45": None if csw_recent_45 is None else float(csw_recent_45),
+            "csw_recent_45_pitches": int(csw_recent_45_pitches or 0),
+            "savant_k_pct": None if savant_k_pct is None else float(savant_k_pct),
+            "savant_bb_pct": None if savant_bb_pct is None else float(savant_bb_pct),
+            "swing_pct": None if swing_pct is None else float(swing_pct),
+            "zone_pct": None if zone_pct is None else float(zone_pct),
+            "avg_exit_velocity": None if avg_exit_velocity is None else round(float(avg_exit_velocity), 2),
+            "hard_hit_pct": None if hard_hit_pct is None else float(hard_hit_pct),
+            "barrel_pct": None if barrel_pct is None else float(barrel_pct),
+            "sweet_spot_pct": None if sweet_spot_pct is None else float(sweet_spot_pct),
+            "avg_launch_angle": None if avg_launch_angle is None else round(float(avg_launch_angle), 2),
+            "xwoba": None if xwoba is None else round(float(xwoba), 3),
+            "woba": None if woba is None else round(float(woba), 3),
+            "batted_balls": int(batted_balls or 0),
+            "plate_appearances": int(plate_appearances or 0),
+        }
     except Exception as e:
         empty["message"] = f"Statcast unavailable: {e}"
         return empty
@@ -40690,6 +40839,168 @@ def build_kproj_table(board):
     return _kreal_apply_overrides(_KREAL_PREV_BUILD_K(board))
 
 
+# =============================================================================
+# OFFICIAL BASEBALL SAVANT INPUTS
+# Pulls official MLB/Baseball Savant Statcast data into the final K board.
+# Projection stays on the legacy/internal path; these fields support APP99,
+# bad-game risk, PO damage risk, and audit sanity.
+# =============================================================================
+OFFICIAL_SAVANT_INPUT_VERSION = "OFFICIAL_BASEBALL_SAVANT_INPUTS_2026_07_26"
+
+
+def _savant_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _savant_pct_to_display(value):
+    v = _savant_num(value, np.nan)
+    if not np.isfinite(v):
+        return ""
+    return round(v * 100.0 if abs(v) <= 1 else v, 1)
+
+
+def _savant_pitcher_id_from_row(row):
+    for key in ["APP97 Pitcher Player ID", "Pitcher ID", "pitcher_id", "player_id", "MLB ID"]:
+        try:
+            v = row.get(key)
+            if v not in (None, "", "—") and np.isfinite(float(v)):
+                return int(float(v))
+        except Exception:
+            pass
+    name = str(row.get("Pitcher") or row.get("pitcher") or row.get("Player") or "").strip()
+    if name and "_mlb_search_player_id_by_name" in globals():
+        try:
+            return _mlb_search_player_id_by_name(name)
+        except Exception:
+            return None
+    return None
+
+
+def _savant_support_label(profile):
+    if not isinstance(profile, dict) or not profile.get("available"):
+        return "SAVANT_MISSING"
+    support = 0
+    caution = 0
+    whiff = _savant_num(profile.get("whiff"), np.nan)
+    csw = _savant_num(profile.get("csw"), np.nan)
+    chase = _savant_num(profile.get("chase"), np.nan)
+    first = _savant_num(profile.get("first_strike_pct"), np.nan)
+    k_pct = _savant_num(profile.get("savant_k_pct"), np.nan)
+    if np.isfinite(whiff):
+        if whiff >= 0.295: support += 1
+        elif whiff < 0.235: caution += 1
+    if np.isfinite(csw):
+        if csw >= 0.305: support += 1
+        elif csw < 0.265: caution += 1
+    if np.isfinite(chase):
+        if chase >= 0.315: support += 1
+        elif chase < 0.255: caution += 1
+    if np.isfinite(first):
+        if first >= 0.635: support += 1
+        elif first < 0.585: caution += 1
+    if np.isfinite(k_pct):
+        if k_pct >= 0.27: support += 1
+        elif k_pct < 0.19: caution += 1
+    if support >= 3 and caution <= 1:
+        return "SAVANT_K_SUPPORT"
+    if caution >= 3 and support <= 1:
+        return "SAVANT_K_CAUTION"
+    if support > caution:
+        return "SAVANT_SLIGHT_SUPPORT"
+    if caution > support:
+        return "SAVANT_SLIGHT_CAUTION"
+    return "SAVANT_NEUTRAL"
+
+
+def _savant_damage_label(profile):
+    if not isinstance(profile, dict) or not profile.get("available"):
+        return "SAVANT_DAMAGE_UNKNOWN"
+    risk = 0
+    hard = _savant_num(profile.get("hard_hit_pct"), np.nan)
+    barrel = _savant_num(profile.get("barrel_pct"), np.nan)
+    xwoba = _savant_num(profile.get("xwoba"), np.nan)
+    ev = _savant_num(profile.get("avg_exit_velocity"), np.nan)
+    if np.isfinite(hard) and hard >= 0.43: risk += 2
+    elif np.isfinite(hard) and hard >= 0.39: risk += 1
+    if np.isfinite(barrel) and barrel >= 0.095: risk += 2
+    elif np.isfinite(barrel) and barrel >= 0.075: risk += 1
+    if np.isfinite(xwoba) and xwoba >= 0.345: risk += 2
+    elif np.isfinite(xwoba) and xwoba >= 0.320: risk += 1
+    if np.isfinite(ev) and ev >= 91.0: risk += 1
+    if risk >= 5:
+        return "SAVANT_HIGH_DAMAGE_RISK"
+    if risk >= 3:
+        return "SAVANT_MED_DAMAGE_RISK"
+    if risk >= 1:
+        return "SAVANT_MILD_DAMAGE_RISK"
+    return "SAVANT_DAMAGE_OK"
+
+
+def _savant_apply_official_inputs(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out_rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        pid = _savant_pitcher_id_from_row(row)
+        profile = get_statcast_pitch_profile(pid, days=365) if pid else {"available": False, "message": "missing MLB pitcher id"}
+        row["Official Savant Source"] = profile.get("official_source", "Baseball Savant Statcast CSV")
+        row["Official Savant Status"] = "SUCCESS" if profile.get("available") else str(profile.get("message") or "UNAVAILABLE")[:120]
+        row["Official Savant Rows"] = profile.get("rows", 0)
+        row["Official Savant K%"] = _savant_pct_to_display(profile.get("savant_k_pct"))
+        row["Official Savant BB%"] = _savant_pct_to_display(profile.get("savant_bb_pct"))
+        row["Official Savant Whiff%"] = _savant_pct_to_display(profile.get("whiff"))
+        row["Official Savant CSW%"] = _savant_pct_to_display(profile.get("csw"))
+        row["Official Savant Chase%"] = _savant_pct_to_display(profile.get("chase"))
+        row["Official Savant First Strike%"] = _savant_pct_to_display(profile.get("first_strike_pct"))
+        row["Official Savant Swing%"] = _savant_pct_to_display(profile.get("swing_pct"))
+        row["Official Savant Zone%"] = _savant_pct_to_display(profile.get("zone_pct"))
+        row["Official Savant HardHit%"] = _savant_pct_to_display(profile.get("hard_hit_pct"))
+        row["Official Savant Barrel%"] = _savant_pct_to_display(profile.get("barrel_pct"))
+        row["Official Savant SweetSpot%"] = _savant_pct_to_display(profile.get("sweet_spot_pct"))
+        row["Official Savant Avg EV"] = profile.get("avg_exit_velocity", "")
+        row["Official Savant Avg LA"] = profile.get("avg_launch_angle", "")
+        row["Official Savant xwOBA"] = profile.get("xwoba", "")
+        row["Official Savant wOBA"] = profile.get("woba", "")
+        row["Official Savant FB Velo"] = profile.get("fastball_velo_season", "")
+        row["Official Savant FB Velo Recent"] = profile.get("fastball_velo_recent", "")
+        row["Official Savant FB Velo Delta"] = profile.get("fastball_velo_delta", "")
+        row["Official Savant K Skill Signal"] = _savant_support_label(profile)
+        row["Official Savant Damage Signal"] = _savant_damage_label(profile)
+        row["Official Savant Version"] = OFFICIAL_SAVANT_INPUT_VERSION
+
+        # Feed existing generic audit fields only when they are blank/missing.
+        if row.get("Whiff%") in (None, "", "—", "nan", "NaN") and row["Official Savant Whiff%"] != "":
+            row["Whiff%"] = row["Official Savant Whiff%"]
+        if row.get("Recent CSW%") in (None, "", "—", "nan", "NaN") and row["Official Savant CSW%"] != "":
+            row["Recent CSW%"] = row["Official Savant CSW%"]
+        if row.get("Recent Chase%") in (None, "", "—", "nan", "NaN") and row["Official Savant Chase%"] != "":
+            row["Recent Chase%"] = row["Official Savant Chase%"]
+        if row.get("First Strike %") in (None, "", "—", "nan", "NaN") and row["Official Savant First Strike%"] != "":
+            row["First Strike %"] = row["Official Savant First Strike%"]
+        if row.get("Damage Risk Label") in (None, "", "—", "nan", "NaN"):
+            row["Damage Risk Label"] = row["Official Savant Damage Signal"]
+        if row.get("Damage Risk Note") in (None, "", "—", "nan", "NaN"):
+            row["Damage Risk Note"] = f"Official Savant: hard-hit {row['Official Savant HardHit%']} | barrel {row['Official Savant Barrel%']} | xwOBA {row['Official Savant xwOBA']} | EV {row['Official Savant Avg EV']}"
+        out_rows.append(row)
+    return pd.DataFrame(out_rows)
+
+
+_SAVANT_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _SAVANT_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _savant_apply_official_inputs(_SAVANT_PREV_BUILD_K(board))
+
+
 def _kreal_render_panel():
     st.markdown("#### K / PO Real Data Overrides")
     st.caption("Optional daily feed for umpire, pitch mix, leash, role/injury, damage risk, and bullpen context. Used by APP99; copy/paste slate stays clean.")
@@ -40706,6 +41017,152 @@ def _kreal_render_panel():
     if isinstance(current, pd.DataFrame) and not current.empty:
         with st.expander("Current K/PO real-data overrides", expanded=False):
             st.dataframe(current.tail(50), use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# WINNING FILE K SOURCE BRIDGE
+#
+# The user supplied two older files that produced stronger slates:
+#   - 17-11 best pitchers.py
+#   - 15-9 keep!!!!.py
+#
+# Those versions performed best before the later APP97/current-matchup layer
+# promoted itself over the legacy Line-Aware/App70 endpoint. This bridge restores
+# that older public K source while keeping APP97/APP88/Savant/APP99 as audit and
+# risk data. Pitching Outs, Moneyline, and copy/paste formatting stay separate.
+# =============================================================================
+WINNING_FILE_K_BRIDGE_VERSION = "WINNING_FILE_K_SOURCE_BRIDGE_2026_07_26"
+WINNING_FILE_K_SOURCE_MODE = "17_11_FIRST"  # options: 17_11_FIRST, 15_9_FIRST, APP70_FIRST, CURRENT_ONLY
+
+
+def _wfk_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN", "NO LINE", "NO_UD_LINE"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _wfk_line(row):
+    for key in ["UD/Line", "UD Line", "Line", "line", "K Line", "Underdog Line"]:
+        v = _wfk_num(row.get(key), np.nan)
+        if np.isfinite(v):
+            return v
+    return np.nan
+
+
+def _wfk_source_order(mode=None):
+    mode = str(mode or WINNING_FILE_K_SOURCE_MODE or "").upper()
+    current = ["K PROJ", "Final K Projection", "Official K PROJ"]
+    file17 = [
+        "File33 Matched K Projection",
+        "Pre-App70 K PROJ",
+        "PRE_APP97 Line-Aware Smart Final K Projection",
+        "Line-Aware Smart Final K Projection",
+    ]
+    file15 = [
+        "App70 Calibrated K PROJ",
+        "App75 Final K PROJ",
+        "APP78 Final K Projection",
+    ]
+    if mode in {"CURRENT_ONLY", "APP97", "CURRENT"}:
+        return current
+    if mode in {"15_9_FIRST", "APP70_FIRST"}:
+        return file15 + file17 + current
+    return file17 + file15 + current
+
+
+def _wfk_choose_projection(row):
+    for key in _wfk_source_order():
+        if key in row:
+            v = _wfk_num(row.get(key), np.nan)
+            if np.isfinite(v):
+                return round(float(v), 2), key
+    return np.nan, ""
+
+
+def _wfk_decision(proj, line):
+    if not np.isfinite(proj) or not np.isfinite(line):
+        return "NO LINE/PROJECTION"
+    edge = proj - line
+    side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
+    if side == "PUSH":
+        return "PASS"
+    abs_edge = abs(edge)
+    if abs_edge >= 1.00:
+        return f"🔥 {side}"
+    if abs_edge >= 0.55:
+        return f"⚠️ {side} LEAN"
+    return f"TRACK {side}"
+
+
+def _wfk_apply_winning_source(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    projections = []
+    sources = []
+    edges = []
+    sides = []
+    decisions = []
+
+    for _, rr in out.iterrows():
+        row = rr.to_dict()
+        proj, source = _wfk_choose_projection(row)
+        line = _wfk_line(row)
+        projections.append(proj if np.isfinite(proj) else np.nan)
+        sources.append(source or "NO_WINNING_SOURCE")
+        if np.isfinite(proj) and np.isfinite(line):
+            edge = round(proj - line, 2)
+            edges.append(edge)
+            sides.append("OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH")
+            decisions.append(_wfk_decision(proj, line))
+        else:
+            edges.append(np.nan)
+            sides.append("")
+            decisions.append("NO LINE/PROJECTION")
+
+    final = pd.Series(projections, index=out.index, dtype="float64")
+    if "K PROJ" in out.columns and "Pre-WinningFile K PROJ" not in out.columns:
+        out["Pre-WinningFile K PROJ"] = out["K PROJ"]
+    if "Decision" in out.columns and "Pre-WinningFile Decision" not in out.columns:
+        out["Pre-WinningFile Decision"] = out["Decision"]
+
+    out["Winning File K Projection"] = final.round(2)
+    out["Winning File K Source"] = sources
+    out["Winning File K Edge"] = pd.Series(edges, index=out.index)
+    out["Winning File K Side"] = sides
+    out["Winning File K Decision"] = decisions
+    out["Winning File K Mode"] = WINNING_FILE_K_SOURCE_MODE
+    out["Winning File K Bridge Version"] = WINNING_FILE_K_BRIDGE_VERSION
+
+    for key in ["K PROJ", "Final K Projection", "Official K PROJ", "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection"]:
+        if key in out.columns:
+            old = pd.to_numeric(out[key], errors="coerce")
+            out[key] = final.where(final.notna(), old).round(2)
+    for key in ["Edge", "Edge Gap", "Official K Edge", "Final K Edge", "Line-Aware Smart Edge"]:
+        if key in out.columns:
+            old = pd.to_numeric(out[key], errors="coerce")
+            out[key] = pd.Series(edges, index=out.index, dtype="float64").where(final.notna(), old)
+    if "Decision" in out.columns:
+        out["Decision"] = decisions
+    if "Main Engine Action" in out.columns:
+        out["Main Engine Action"] = decisions
+    if "Line-Aware Smart Decision" in out.columns:
+        out["Line-Aware Smart Decision"] = decisions
+    out["Active K Pipeline"] = "WINNING_FILE_BRIDGE_" + WINNING_FILE_K_SOURCE_MODE
+    return out
+
+
+_WFK_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _WFK_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _wfk_apply_winning_source(_WFK_PREV_BUILD_K(board))
 
 
 # =============================================================================
@@ -40756,15 +41213,25 @@ def _app99_right_wins_row(row):
 
     lineup_status = _app99_text(row, ["APP97 Lineup Status", "Lineup Source", "Projection Source", "Lineup"]).upper()
     k_warning = _app99_text(row, ["APP97 Pitcher K% Warning"]).upper()
-    pitcher_k_src = _app99_text(row, ["APP97 Pitcher K Source", "APP97 Pitcher ID Source", "Pitcher K% Source"]).upper()
-    interaction = _app99_text(row, ["APP97 K Interaction Label", "APP97 Current Matchup Read", "APP98 Loss Target Reason"]).upper()
+    pitcher_k_src = _app99_text(row, ["Official Savant Status", "APP97 Pitcher K Source", "APP97 Pitcher ID Source", "Pitcher K% Source"]).upper()
+    official_k_skill = _app99_text(row, ["Official Savant K Skill Signal"]).upper()
+    interaction = _app99_text(row, ["APP97 K Interaction Label", "APP97 Current Matchup Read", "APP98 Loss Target Reason", "Official Savant K Skill Signal"]).upper()
     sim_prob = _app99_num(_app99_text(row, ["K Sim Current Side Prob %", "K Sim True Prob %"]), np.nan)
-    whiff = _app99_num(_app99_text(row, ["APP85 PutAway Rate", "Putaway/Whiff", "Atlas Putaway Used", "Whiff%", "Recent SwStr%"]), np.nan)
+    whiff = _app99_num(_app99_text(row, ["Official Savant Whiff%", "APP85 PutAway Rate", "Putaway/Whiff", "Atlas Putaway Used", "Whiff%", "Recent SwStr%"]), np.nan)
+    csw = _app99_num(_app99_text(row, ["Official Savant CSW%", "Recent CSW%", "CSW%"]), np.nan)
+    chase = _app99_num(_app99_text(row, ["Official Savant Chase%", "Recent Chase%", "Chase%"]), np.nan)
+    official_k_pct = _app99_num(_app99_text(row, ["Official Savant K%", "APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%"]), np.nan)
     if np.isfinite(whiff) and whiff <= 1.0:
         whiff *= 100.0
+    if np.isfinite(csw) and csw <= 1.0:
+        csw *= 100.0
+    if np.isfinite(chase) and chase <= 1.0:
+        chase *= 100.0
+    if np.isfinite(official_k_pct) and official_k_pct <= 1.0:
+        official_k_pct *= 100.0
     pitch_mix_txt = _app99_text(row, ["Pitch Mix Matchup Label", "Pitch Mix Matchup", "APP88 Whiff Interaction Adjustment", "Whiff Interaction Note", "Pitch Arsenal Matchup"]).upper()
     leash_txt = _app99_text(row, ["IP Confidence", "Beta Flags", "Pitch Count Trend", "APP97 BF Reconciliation", "Volume Miss Label", "Manager Pull Risk"]).upper()
-    damage_txt = _app99_text(row, ["Damage Risk Label", "Damage Risk Note", "Traffic Label", "Bad Game Risk", "Projected WHIP"]).upper()
+    damage_txt = _app99_text(row, ["Official Savant Damage Signal", "Damage Risk Label", "Damage Risk Note", "Traffic Label", "Bad Game Risk", "Projected WHIP"]).upper()
     ump_txt = _app99_text(row, ["Umpire", "Umpire K Boost", "Zone Boost", "Called Strike Boost", "APP Umpire Zone"]).upper()
 
     score = 100
@@ -40777,9 +41244,20 @@ def _app99_right_wins_row(row):
     if k_warning and k_warning not in {"OK", "NAN"}:
         score -= 16
         risks.append("pitcher K% warning")
-    if "MISSING" in pitcher_k_src or "FALLBACK" in pitcher_k_src:
+    if "MISSING" in pitcher_k_src or "FALLBACK" in pitcher_k_src or "UNAVAILABLE" in pitcher_k_src:
         score -= 6
         missing.append("verified pitcher K%")
+    if "SAVANT_K_SUPPORT" in official_k_skill or "SAVANT_SLIGHT_SUPPORT" in official_k_skill:
+        score += 4
+    elif "SAVANT_K_CAUTION" in official_k_skill or "SAVANT_SLIGHT_CAUTION" in official_k_skill:
+        score -= 8
+        risks.append("official Savant K-skill caution")
+    if np.isfinite(official_k_pct):
+        if official_k_pct >= 27:
+            score += 3
+        elif official_k_pct < 19:
+            score -= 8
+            risks.append("low official pitcher K%")
     if not np.isfinite(whiff):
         score -= 9
         missing.append("whiff/stuff")
@@ -40788,6 +41266,18 @@ def _app99_right_wins_row(row):
         risks.append("low whiff/stuff")
     elif whiff >= 30:
         score += 4
+    if np.isfinite(csw):
+        if csw >= 30.5:
+            score += 3
+        elif csw < 26.5:
+            score -= 5
+            risks.append("low official CSW")
+    if np.isfinite(chase):
+        if chase >= 31.5:
+            score += 2
+        elif chase < 25.5:
+            score -= 4
+            risks.append("low official chase")
     if not pitch_mix_txt:
         score -= 8
         missing.append("pitch mix matchup")
@@ -40803,6 +41293,11 @@ def _app99_right_wins_row(row):
     if any(x in damage_txt for x in ["HIGH", "RED", "BAD", "TRAFFIC", "WHIP"]):
         score -= 10
         risks.append("damage/traffic risk")
+    elif "SAVANT_MED_DAMAGE_RISK" in damage_txt:
+        score -= 6
+        risks.append("official Savant damage risk")
+    elif "SAVANT_MILD_DAMAGE_RISK" in damage_txt:
+        score -= 3
     if np.isfinite(sim_prob):
         if sim_prob < 58:
             score -= 8
@@ -40834,7 +41329,7 @@ def _app99_right_wins_row(row):
         "APP99 Right Wins Gate": gate,
         "APP99 Missing Data": ", ".join(dict.fromkeys(missing)) or "none",
         "APP99 Loss Risks": ", ".join(dict.fromkeys(risks)) or "none",
-        "APP99 Data Used": f"lineup={lineup_status or 'UNKNOWN'} | pitcherK={pitcher_k_src or 'UNKNOWN'} | whiff={'' if not np.isfinite(whiff) else round(whiff,1)} | sim={'' if not np.isfinite(sim_prob) else round(sim_prob,1)}",
+        "APP99 Data Used": f"lineup={lineup_status or 'UNKNOWN'} | pitcherK={pitcher_k_src or 'UNKNOWN'} | offK={'' if not np.isfinite(official_k_pct) else round(official_k_pct,1)} | whiff={'' if not np.isfinite(whiff) else round(whiff,1)} | csw={'' if not np.isfinite(csw) else round(csw,1)} | chase={'' if not np.isfinite(chase) else round(chase,1)} | sim={'' if not np.isfinite(sim_prob) else round(sim_prob,1)}",
         "APP99 Version": APP99_RIGHT_WINS_VERSION,
     }
 
@@ -40932,10 +41427,13 @@ def _kclean_main_df(df):
             "K Projection": _kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection", "APP98 Loss Target Projection"], ""),
             "Edge": _kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], ""),
             "Pick": _kclean_display_decision(row),
+            "K Source": _kclean_pick(row, ["Winning File K Source", "Active K Pipeline", "File33 Projection Source"], ""),
             "Sim Side %": _kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], ""),
             "Lineup": _kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], ""),
             "Opp K%": _kclean_pick(row, ["APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used"], ""),
-            "Pitcher K%": _kclean_pick(row, ["APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%"], ""),
+            "Pitcher K%": _kclean_pick(row, ["Official Savant K%", "APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%"], ""),
+            "Whiff": _kclean_pick(row, ["Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate", "Recent SwStr%"], ""),
+            "Savant": _kclean_pick(row, ["Official Savant K Skill Signal", "Official Savant Status"], ""),
             "Win Gate": _kclean_pick(row, ["APP99 Right Wins Gate"], ""),
             "Win Score": _kclean_pick(row, ["APP99 Right Wins Score"], ""),
             "Missing": _kclean_pick(row, ["APP99 Missing Data"], ""),
@@ -41004,11 +41502,21 @@ def render_kproj_tab(board):
     with st.expander("Full K audit details", expanded=False):
         cols = [c for c in [
             "Pitcher", "Matchup", "UD/Line", "RAW BASE_K", "APP97 True K Projection",
+            "Winning File K Projection", "Winning File K Source", "Winning File K Edge",
+            "Winning File K Decision", "Pre-WinningFile K PROJ",
+            "File33 Matched K Projection", "File33 Projection Source",
+            "App70 Calibrated K PROJ", "Pre-App70 K PROJ",
             "APP98 Loss Target Projection", "APP98 Loss Target Adjustment", "APP98 Loss Target Reason",
             "K Sim Pick", "K Sim True Prob %", "K Sim Current Side Prob %",
             "APP97 Lineup Status", "APP97 Opponent K Environment", "APP97 Pitcher K% Warning",
             "APP99 Right Wins Score", "APP99 Right Wins Gate", "APP99 Missing Data",
             "APP99 Loss Risks", "APP99 Data Used",
+            "Official Savant Status", "Official Savant Rows", "Official Savant K%",
+            "Official Savant BB%", "Official Savant Whiff%", "Official Savant CSW%",
+            "Official Savant Chase%", "Official Savant First Strike%",
+            "Official Savant HardHit%", "Official Savant Barrel%",
+            "Official Savant xwOBA", "Official Savant Avg EV",
+            "Official Savant K Skill Signal", "Official Savant Damage Signal",
             "K Real Data Override", "K Real Data Used", "K Real Data Notes", "K Real Data Version",
             "APP88 Batter Lineup K%", "APP85 PutAway Rate", "Atlas Grade", "Official Card Tier",
             "APP98 Version", "APP99 Version", "K Clean UI Version"
@@ -41308,10 +41816,26 @@ def build_projection_health_audit(board=None):
             warning_count = total
         add("Pitcher K% Sanity", f"{warning_count} warning rows", "Wrong pitcher K% can push overs/unders the wrong way.", "Check APP97 Pitcher K% Warning and ID Source before locking plays.")
 
+        savant_loaded = 0
+        savant_rows = 0
+        if total and "Official Savant Status" in kdf.columns:
+            savant_loaded = int(kdf["Official Savant Status"].astype(str).str.upper().eq("SUCCESS").sum())
+        if total and "Official Savant Rows" in kdf.columns:
+            savant_rows = int(pd.to_numeric(kdf["Official Savant Rows"], errors="coerce").fillna(0).sum())
+        add("Official MLB/Savant Inputs", f"{savant_loaded}/{total} pitchers loaded | {savant_rows} pitch rows", "Missing official Statcast leaves K%, whiff, CSW, chase, and damage risk on weaker fallback inputs.", "Keep MLB pitcher IDs clean; trust GREEN/YELLOW more when Official Savant Status is SUCCESS.")
+
+        winning_loaded = 0
+        source_counts = {}
+        if total and "Winning File K Source" in kdf.columns:
+            src = kdf["Winning File K Source"].astype(str)
+            winning_loaded = int(~src.str.upper().isin(["", "NO_WINNING_SOURCE", "NAN"]).sum())
+            source_counts = src.value_counts().head(4).to_dict()
+        add("Winning File K Projection Source", f"{winning_loaded}/{total} rows | {source_counts}", "Later current-matchup layers can drift away from the 17-11 / 15-9 slate behavior.", "Use the Winning File K Source column to confirm rows are anchored to File33/Pre-App70/App70 instead of current-only fallback.")
+
         app98_adjusted = 0
         if total and "APP98 Loss Target Adjustment" in kdf.columns:
             app98_adjusted = int((pd.to_numeric(kdf["APP98 Loss Target Adjustment"], errors="coerce").fillna(0).abs() > 0).sum())
-        add("K Loss Targeting", f"{app98_adjusted}/{total} rows adjusted", "The model was losing too many high-line/contact-suppression and thin-edge spots.", "APP98 trims risky overs and boosts risky unders when loss flags stack up.")
+        add("K Loss Targeting", f"{app98_adjusted}/{total} audit adjustments flagged", "The model was losing too many high-line/contact-suppression and thin-edge spots.", "APP98 is audit-only right now; use the flags to avoid risky plays without moving the stable public K projection.")
         if total and "APP99 Right Wins Gate" in kdf.columns:
             gates = kdf["APP99 Right Wins Gate"].astype(str).str.upper()
             green = int(gates.str.contains("GREEN", na=False).sum())
