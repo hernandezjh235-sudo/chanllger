@@ -41166,6 +41166,278 @@ def build_kproj_table(board):
 
 
 # =============================================================================
+# HANDEDNESS SPLIT DATA VERIFIER
+#
+# Ensures K rows use the pitcher's actual throwing hand for matchup K data:
+#   LHP -> opponent/team/batter K% vs LHP
+#   RHP -> opponent/team/batter K% vs RHP
+#
+# Pitcher own K% remains pitcher talent; opponent K environment uses vs-hand.
+# =============================================================================
+HANDEDNESS_SPLIT_DATA_VERSION = "HANDEDNESS_SPLIT_VERIFIER_2026_07_26"
+
+
+def _hsk_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _hsk_pct(value, default=np.nan):
+    v = _hsk_num(value, default)
+    if not np.isfinite(v):
+        return default
+    return v * 100.0 if abs(v) <= 1.0 else v
+
+
+def _hsk_norm_hand(value):
+    txt = str(value or "").upper().strip()
+    if txt in {"L", "LH", "LHP", "LEFT", "LEFTY", "LEFT-HANDED"} or "LHP" in txt or "LEFT" in txt:
+        return "LHP"
+    if txt in {"R", "RH", "RHP", "RIGHT", "RIGHTY", "RIGHT-HANDED"} or "RHP" in txt or "RIGHT" in txt:
+        return "RHP"
+    return ""
+
+
+def _hsk_resolve_hand(row, board_item=None):
+    if "_okr_pitcher_hand_from_any" in globals():
+        try:
+            hand = _hsk_norm_hand(_okr_pitcher_hand_from_any(row, board_item))
+            if hand:
+                return hand, "OKR_HAND_RESOLVER"
+        except Exception:
+            pass
+    for key in [
+        "Pitcher Hand", "Throws", "Throwing Hand", "Pitcher Throws", "Hand",
+        "hand", "pitcher_hand", "p_throws", "throws", "arm",
+    ]:
+        hand = _hsk_norm_hand(row.get(key))
+        if hand:
+            return hand, key
+    if isinstance(board_item, dict):
+        for key in [
+            "Pitcher Hand", "Throws", "Throwing Hand", "Pitcher Throws", "Hand",
+            "hand", "pitcher_hand", "p_throws", "throws", "arm",
+        ]:
+            hand = _hsk_norm_hand(board_item.get(key))
+            if hand:
+                return hand, "BOARD_" + key
+    return "", "MISSING"
+
+
+def _hsk_first_pct(row, keys):
+    for key in keys:
+        if key in row:
+            v = _hsk_pct(row.get(key), np.nan)
+            if np.isfinite(v):
+                return round(float(v), 2), key
+    return np.nan, ""
+
+
+def _hsk_split_keys(hand):
+    if hand == "LHP":
+        return [
+            "Opp K% vs LHP Official", "Opponent K% vs LHP", "Opp K% vs LHP",
+            "Team K% vs LHP", "Lineup K% vs LHP", "K% vs LHP",
+            "Opp L30 K% vs LHP Official", "Opp L15 K% vs LHP Official",
+            "Opp L10 K% vs LHP Official", "Opp L5 K% vs LHP Official",
+        ]
+    if hand == "RHP":
+        return [
+            "Opp K% vs RHP Official", "Opponent K% vs RHP", "Opp K% vs RHP",
+            "Team K% vs RHP", "Lineup K% vs RHP", "K% vs RHP",
+            "Opp L30 K% vs RHP Official", "Opp L15 K% vs RHP Official",
+            "Opp L10 K% vs RHP Official", "Opp L5 K% vs RHP Official",
+        ]
+    return []
+
+
+def _hsk_board_lookup(board):
+    lookup = {}
+    for p in board or []:
+        try:
+            name = str(p.get("pitcher") or p.get("Pitcher") or p.get("Player") or "").strip()
+            if name:
+                lookup[normalize_name(name)] = p
+        except Exception:
+            pass
+    return lookup
+
+
+def _hsk_apply_handedness_verifier(df, board=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    lookup = _hsk_board_lookup(board)
+    hands, hand_sources, matchup_k, matchup_sources, warnings = [], [], [], [], []
+
+    for _, rr in out.iterrows():
+        row = rr.to_dict()
+        name_key = normalize_name(str(row.get("Pitcher") or row.get("pitcher") or row.get("Player") or ""))
+        board_item = lookup.get(name_key, {})
+        hand, hand_source = _hsk_resolve_hand(row, board_item)
+        k_val, k_source = _hsk_first_pct(row, _hsk_split_keys(hand))
+
+        if not np.isfinite(k_val):
+            k_val, k_source = _hsk_first_pct(row, [
+                "Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment",
+                "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used",
+                "Opp K%", "Opponent K%",
+            ])
+
+        warn = []
+        if not hand:
+            warn.append("missing pitcher hand; using generic opponent K fallback")
+        elif not k_source or "vs " not in k_source:
+            warn.append(f"missing opponent K split vs {hand}; using fallback")
+
+        hands.append(hand or "UNKNOWN")
+        hand_sources.append(hand_source)
+        matchup_k.append(k_val if np.isfinite(k_val) else np.nan)
+        matchup_sources.append(k_source or "NO_K_SOURCE")
+        warnings.append("; ".join(warn) or "OK")
+
+    out["Pitcher Hand"] = hands
+    out["Handedness Source"] = hand_sources
+    out["Opponent K% vs Pitcher Hand"] = pd.Series(matchup_k, index=out.index, dtype="float64").round(2)
+    out["Opponent K% vs Pitcher Hand Source"] = matchup_sources
+    out["Handedness Split Warning"] = warnings
+    out["Handedness Split Version"] = HANDEDNESS_SPLIT_DATA_VERSION
+    return out
+
+
+_HSK_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _HSK_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _hsk_apply_handedness_verifier(_HSK_PREV_BUILD_K(board), board)
+
+
+# =============================================================================
+# PROJECTION DATA INTEGRITY GATE
+#
+# Final "do not trust bad inputs" audit before APP99. This does not rewrite the
+# K number; it labels whether the projection is built from matched pitcher,
+# matched hand, opponent vs-hand K split, and official/statcast support.
+# =============================================================================
+PROJECTION_DATA_INTEGRITY_VERSION = "PROJECTION_DATA_INTEGRITY_GATE_2026_07_26"
+
+
+def _pdig_text(row, keys):
+    for key in keys:
+        try:
+            val = row.get(key)
+            if val not in (None, "", "—", "nan", "NaN"):
+                return str(val)
+        except Exception:
+            pass
+    return ""
+
+
+def _pdig_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _pdig_row(row):
+    issues = []
+    cautions = []
+
+    hand = _pdig_text(row, ["Pitcher Hand", "Hand", "Throws"]).upper()
+    hand_warn = _pdig_text(row, ["Handedness Split Warning"]).upper()
+    opp_src = _pdig_text(row, ["Opponent K% vs Pitcher Hand Source", "Opp K Source"]).upper()
+    opp_k = _pdig_num(row.get("Opponent K% vs Pitcher Hand"), np.nan)
+    savant_status = _pdig_text(row, ["Official Savant Status"]).upper()
+    app97_pid_src = _pdig_text(row, ["APP97 Pitcher ID Source"]).upper()
+    app97_k_warn = _pdig_text(row, ["APP97 Pitcher K% Warning"]).upper()
+    app97_fetch = (
+        _pdig_text(row, ["APP97 Pitcher Season Fetch Status"]).upper(),
+        _pdig_text(row, ["APP97 Pitcher GameLog Fetch Status"]).upper(),
+    )
+    source = _pdig_text(row, ["Winning File K Source", "Active K Pipeline"]).upper()
+
+    if hand not in {"LHP", "RHP"}:
+        issues.append("missing pitcher hand")
+    if hand_warn and hand_warn != "OK":
+        issues.append("opponent K split fallback")
+    if hand == "LHP" and "LHP" not in opp_src:
+        issues.append("LHP pitcher not matched to vs LHP source")
+    if hand == "RHP" and "RHP" not in opp_src:
+        issues.append("RHP pitcher not matched to vs RHP source")
+    if not np.isfinite(opp_k):
+        issues.append("missing opponent vs-hand K%")
+    elif opp_k < 12 or opp_k > 35:
+        cautions.append(f"opponent vs-hand K% outlier {opp_k:.1f}")
+
+    if "MISSING" in app97_pid_src or not app97_pid_src:
+        issues.append("missing verified MLB pitcher id")
+    elif "NAME_SEARCH" in app97_pid_src:
+        cautions.append("pitcher id from name search")
+    if app97_k_warn and app97_k_warn not in {"OK", "NAN"}:
+        cautions.append("pitcher K% warning")
+    if savant_status and savant_status != "SUCCESS":
+        cautions.append("official Savant unavailable")
+    if app97_fetch[0] and app97_fetch[0] != "SUCCESS":
+        cautions.append("MLB season pitcher fetch not success")
+    if source in {"", "NO_WINNING_SOURCE"}:
+        cautions.append("winning-file K source missing")
+
+    if issues:
+        gate = "RED - VERIFY BEFORE USING"
+    elif len(cautions) >= 3:
+        gate = "ORANGE - DATA CAUTION"
+    elif cautions:
+        gate = "YELLOW - MINOR DATA CAUTION"
+    else:
+        gate = "GREEN - DATA VERIFIED"
+
+    return {
+        "Projection Data Gate": gate,
+        "Projection Data Issues": ", ".join(dict.fromkeys(issues)) or "none",
+        "Projection Data Cautions": ", ".join(dict.fromkeys(cautions)) or "none",
+        "Projection Data Version": PROJECTION_DATA_INTEGRITY_VERSION,
+    }
+
+
+def _pdig_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    rows = []
+    for _, rr in out.iterrows():
+        try:
+            rows.append(_pdig_row(rr.to_dict()))
+        except Exception as e:
+            rows.append({
+                "Projection Data Gate": "RED - VERIFY BEFORE USING",
+                "Projection Data Issues": "integrity gate error",
+                "Projection Data Cautions": str(e)[:120],
+                "Projection Data Version": PROJECTION_DATA_INTEGRITY_VERSION,
+            })
+    return pd.concat([out.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
+
+
+_PDIG_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _PDIG_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _pdig_apply(_PDIG_PREV_BUILD_K(board))
+
+
+# =============================================================================
 # APP99 RIGHT-WINS DATA GATE
 # Final audit layer for missing inputs that usually cause losses.
 # It does not overwrite K PROJ. It flags Fire/Lean/Track readiness using:
@@ -41221,6 +41493,9 @@ def _app99_right_wins_row(row):
     csw = _app99_num(_app99_text(row, ["Official Savant CSW%", "Recent CSW%", "CSW%"]), np.nan)
     chase = _app99_num(_app99_text(row, ["Official Savant Chase%", "Recent Chase%", "Chase%"]), np.nan)
     official_k_pct = _app99_num(_app99_text(row, ["Official Savant K%", "APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%"]), np.nan)
+    hand_warning = _app99_text(row, ["Handedness Split Warning"]).upper()
+    data_gate = _app99_text(row, ["Projection Data Gate"]).upper()
+    data_issues = _app99_text(row, ["Projection Data Issues"]).upper()
     if np.isfinite(whiff) and whiff <= 1.0:
         whiff *= 100.0
     if np.isfinite(csw) and csw <= 1.0:
@@ -41241,6 +41516,18 @@ def _app99_right_wins_row(row):
     if not any(x in lineup_status for x in ["CONFIRMED", "ROTO", "ACTUAL"]):
         score -= 14
         missing.append("confirmed lineup")
+    if hand_warning and hand_warning != "OK":
+        score -= 8
+        missing.append("verified LHP/RHP opponent K split")
+        risks.append("handedness split fallback")
+    if "RED" in data_gate:
+        score -= 20
+        risks.append("projection data red gate")
+        if data_issues and data_issues != "NONE":
+            missing.append(data_issues.lower())
+    elif "ORANGE" in data_gate:
+        score -= 10
+        risks.append("projection data caution")
     if k_warning and k_warning not in {"OK", "NAN"}:
         score -= 16
         risks.append("pitcher K% warning")
@@ -41430,12 +41717,15 @@ def _kclean_main_df(df):
             "K Source": _kclean_pick(row, ["Winning File K Source", "Active K Pipeline", "File33 Projection Source"], ""),
             "Sim Side %": _kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %"], ""),
             "Lineup": _kclean_pick(row, ["APP97 Lineup Status", "Lineup", "Projection Source"], ""),
-            "Opp K%": _kclean_pick(row, ["APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used"], ""),
+            "Hand": _kclean_pick(row, ["Pitcher Hand", "Hand", "Throws"], ""),
+            "Opp K%": _kclean_pick(row, ["Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%", "Opponent K% Used"], ""),
+            "Opp K Source": _kclean_pick(row, ["Opponent K% vs Pitcher Hand Source", "Handedness Source"], ""),
             "Pitcher K%": _kclean_pick(row, ["Official Savant K%", "APP97 Live Pitcher K%", "Pitcher K% Used", "Pitcher K%"], ""),
             "Whiff": _kclean_pick(row, ["Official Savant Whiff%", "Whiff%", "APP85 PutAway Rate", "Recent SwStr%"], ""),
             "Savant": _kclean_pick(row, ["Official Savant K Skill Signal", "Official Savant Status"], ""),
             "Win Gate": _kclean_pick(row, ["APP99 Right Wins Gate"], ""),
             "Win Score": _kclean_pick(row, ["APP99 Right Wins Score"], ""),
+            "Data Gate": _kclean_pick(row, ["Projection Data Gate"], ""),
             "Missing": _kclean_pick(row, ["APP99 Missing Data"], ""),
             "Loss Risks": _kclean_pick(row, ["APP99 Loss Risks"], ""),
             "Reason": _kclean_pick(row, ["APP98 Loss Target Reason", "APP97 K Interaction Label", "K Sim Note"], ""),
@@ -41468,20 +41758,79 @@ def _kclean_render_rotowire_status():
         st.info(f"RotoWire diagnostics unavailable: {e}")
 
 
+def _kclean_copy_paste_slate(df, include_thin=False):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+        d = df.copy()
+        if "Line Source" in d.columns:
+            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
+        if d.empty:
+            return ""
+        if "UD/Line" not in d.columns:
+            d["UD/Line"] = d.get("Line")
+        d["UD/Line"] = pd.to_numeric(d["UD/Line"], errors="coerce")
+        d = d[d["UD/Line"].notna()].copy()
+        if "_owp_one_final_row_per_pitcher" in globals():
+            d = _owp_one_final_row_per_pitcher(d)
+
+        lines = []
+        for matchup, group in d.groupby("Matchup", sort=False):
+            block = []
+            for _, rr in group.iterrows():
+                row = rr.to_dict()
+                line = _kclean_num(row.get("UD/Line"), np.nan)
+                proj = _kclean_num(_kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "Winning File K Projection"], ""), np.nan)
+                if not np.isfinite(line) or not np.isfinite(proj):
+                    continue
+                edge = proj - line
+                side = str(_kclean_pick(row, ["Winning File K Side", "APP97 Final Side", "APP88 Final Side"], "")).upper()
+                if side not in {"OVER", "UNDER"}:
+                    side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
+                if side == "PUSH":
+                    if not include_thin:
+                        continue
+                    symbol = "PASS"
+                else:
+                    abs_edge = abs(edge)
+                    if abs_edge < 0.55 and not include_thin:
+                        continue
+                    prefix = "O" if side == "OVER" else "U"
+                    symbol = f"🔥 {prefix}" if abs_edge >= 1.00 else (f"⚠️ {prefix}" if abs_edge < 0.65 else prefix)
+                ip = _kclean_num(_kclean_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection"], ""), np.nan)
+                ip_text = "—" if not np.isfinite(ip) else f"{ip:.2f}"
+                block.append(f"• {row.get('Pitcher')} — {symbol} {line:.1f} — {proj:.2f} K — IP {ip_text}")
+            if block:
+                lines.append(str(matchup))
+                lines.extend(block)
+                lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as e:
+        return f"Slate builder unavailable: {e}"
+
+
 def render_kproj_tab(board):
     st.markdown('<div class="section-title-pro">K Upside Board</div>', unsafe_allow_html=True)
-    st.caption("Single clean board. Historical calibration, ensemble, SOS, Monte Carlo, and loss-target outputs are rolled into this table; details are collapsed below.")
-    _kclean_render_rotowire_status()
+    st.caption("Copy/paste slate first. Diagnostics stay collapsed below the board.")
 
     df = build_kproj_table(board)
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        st.info("No K projection rows loaded yet.")
+        st.info("No K projection rows loaded yet. Refresh or load today's pitcher props, then the copy/paste slate will appear here.")
         return
 
     main = _kclean_main_df(df)
     if main.empty:
         st.info("No clean K rows available.")
         return
+
+    slate_text = _kclean_copy_paste_slate(df, include_thin=False)
+    st.subheader("Copy/Paste Slate")
+    if slate_text:
+        st.text_area("Best plays", slate_text, height=320, key="kclean_copy_paste_best")
+    else:
+        st.info("No playable Underdog K rows for the copy/paste slate yet.")
+    with st.expander("Copy/Paste Slate — All Underdog K Rows", expanded=False):
+        st.text_area("All rows", _kclean_copy_paste_slate(df, include_thin=True), height=320, key="kclean_copy_paste_all")
 
     try:
         total = len(main)
@@ -41499,6 +41848,12 @@ def render_kproj_tab(board):
 
     st.dataframe(main, use_container_width=True, hide_index=True)
 
+    with st.expander("Data controls / diagnostics", expanded=False):
+        try:
+            _kreal_render_panel()
+        except Exception as _kreal_e:
+            st.info(f"K/PO real-data override panel unavailable: {_kreal_e}")
+
     with st.expander("Full K audit details", expanded=False):
         cols = [c for c in [
             "Pitcher", "Matchup", "UD/Line", "RAW BASE_K", "APP97 True K Projection",
@@ -41506,6 +41861,11 @@ def render_kproj_tab(board):
             "Winning File K Decision", "Pre-WinningFile K PROJ",
             "File33 Matched K Projection", "File33 Projection Source",
             "App70 Calibrated K PROJ", "Pre-App70 K PROJ",
+            "Pitcher Hand", "Handedness Source", "Opponent K% vs Pitcher Hand",
+            "Opponent K% vs Pitcher Hand Source", "Handedness Split Warning",
+            "Opp K% vs RHP Official", "Opp K% vs LHP Official",
+            "Opp L30 K% vs RHP Official", "Opp L30 K% vs LHP Official",
+            "Projection Data Gate", "Projection Data Issues", "Projection Data Cautions",
             "APP98 Loss Target Projection", "APP98 Loss Target Adjustment", "APP98 Loss Target Reason",
             "K Sim Pick", "K Sim True Prob %", "K Sim Current Side Prob %",
             "APP97 Lineup Status", "APP97 Opponent K Environment", "APP97 Pitcher K% Warning",
@@ -41831,6 +42191,22 @@ def build_projection_health_audit(board=None):
             winning_loaded = int(~src.str.upper().isin(["", "NO_WINNING_SOURCE", "NAN"]).sum())
             source_counts = src.value_counts().head(4).to_dict()
         add("Winning File K Projection Source", f"{winning_loaded}/{total} rows | {source_counts}", "Later current-matchup layers can drift away from the 17-11 / 15-9 slate behavior.", "Use the Winning File K Source column to confirm rows are anchored to File33/Pre-App70/App70 instead of current-only fallback.")
+
+        hand_ok = 0
+        hand_warn = 0
+        if total and "Handedness Split Warning" in kdf.columns:
+            hw = kdf["Handedness Split Warning"].astype(str).str.upper()
+            hand_ok = int(hw.eq("OK").sum())
+            hand_warn = int((~hw.eq("OK")).sum())
+        add("LHP/RHP Matchup K Split", f"{hand_ok}/{total} verified | {hand_warn} fallback warnings", "Using overall opponent K% for a lefty/righty matchup can move K projections and sides the wrong way.", "Check Pitcher Hand, Opp K Source, and Handedness Split Warning on the K board before trusting plays.")
+
+        if total and "Projection Data Gate" in kdf.columns:
+            dg = kdf["Projection Data Gate"].astype(str).str.upper()
+            green = int(dg.str.contains("GREEN", na=False).sum())
+            yellow = int(dg.str.contains("YELLOW", na=False).sum())
+            orange = int(dg.str.contains("ORANGE", na=False).sum())
+            red = int(dg.str.contains("RED", na=False).sum())
+            add("Projection Data Integrity", f"Green {green} | Yellow {yellow} | Orange {orange} | Red {red}", "Wrong pitcher IDs, missing hand splits, or failed official fetches create wrong projections even when the formula is good.", "Use Data Gate and Projection Data Issues; treat RED rows as verify/pass until the source is fixed.")
 
         app98_adjusted = 0
         if total and "APP98 Loss Target Adjustment" in kdf.columns:
