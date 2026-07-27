@@ -40510,6 +40510,31 @@ def _fi_pick_class(pick):
     return "track"
 
 
+def _visual_team_logo_html(abbr, img_cls="team-logo", fallback_cls="team-logo-fallback"):
+    abbr = str(abbr or "").upper().strip()
+    if not abbr or abbr == "—":
+        return f'<div class="{fallback_cls}">—</div>'
+    try:
+        url = ml_team_logo_url(abbr) if "ml_team_logo_url" in globals() else ""
+    except Exception:
+        url = ""
+    if url:
+        return f'<img class="{img_cls}" src="{html.escape(str(url))}" alt="{html.escape(abbr)}">'
+    return f'<div class="{fallback_cls}">{html.escape(abbr[:3])}</div>'
+
+
+def _visual_matchup_teams(matchup):
+    txt = str(matchup or "")
+    if "@" in txt:
+        a, h = txt.split("@", 1)
+        return a.strip().upper(), h.strip().upper()
+    low = txt.lower()
+    if " vs " in low:
+        idx = low.find(" vs ")
+        return txt[:idx].strip().upper(), txt[idx + 4:].strip().upper()
+    return "", ""
+
+
 def _render_first_inning_pitch_count_cards(df, max_cards=18):
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return
@@ -40530,6 +40555,7 @@ def _render_first_inning_pitch_count_cards(df, max_cards=18):
             row = rr.to_dict()
             pitcher = _fi_card_safe(row.get("Pitcher"))
             matchup = _fi_card_safe(row.get("Matchup"))
+            away, home = _visual_matchup_teams(matchup)
             pclass = _fi_card_safe(row.get("Pitcher Class") or row.get("Experience Gate"))
             sample = _fi_card_safe(row.get("Sample Class"))
             line_status = str(row.get("Line Status") or "WAITING").upper()
@@ -40552,7 +40578,17 @@ def _render_first_inning_pitch_count_cards(df, max_cards=18):
             side_cls = _fi_pick_class(row.get("Pick"))
             cards.append(f"""
               <article class="fi-card">
-                <div class="fi-head"><div><h3>{pitcher}</h3><p>{matchup}</p></div><span class="{side_cls}">{pick}</span></div>
+                <div class="fi-head">
+                  <div class="fi-title">
+                    <div class="fi-matchup-logos">
+                      <div>{_visual_team_logo_html(away, "fi-team-logo", "fi-team-fallback")}<small>{_fi_card_safe(away)}</small></div>
+                      <em>@</em>
+                      <div>{_visual_team_logo_html(home, "fi-team-logo", "fi-team-fallback")}<small>{_fi_card_safe(home)}</small></div>
+                    </div>
+                    <h3>{pitcher}</h3><p>{matchup}</p>
+                  </div>
+                  <span class="{side_cls}">{pick}</span>
+                </div>
                 <div class="fi-hero"><div><small>Projection</small><b>{proj}</b><em>line {line} · edge {edge}</em></div><div><small>Hit %</small><b>{hit}</b><em>{_fi_card_safe(line_status)}</em></div></div>
                 <div class="fi-grid">
                   <div><small>Median</small><b>{median}</b></div><div><small>P10-P90</small><b>{p1090}</b></div>
@@ -40569,7 +40605,8 @@ def _render_first_inning_pitch_count_cards(df, max_cards=18):
         body{margin:0;background:transparent;color:#eef6ff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
         .fi-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px;padding:2px 0 12px}
         .fi-card{background:linear-gradient(180deg,#111827,#070a11);border:1px solid rgba(37,99,235,.35);border-radius:18px;padding:15px;box-shadow:0 12px 32px rgba(0,0,0,.28)}
-        .fi-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.fi-head h3{margin:0;font-size:1.1rem}.fi-head p{margin:3px 0 0;color:#94a3b8;font-size:.75rem}.fi-head span{border:1px solid #64748b;border-radius:999px;padding:5px 8px;font-size:.72rem;font-weight:900;white-space:nowrap}.fi-head span.over{color:#86efac;border-color:#16a34a}.fi-head span.under{color:#93c5fd;border-color:#2563eb}.fi-head span.track{color:#fde68a;border-color:#ca8a04}
+        .fi-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.fi-title{min-width:0}.fi-head h3{margin:7px 0 0;font-size:1.1rem}.fi-head p{margin:3px 0 0;color:#94a3b8;font-size:.75rem}.fi-head span{border:1px solid #64748b;border-radius:999px;padding:5px 8px;font-size:.72rem;font-weight:900;white-space:nowrap}.fi-head span.over{color:#86efac;border-color:#16a34a}.fi-head span.under{color:#93c5fd;border-color:#2563eb}.fi-head span.track{color:#fde68a;border-color:#ca8a04}
+        .fi-matchup-logos{display:grid;grid-template-columns:1fr 22px 1fr;gap:8px;align-items:center;max-width:190px}.fi-matchup-logos>div{display:grid;justify-items:center;gap:3px}.fi-matchup-logos em{font-style:normal;color:#445066;text-align:center;font-weight:900}.fi-matchup-logos small{color:#dbeafe;font-weight:900;font-size:.62rem}.fi-team-logo{width:38px;height:38px;object-fit:contain;filter:drop-shadow(0 0 8px rgba(255,255,255,.18))}.fi-team-fallback{display:flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;background:#111a2d;border:1px solid #293e68;font-weight:900;color:#fff;font-size:.78rem}
         .fi-hero{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:12px 0}.fi-hero>div,.fi-grid>div{background:#0b1220;border:1px solid rgba(148,163,184,.15);border-radius:12px;padding:10px}.fi-hero small,.fi-grid small{display:block;color:#8b97aa;text-transform:uppercase;font-size:.64rem;font-weight:900}.fi-hero b{display:block;font-size:2.1rem;color:#38bdf8;line-height:1;margin:4px 0}.fi-hero em{font-style:normal;color:#cbd5e1;font-size:.72rem}
         .fi-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.fi-grid b{display:block;font-size:1rem;margin-top:3px}.fi-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}.fi-tags span{font-size:.66rem;font-weight:800;color:#bae6fd;background:rgba(14,165,233,.1);border:1px solid rgba(14,165,233,.24);border-radius:999px;padding:5px 7px}
         @media(max-width:560px){.fi-wrap{grid-template-columns:1fr}.fi-grid{grid-template-columns:repeat(2,1fr)}}
@@ -40642,21 +40679,26 @@ def _mlui_row_card(row):
     away_sp = row.get("Away SP") or "—"
     home_sp = row.get("Home SP") or "—"
     badge_class = "elite" if "ELITE" in str(rating).upper() else "high" if "HIGH" in str(rating).upper() else "medium" if "MEDIUM" in str(rating).upper() else "track"
+    rating_label = str(rating or "TRACK")
+    if rating_label and not rating_label.strip().startswith(("⚡", "🔥")):
+        rating_label = f"⚡ {rating_label}"
+    away_logo = _visual_team_logo_html(away, "ml-logo-img", "ml-logo-fallback")
+    home_logo = _visual_team_logo_html(home, "ml-logo-img", "ml-logo-fallback")
     return f"""
     <div class="ml-edge-card">
       <div class="ml-card-top">
         <div class="ml-game-time">{_mlui_safe(row.get('Start Time') or row.get('Game Time') or '')}</div>
-        <div class="ml-rating {badge_class}">{_mlui_safe(rating)}</div>
+        <div class="ml-rating {badge_class}">{_mlui_safe(rating_label)}</div>
       </div>
       <div class="ml-teams">
         <div class="ml-team">
-          <div class="ml-logo">{_mlui_safe(away[:3])}</div>
+          {away_logo}
           <div class="ml-team-name">{_mlui_safe(away)}</div>
           <div class="ml-sp">{_mlui_safe(away_sp)}</div>
         </div>
         <div class="ml-vs">vs</div>
         <div class="ml-team right">
-          <div class="ml-logo">{_mlui_safe(home[:3])}</div>
+          {home_logo}
           <div class="ml-team-name">{_mlui_safe(home)}</div>
           <div class="ml-sp">{_mlui_safe(home_sp)}</div>
         </div>
@@ -40671,7 +40713,7 @@ def _mlui_row_card(row):
         <div><span>{_mlui_safe(home)}</span><strong>{_mlui_safe(home_runs)}</strong><small></small></div>
       </div>
       <div class="ml-best">
-        <span>BEST PLAY</span>
+        <span>⚡ BEST PLAY</span>
         <strong>{_mlui_safe(best)}</strong>
         <b>{_mlui_safe(best_prob)}%</b>
       </div>
@@ -40697,7 +40739,7 @@ def _render_moneyline_visual_cards(df, max_cards=12):
     .ml-rating{font-size:12px;font-weight:800;border-radius:999px;padding:5px 10px;border:1px solid #385bff;color:#a9c2ff;background:#101a38}
     .ml-rating.elite{border-color:#f2d24b;color:#ffe982;background:#352b07}.ml-rating.high{border-color:#5b80ff}.ml-rating.medium{border-color:#2d80ff;color:#8fc3ff}.ml-rating.track{border-color:#42506a;color:#c5ccda}
     .ml-teams{display:grid;grid-template-columns:1fr 34px 1fr;align-items:center;gap:8px}
-    .ml-team{text-align:left}.ml-team.right{text-align:right}.ml-logo{display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;border-radius:50%;background:#111a2d;border:1px solid #293e68;font-weight:900;color:#ffffff}
+    .ml-team{text-align:left}.ml-team.right{text-align:right}.ml-logo-img{width:64px;height:64px;object-fit:contain;filter:drop-shadow(0 0 10px rgba(255,255,255,.18))}.ml-logo-fallback{display:inline-flex;align-items:center;justify-content:center;width:58px;height:58px;border-radius:50%;background:#111a2d;border:1px solid #293e68;font-weight:900;color:#ffffff}
     .ml-team-name{font-weight:800;font-size:15px;margin-top:7px}.ml-sp{font-size:11px;color:#8c98ad;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ml-vs{text-align:center;color:#364056;font-size:11px}
     .ml-win-row{display:grid;grid-template-columns:42px 1fr 42px;gap:8px;align-items:center;margin:13px 0;color:#d8e5ff;font-weight:700;font-size:13px}.ml-win-row span:last-child{text-align:right}
     .ml-winbar{height:4px;border-radius:999px;display:flex;overflow:hidden;background:#1b2232}.ml-winbar .away{background:#245cff}.ml-winbar .home{background:#ff335f}
