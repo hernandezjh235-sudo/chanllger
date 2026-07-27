@@ -41145,6 +41145,10 @@ DATA_PACK_FILE_MAP = {
     "confirmed_lineups_daily_template.csv": "confirmed_lineups_daily.csv",
     "savant_pitcher_stats.csv": "savant_pitcher_stats.csv",
     "savant_pitcher_stats_template.csv": "savant_pitcher_stats.csv",
+    "pitch_mix_matchups.csv": "pitch_mix_matchups.csv",
+    "pitch_mix_matchups_template.csv": "pitch_mix_matchups.csv",
+    "savant_pitch_level_heatmap_foul.csv": "savant_pitch_level_heatmap_foul.csv",
+    "savant_pitch_level_heatmap_foul_template.csv": "savant_pitch_level_heatmap_foul.csv",
     "graded_history.csv": "graded_history.csv",
     "graded_history_template.csv": "graded_history.csv",
 }
@@ -41266,7 +41270,7 @@ def render_data_pack_installer_panel():
     st.markdown('<div class="section-title-pro">Starter Data Pack Installer</div>', unsafe_allow_html=True)
     st.caption("Upload the filled CSVs here. Header-only templates are rejected so they cannot hurt projections. Installed files are support-first unless the app finds clean matching rows.")
     with st.expander("Upload filled starter CSVs", expanded=False):
-        st.write("Accepted: Pitch.csv, confirmed_lineups_daily.csv, savant_pitcher_stats.csv, graded_history.csv. Template filenames are accepted only after they contain real rows.")
+        st.write("Accepted: Pitch.csv, confirmed_lineups_daily.csv, savant_pitcher_stats.csv, pitch_mix_matchups.csv, savant_pitch_level_heatmap_foul.csv, graded_history.csv. Template filenames are accepted only after they contain real rows.")
         ups = st.file_uploader(
             "Upload filled data-pack CSVs",
             type=["csv"],
@@ -41286,6 +41290,7 @@ def _hadb_data_freshness_rows():
     today = pd.Timestamp(datetime.now().date())
     for name in [
         "Pitch.csv", "confirmed_lineups_daily.csv", "savant_pitcher_stats.csv",
+        "pitch_mix_matchups.csv", "savant_pitch_level_heatmap_foul.csv",
         "Batter.csv", "TeamOffense.csv", "Bullpen.csv", "graded_history.csv"
     ]:
         df, path = _hadb_read_csv(name)
