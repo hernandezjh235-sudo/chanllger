@@ -21197,6 +21197,20 @@ def _biq_is_best_play_candidate(row):
     except Exception:
         return False
 
+
+def _biq_is_watchlist_candidate(row):
+    """Near-best IQ watchlist. Read-only helper for finding wins without moving picks."""
+    try:
+        if str(row.get("Module", "")).upper() != "K UPSIDE":
+            return False
+        pick = str(row.get("Model Pick", "")).upper()
+        if not pick or "NO LINE" in pick or "AVOID" in pick:
+            return False
+        score = _iq_num(row.get("Baseball IQ Score"), 0)
+        return 54 <= score < 60
+    except Exception:
+        return False
+
 def _biq_recent_grade_summary():
     """Small after-grading summary for Baseball IQ. Read-only, no projection impact."""
     try:
@@ -21239,8 +21253,24 @@ def render_baseball_iq_tab(board):
     if best is None or best.empty:
         st.warning("No clean Baseball IQ best-play candidates right now. That means the board has no K play clearing the strict IQ filter yet.")
     else:
-        show_cols = [c for c in ["Player", "Matchup", "Projection", "Line", "Model Pick", "Baseball IQ Score", "IQ Label", "Main Reasons"] if c in best.columns]
+        show_cols = [c for c in [
+            "Player", "Matchup", "Projection", "Line", "Model Pick", "Baseball IQ Score",
+            "IQ Label", "Main Reasons", "Risk Reasons", "Data Quality", "Volume Signal",
+            "Pitch Mix Signal", "Recent Form Signal", "Bullpen Signal"
+        ] if c in best.columns]
         st.dataframe(best[show_cols], use_container_width=True, hide_index=True)
+
+    watch = kdf[kdf.apply(_biq_is_watchlist_candidate, axis=1)].sort_values("Baseball IQ Score", ascending=False).head(12) if not kdf.empty else pd.DataFrame()
+    with st.expander("IQ Watchlist — close but not best plays", expanded=False):
+        st.caption("Advisory only. These are near the filter, useful for review, but they do not move the official pick.")
+        if watch is None or watch.empty:
+            st.info("No near-best K plays right now.")
+        else:
+            show_cols = [c for c in [
+                "Player", "Matchup", "Projection", "Line", "Model Pick", "Baseball IQ Score",
+                "IQ Label", "Main Reasons", "Risk Reasons"
+            ] if c in watch.columns]
+            st.dataframe(watch[show_cols], use_container_width=True, hide_index=True)
 
     st.markdown("#### 📚 After-Grading Read")
     st.info(summary.get("note", "No graded samples yet.") + " Baseball IQ is advisory only and will not move projections.")
@@ -38261,7 +38291,13 @@ def build_kproj_table(board):
 
 
 def _po_official_selector(row):
-    side = str(row.get("Beta Lean") or "").upper()
+    side_raw = str(row.get("Beta Lean") or "").upper()
+    if "OVER" in side_raw or side_raw.strip().startswith("O"):
+        side = "OVER"
+    elif "UNDER" in side_raw or side_raw.strip().startswith("U"):
+        side = "UNDER"
+    else:
+        side = side_raw
     edge = abs(_tpl_num(row.get("Beta Edge"), 0) or 0)
     proj = _tpl_num(row.get("Beta Projection"), None)
     line = _tpl_num(row.get("UD Line"), None)
@@ -40446,6 +40482,105 @@ def render_pitcher_fs_tab(board=None):
     except Exception: pass
 
 
+def _fi_card_safe(value):
+    try:
+        return html.escape(str(value if value not in (None, "", "nan", "NaN") else "—"))
+    except Exception:
+        return "—"
+
+
+def _fi_card_num(row, keys, decimals=1, default="—"):
+    try:
+        for key in keys:
+            if key in row and row.get(key) not in (None, "", "—", "nan", "NaN"):
+                v = float(str(row.get(key)).replace("%", "").replace(",", "").strip())
+                if np.isfinite(v):
+                    return f"{v:.{int(decimals)}f}"
+    except Exception:
+        pass
+    return default
+
+
+def _fi_pick_class(pick):
+    t = str(pick or "").upper()
+    if "HIGHER" in t or "OVER" in t or "🔥" in t:
+        return "over"
+    if "LOWER" in t or "UNDER" in t:
+        return "under"
+    return "track"
+
+
+def _render_first_inning_pitch_count_cards(df, max_cards=18):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    import streamlit.components.v1 as components
+    try:
+        d = df.copy()
+        if "Line Status" in d.columns:
+            d["_line_sort"] = d["Line Status"].astype(str).str.upper().eq("FOUND").astype(int)
+        else:
+            d["_line_sort"] = 0
+        if "Hit %" in d.columns:
+            d["_prob_sort"] = pd.to_numeric(d["Hit %"], errors="coerce").fillna(0)
+        else:
+            d["_prob_sort"] = 0
+        d = d.sort_values(["_line_sort", "_prob_sort"], ascending=[False, False]).head(int(max_cards))
+        cards = []
+        for _, rr in d.iterrows():
+            row = rr.to_dict()
+            pitcher = _fi_card_safe(row.get("Pitcher"))
+            matchup = _fi_card_safe(row.get("Matchup"))
+            pclass = _fi_card_safe(row.get("Pitcher Class") or row.get("Experience Gate"))
+            sample = _fi_card_safe(row.get("Sample Class"))
+            line_status = str(row.get("Line Status") or "WAITING").upper()
+            line = _fi_card_num(row, ["UD Line", "Line"], 1, "—")
+            proj = _fi_card_num(row, ["Projection"], 1, "—")
+            edge = _fi_card_num(row, ["Edge"], 2, "—")
+            hit = _fi_card_num(row, ["Hit %", "Confidence %"], 1, "—")
+            median = _fi_card_num(row, ["Median"], 1, "—")
+            p1090 = _fi_card_safe(row.get("P10-P90"))
+            bf = _fi_card_num(row, ["Expected BF 1st"], 1, "—")
+            ppa = _fi_card_num(row, ["Expected Pitches/PA"], 2, "—")
+            clean = _fi_card_num(row, ["1-2-3 Inning %"], 1, "—")
+            l5 = _fi_card_num(row, ["L5 FI Avg"], 1, "—")
+            l10 = _fi_card_num(row, ["L10 FI Avg"], 1, "—")
+            season = _fi_card_num(row, ["Season FI Avg"], 1, "—")
+            samples = _fi_card_num(row, ["FI Samples"], 0, "—")
+            top4 = _fi_card_num(row, ["Top4 K%"], 1, "—")
+            lineup = _fi_card_safe(row.get("Lineup Confirmed"))
+            pick = _fi_card_safe(row.get("Pick") or ("WAITING FOR LINE" if line_status != "FOUND" else "TRACK"))
+            side_cls = _fi_pick_class(row.get("Pick"))
+            cards.append(f"""
+              <article class="fi-card">
+                <div class="fi-head"><div><h3>{pitcher}</h3><p>{matchup}</p></div><span class="{side_cls}">{pick}</span></div>
+                <div class="fi-hero"><div><small>Projection</small><b>{proj}</b><em>line {line} · edge {edge}</em></div><div><small>Hit %</small><b>{hit}</b><em>{_fi_card_safe(line_status)}</em></div></div>
+                <div class="fi-grid">
+                  <div><small>Median</small><b>{median}</b></div><div><small>P10-P90</small><b>{p1090}</b></div>
+                  <div><small>Exp BF</small><b>{bf}</b></div><div><small>P/PA</small><b>{ppa}</b></div>
+                  <div><small>1-2-3%</small><b>{clean}</b></div><div><small>Top4 K%</small><b>{top4}</b></div>
+                  <div><small>L5</small><b>{l5}</b></div><div><small>L10</small><b>{l10}</b></div>
+                  <div><small>Season</small><b>{season}</b></div><div><small>Samples</small><b>{samples}</b></div>
+                </div>
+                <div class="fi-tags"><span>{pclass}</span><span>{sample}</span><span>{lineup}</span></div>
+              </article>
+            """)
+        html_doc = """
+        <style>
+        body{margin:0;background:transparent;color:#eef6ff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        .fi-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px;padding:2px 0 12px}
+        .fi-card{background:linear-gradient(180deg,#111827,#070a11);border:1px solid rgba(37,99,235,.35);border-radius:18px;padding:15px;box-shadow:0 12px 32px rgba(0,0,0,.28)}
+        .fi-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.fi-head h3{margin:0;font-size:1.1rem}.fi-head p{margin:3px 0 0;color:#94a3b8;font-size:.75rem}.fi-head span{border:1px solid #64748b;border-radius:999px;padding:5px 8px;font-size:.72rem;font-weight:900;white-space:nowrap}.fi-head span.over{color:#86efac;border-color:#16a34a}.fi-head span.under{color:#93c5fd;border-color:#2563eb}.fi-head span.track{color:#fde68a;border-color:#ca8a04}
+        .fi-hero{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin:12px 0}.fi-hero>div,.fi-grid>div{background:#0b1220;border:1px solid rgba(148,163,184,.15);border-radius:12px;padding:10px}.fi-hero small,.fi-grid small{display:block;color:#8b97aa;text-transform:uppercase;font-size:.64rem;font-weight:900}.fi-hero b{display:block;font-size:2.1rem;color:#38bdf8;line-height:1;margin:4px 0}.fi-hero em{font-style:normal;color:#cbd5e1;font-size:.72rem}
+        .fi-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.fi-grid b{display:block;font-size:1rem;margin-top:3px}.fi-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}.fi-tags span{font-size:.66rem;font-weight:800;color:#bae6fd;background:rgba(14,165,233,.1);border:1px solid rgba(14,165,233,.24);border-radius:999px;padding:5px 7px}
+        @media(max-width:560px){.fi-wrap{grid-template-columns:1fr}.fi-grid{grid-template-columns:repeat(2,1fr)}}
+        </style>
+        <div class="fi-wrap">
+        """ + "\n".join(cards) + "</div>"
+        components.html(html_doc, height=max(700, min(18000, 430 * max(1, len(cards)))), scrolling=False)
+    except Exception as e:
+        st.info(f"1st inning pitch-count cards unavailable: {e}")
+
+
 # Replace FI renderer so the new classification is visible in the main table.
 def render_first_inning_pitch_count_tab(board):
     st.markdown('<div class="section-title-pro">⚾ 1st Inning Pitch Count</div>', unsafe_allow_html=True)
@@ -40459,6 +40594,8 @@ def render_first_inning_pitch_count_tab(board):
     c1,c2,c3=st.columns(3); c1.metric("Pitchers",len(df)); c2.metric("UD FI Lines",found); c3.metric("Model Plays",plays)
     if st.button("💾 Save 1st Inning Official Board", key="save_fi_pc_board", use_container_width=True):
         ok,msg=_beta_save_official_board(df,"FI_PITCHES"); (st.success if ok else st.warning)(msg)
+    st.markdown("### 1st Inning Pitch Count Cards")
+    _render_first_inning_pitch_count_cards(df)
     cols=[c for c in ["Pitcher","Matchup","Pitcher Class","Sample Class","Experience Gate","UD Line","Projection","Pick","Edge","Hit %","Median","P10-P90","Expected BF 1st","Expected Pitches/PA","1-2-3 Inning %","L5 FI Avg","L10 FI Avg","Season FI Avg","FI Samples","Top4 K%","Lineup Confirmed","FI Experience Confidence","FI Experience-Adjusted Confidence","Line Status"] if c in df.columns]
     st.dataframe(df[cols],use_container_width=True,hide_index=True)
     with st.expander("1st Inning Model Debug",expanded=False): st.dataframe(df,use_container_width=True,hide_index=True)
@@ -40549,8 +40686,10 @@ def _mlui_row_card(row):
 def _render_moneyline_visual_cards(df, max_cards=12):
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return
-    st.markdown("""
+    import streamlit.components.v1 as components
+    css = """
     <style>
+    body{margin:0;background:transparent}
     .ml-card-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px;margin:12px 0 18px}
     .ml-edge-card{background:#070b14;border:1px solid #16335f;border-radius:18px;padding:16px;color:#eaf2ff;box-shadow:0 0 18px rgba(40,95,190,.18)}
     .ml-card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
@@ -40566,14 +40705,15 @@ def _render_moneyline_visual_cards(df, max_cards=12):
     .ml-best{border:1px solid #1c62be;border-radius:14px;padding:12px;display:grid;grid-template-columns:1fr auto;gap:4px;align-items:end;background:#080e1d}.ml-best span{grid-column:1/3;color:#7f8da5;font-size:10px;font-weight:800;letter-spacing:.08em}.ml-best strong{font-size:25px}.ml-best b{font-size:24px;color:#f2f6ff}
     .ml-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.ml-mini-grid div{border:1px solid #193e78;border-radius:12px;padding:10px;background:#0b1120}.ml-mini-grid strong{display:block;font-size:13px}.ml-mini-grid span{font-size:12px;color:#9db9e8}
     </style>
-    """, unsafe_allow_html=True)
+    """
     try:
         d = df.copy()
         if "ML Card Rating Score" in d.columns:
             d["_sort"] = pd.to_numeric(d["ML Card Rating Score"], errors="coerce").fillna(-999)
             d = d.sort_values("_sort", ascending=False).drop(columns=["_sort"])
         cards = "\n".join(_mlui_row_card(r) for _, r in d.head(int(max_cards)).iterrows())
-        st.markdown(f'<div class="ml-card-wrap">{cards}</div>', unsafe_allow_html=True)
+        html_doc = f"{css}<div class=\"ml-card-wrap\">{cards}</div>"
+        components.html(html_doc, height=max(620, min(12000, 390 * max(1, min(int(max_cards), len(d))))), scrolling=False)
     except Exception as e:
         st.info(f"Moneyline visual cards unavailable: {e}")
 
@@ -40997,6 +41137,17 @@ def render_moneyline_edge_tab(board, dates=None):
 
 
 HISTORICAL_ACTUALS_DB_VERSION = "HISTORICAL_ACTUALS_POST_SLATE_CALIBRATION_2026_07_26"
+DATA_PACK_INSTALLER_VERSION = "STARTER_DATA_PACK_INSTALLER_2026_07_27"
+DATA_PACK_FILE_MAP = {
+    "Pitch.csv": "Pitch.csv",
+    "Pitch_template.csv": "Pitch.csv",
+    "confirmed_lineups_daily.csv": "confirmed_lineups_daily.csv",
+    "confirmed_lineups_daily_template.csv": "confirmed_lineups_daily.csv",
+    "savant_pitcher_stats.csv": "savant_pitcher_stats.csv",
+    "savant_pitcher_stats_template.csv": "savant_pitcher_stats.csv",
+    "graded_history.csv": "graded_history.csv",
+    "graded_history_template.csv": "graded_history.csv",
+}
 
 
 def _hadb_num(value, default=np.nan):
@@ -41050,10 +41201,93 @@ def _hadb_read_csv(name):
     return pd.DataFrame(), ""
 
 
+def _data_pack_target_dirs():
+    dirs = []
+    for base in _hadb_learning_dirs():
+        try:
+            dirs.append(Path(base))
+        except Exception:
+            pass
+    out = []
+    seen = set()
+    for d in dirs:
+        s = str(d.resolve() if d.exists() else d)
+        if s not in seen:
+            seen.add(s)
+            out.append(d)
+    return out
+
+
+def _data_pack_is_template_only(df):
+    try:
+        return df is None or not isinstance(df, pd.DataFrame) or df.empty
+    except Exception:
+        return True
+
+
+def _data_pack_install(uploaded_files):
+    status = []
+    if not uploaded_files:
+        return status
+    for up in uploaded_files:
+        original_name = str(getattr(up, "name", "") or "").split("/")[-1]
+        target_name = DATA_PACK_FILE_MAP.get(original_name)
+        if not target_name:
+            status.append({"File": original_name, "Saved As": "", "Rows": 0, "Status": "SKIPPED", "Note": "not one of the starter data-pack files"})
+            continue
+        try:
+            df = pd.read_csv(up)
+        except Exception as e:
+            status.append({"File": original_name, "Saved As": target_name, "Rows": 0, "Status": "ERROR", "Note": str(e)[:140]})
+            continue
+        if _data_pack_is_template_only(df):
+            status.append({"File": original_name, "Saved As": target_name, "Rows": 0, "Status": "TEMPLATE_ONLY", "Note": "header-only template was not installed"})
+            continue
+        saved = []
+        for d in _data_pack_target_dirs():
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                out_path = d / target_name
+                df.to_csv(out_path, index=False)
+                saved.append(str(out_path))
+            except Exception:
+                continue
+        status.append({
+            "File": original_name,
+            "Saved As": target_name,
+            "Rows": len(df),
+            "Status": "INSTALLED" if saved else "NOT_SAVED",
+            "Note": "; ".join(saved[:3]) if saved else "no writable learning_data target",
+        })
+    return status
+
+
+def render_data_pack_installer_panel():
+    st.markdown('<div class="section-title-pro">Starter Data Pack Installer</div>', unsafe_allow_html=True)
+    st.caption("Upload the filled CSVs here. Header-only templates are rejected so they cannot hurt projections. Installed files are support-first unless the app finds clean matching rows.")
+    with st.expander("Upload filled starter CSVs", expanded=False):
+        st.write("Accepted: Pitch.csv, confirmed_lineups_daily.csv, savant_pitcher_stats.csv, graded_history.csv. Template filenames are accepted only after they contain real rows.")
+        ups = st.file_uploader(
+            "Upload filled data-pack CSVs",
+            type=["csv"],
+            accept_multiple_files=True,
+            key="starter_data_pack_uploads",
+        )
+        if st.button("Install uploaded CSVs", key="starter_data_pack_install_btn"):
+            result = _data_pack_install(ups)
+            if result:
+                st.dataframe(pd.DataFrame(result), use_container_width=True, hide_index=True)
+            else:
+                st.info("No files selected.")
+
+
 def _hadb_data_freshness_rows():
     rows = []
     today = pd.Timestamp(datetime.now().date())
-    for name in ["Pitch.csv", "Batter.csv", "TeamOffense.csv", "Bullpen.csv", "graded_history.csv"]:
+    for name in [
+        "Pitch.csv", "confirmed_lineups_daily.csv", "savant_pitcher_stats.csv",
+        "Batter.csv", "TeamOffense.csv", "Bullpen.csv", "graded_history.csv"
+    ]:
         df, path = _hadb_read_csv(name)
         row = {"File": name, "Rows": len(df) if isinstance(df, pd.DataFrame) else 0, "Path": path or "missing"}
         if df is None or df.empty:
@@ -41356,6 +41590,7 @@ def build_post_slate_calibration_report(actuals=None):
 def render_historical_actuals_calibration_panel():
     st.markdown('<div class="section-title-pro">Historical Actuals / Post-Slate Calibration</div>', unsafe_allow_html=True)
     st.caption("Support-only. This normalizes graded K/PO/ML/cover/score results and shows which buckets or flags helped after the slate.")
+    render_data_pack_installer_panel()
     render_learning_data_freshness_panel()
     actuals = load_historical_actuals_database()
     sources = st.session_state.get("historical_actuals_sources", [])
@@ -43790,7 +44025,12 @@ def _kcard_lineup_html(rows):
         batter = html.escape(str(r.get("Batter") or r.get("Player") or r.get("Name") or ""))
         hand = html.escape(str(r.get("Hand") or r.get("Bats") or ""))
         used = _kclean_fmt(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), 1)
-        split = _kclean_fmt(r.get("Split K%") if r.get("Split K%") is not None else r.get("K% vs Hand"), 1)
+        split_raw = r.get("Split K%") if r.get("Split K%") is not None else r.get("K% vs Hand")
+        if split_raw in (None, "", "—", "-", "nan", "NaN"):
+            split_raw = r.get("K% vs RHP") if str(r.get("Pitcher Hand") or "").upper().startswith("R") else r.get("K% vs LHP") if str(r.get("Pitcher Hand") or "").upper().startswith("L") else None
+        if split_raw in (None, "", "—", "-", "nan", "NaN"):
+            split_raw = r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used")
+        split = _kclean_fmt(split_raw, 1)
         season = _kclean_fmt(r.get("Season K%") if r.get("Season K%") is not None else r.get("K%"), 1)
         src = html.escape(str(r.get("K Source") or r.get("Lineup Source") or "")[:34])
         val = _kclean_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan)
@@ -44890,7 +45130,16 @@ def _po_render_player_cards(df, board=None, limit=None):
                 _po_card_chip("Hook", _po_card_num(row, ["Recent Hook Rate"], 0)),
                 _po_card_chip("Deep", _po_card_num(row, ["Deep Start Rate"], 0)),
                 _po_card_chip("P/IP", _po_card_num(row, ["Pitch Efficiency P/IP"], 1)),
+                _po_card_chip("P/BF", _po_card_num(row, ["Pitch Efficiency P/BF", "PO Fill P/BF"], 2)),
+                _po_card_chip("L3 PC", _po_card_num(row, ["Pitch Count Avg L3", "PO Fill Pitch Count L3"], 1)),
+                _po_card_chip("L5 PC", _po_card_num(row, ["Pitch Count Avg L5", "PO Fill Pitch Count L5"], 1)),
+                _po_card_chip("L10 PC", _po_card_num(row, ["Pitch Count Avg L10", "PO Fill Pitch Count L10"], 1)),
+                _po_card_chip("Last PC", _po_card_num(row, ["Last Start Pitch Count", "PO Fill Last Pitch Count"], 0)),
+                _po_card_chip("Max PC", _po_card_num(row, ["Max Pitch Count L10", "PO Fill Max Pitch Count L10"], 0)),
+                _po_card_chip("Season PC", _po_card_num(row, ["Season Avg Pitch Count", "PO Fill Season Pitch Count Avg"], 1)),
                 _po_card_chip("Damage", _po_cal_txt(row, ["Damage Risk Label"], "—")),
+                _po_card_chip("Sample", _po_card_num(row, ["PO Fill Sample"], 0)),
+                _po_card_chip("Workload", _po_card_num(row, ["PO Fill Workload Score"], 0)),
                 _po_card_chip("Stuff+", _po_card_num(row, ["Stuff+", "Stuff Plus", "botStf", "PitchingBot Stuff"], 0)),
                 _po_card_chip("Heart", _po_card_num(row, ["Heart Zone%", "Heart%", "Meatball%"], 1)),
                 _po_card_chip("Foul", _po_card_num(row, ["Foul%", "Foul Ball%", "Foul/PA"], 1)),
@@ -44902,6 +45151,9 @@ def _po_render_player_cards(df, board=None, limit=None):
                 f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Pitch Efficiency Signal'], 'EFF'))}</span>",
                 f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Damage Signal'], 'DAMAGE'))}</span>",
                 f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Role/Sample Signal'], 'ROLE'))}</span>",
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Pitch Count Signal'], 'PC'))}</span>",
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Role/Pitch Limit Signal'], 'LIMIT'))}</span>",
+                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Bullpen Leash Signal'], 'BULLPEN'))}</span>",
             ])
             cards.append(f"""
               <article class="poc-card">
@@ -44972,8 +45224,17 @@ def render_beta_pitching_outs_tab(board):
                 "PO BF Signal", "PO Leash/Hook Signal", "PO Pitch Efficiency Signal",
                 "PO Damage Signal", "PO Role/Sample Signal", "PO Confidence Signal",
                 "Beta BF", "Recent Hook Rate", "Deep Start Rate", "Pitch Efficiency P/IP",
+                "Pitch Efficiency P/BF", "Pitch Count Avg L3", "Pitch Count Avg L5",
+                "Pitch Count Avg L10", "Season Avg Pitch Count", "Last Start Pitch Count",
+                "Max Pitch Count L10", "Pitch Count Trend", "PO Pitch Count Signal",
+                "PO Efficiency Signal", "PO Leash Signal", "PO Role/Pitch Limit Signal",
+                "PO Bullpen Leash Signal",
                 "Damage Risk Label", "IP Confidence", "PO History Sample", "PO History Avg Error",
-                "PO History Loss Pattern", "PO Calibration Notes", "PO Calibration Version"
+                "PO History Loss Pattern", "PO Fill Sample", "PO Fill Last Start IP",
+                "PO Fill Last Start BF", "PO Fill Days Since Last Start",
+                "PO Fill Workload Score", "PO Fill Source",
+                "PO Stuff+ Need", "PO Foul Need", "PO Calibration Notes", "PO Calibration Version",
+                "PO Data Fill Version"
             ] if c in df.columns]
             st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
             st.markdown('<div class="section-title-pro">Pitching Outs Player Cards</div>', unsafe_allow_html=True)
@@ -45146,6 +45407,380 @@ def _beta_projection_rows(board, market_kind="OUTS"):
     df = _ADV_PREV_BETA_ROWS(board, market_kind) if _ADV_PREV_BETA_ROWS is not None else pd.DataFrame()
     if str(market_kind).upper() == "OUTS":
         return _adv_apply_daily_feed(df)
+    return df
+
+
+PO_DATA_FILL_VERSION = "PO_WORKLOAD_EFFICIENCY_FILL_2026_07_27"
+
+
+def _po_fill_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _po_fill_text(row, keys, default=""):
+    row = row.to_dict() if isinstance(row, pd.Series) else dict(row or {})
+    low = {str(k).lower(): k for k in row.keys()}
+    for key in keys:
+        if key in row and row.get(key) not in [None, "", "—", "nan", "NaN"]:
+            return row.get(key)
+        lk = low.get(str(key).lower())
+        if lk is not None and row.get(lk) not in [None, "", "—", "nan", "NaN"]:
+            return row.get(lk)
+    return default
+
+
+def _po_fill_norm_name(name):
+    try:
+        if "_tpl_norm_name" in globals():
+            return _tpl_norm_name(name)
+        if "normalize_name" in globals():
+            return normalize_name(name)
+    except Exception:
+        pass
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+
+
+def _po_fill_pitch_logs():
+    try:
+        if "_a70_load_pitch_logs" in globals():
+            df = _a70_load_pitch_logs()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df.copy()
+    except Exception:
+        pass
+    frames = []
+    try:
+        for key in ["pitcher_season_logs", "pitcher_30_day_logs"]:
+            val = st.session_state.get(key)
+            if isinstance(val, pd.DataFrame) and not val.empty:
+                frames.append(val.copy())
+    except Exception:
+        pass
+    try:
+        for path in [
+            Path("learning_data") / "Pitch.csv",
+            Path.cwd() / "learning_data" / "Pitch.csv",
+            Path(__file__).resolve().parent / "learning_data" / "Pitch.csv",
+        ]:
+            if path.exists():
+                frames.append(pd.read_csv(path))
+    except Exception:
+        pass
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    pcol = next((c for c in ["Pitcher", "Player", "Name", "pitcher"] if c in df.columns), None)
+    if pcol:
+        df["_po_fill_name"] = df[pcol].map(_po_fill_norm_name)
+    if "Date" in df.columns:
+        df["_po_fill_date"] = pd.to_datetime(df["Date"], errors="coerce")
+    return df
+
+
+def _po_fill_pitcher_log_profile(pitcher):
+    df = _po_fill_pitch_logs()
+    key = _po_fill_norm_name(pitcher)
+    if df is None or df.empty or not key:
+        return {}
+    if "_po_fill_name" not in df.columns:
+        pcol = next((c for c in ["Pitcher", "Player", "Name", "pitcher"] if c in df.columns), None)
+        if not pcol:
+            return {}
+        df["_po_fill_name"] = df[pcol].map(_po_fill_norm_name)
+    d = df[df["_po_fill_name"].eq(key)].copy()
+    if d.empty:
+        return {}
+    if "_po_fill_date" in d.columns:
+        d = d.sort_values("_po_fill_date", ascending=False)
+    full_d = d.copy()
+    d = d.head(12).copy()
+
+    def col(names):
+        return next((c for c in names if c in d.columns), None)
+
+    ipc = col(["IP", "IP_float", "inningsPitched"])
+    bfc = col(["BF", "battersFaced"])
+    pc = col(["Pitch Count", "Pitches", "numberOfPitches", "pitchCount"])
+    erc = col(["ER", "earnedRuns", "Earned Runs"])
+    hc = col(["H", "hits", "Hits"])
+    bbc = col(["BB", "baseOnBalls", "Walks"])
+    hrc = col(["HR", "homeRuns", "Home Runs"])
+    rc = col(["R", "runs", "Runs"])
+
+    ips, outs, bfs, pitches, ers, hits, bbs, hrs, runs = [], [], [], [], [], [], [], [], []
+    for _, rr in d.iterrows():
+        ip = _po_fill_num(rr.get(ipc), np.nan) if ipc else np.nan
+        if np.isfinite(ip):
+            ips.append(float(ip))
+            whole = int(float(ip))
+            frac = int(round((float(ip) - whole) * 10))
+            outs.append(whole * 3 + (frac if frac in [1, 2] else int(round((float(ip) - whole) * 3))))
+        for arr, c in [(bfs, bfc), (pitches, pc), (ers, erc), (hits, hc), (bbs, bbc), (hrs, hrc), (runs, rc)]:
+            v = _po_fill_num(rr.get(c), np.nan) if c else np.nan
+            if np.isfinite(v):
+                arr.append(float(v))
+
+    def avg(vals, n=None):
+        vals = vals[:n] if n else vals
+        return np.nan if not vals else float(np.mean(vals))
+
+    sample = len(outs)
+    pc_l3 = avg(pitches, 3)
+    pc_l5 = avg(pitches, 5)
+    pc_l10 = avg(pitches, 10)
+    season_pc = np.nan
+    if pc and pc in full_d.columns:
+        season_vals = pd.to_numeric(full_d[pc], errors="coerce").dropna()
+        if not season_vals.empty:
+            season_pc = float(season_vals.mean())
+    last_pc = pitches[0] if pitches else np.nan
+    max_pc_l10 = max(pitches[:10]) if pitches else np.nan
+    last_ip = ips[0] if ips else np.nan
+    last_bf = bfs[0] if bfs else np.nan
+    days_since = np.nan
+    if "_po_fill_date" in d.columns:
+        last_date = pd.to_datetime(d["_po_fill_date"], errors="coerce").dropna()
+        if not last_date.empty:
+            days_since = float((pd.Timestamp.today().normalize() - last_date.max().normalize()).days)
+    hook_rate = np.nan
+    deep_rate = np.nan
+    qs_rate = np.nan
+    if outs:
+        hook_rate = float(np.mean([x <= 14 for x in outs]) * 100.0)
+        deep_rate = float(np.mean([x >= 18 for x in outs]) * 100.0)
+        qs_rate = float(np.mean([x >= 18 for x in outs]) * 100.0)
+    ppi = np.nan
+    if pitches and ips and sum(ips[:len(pitches)]) > 0:
+        ppi = float(sum(pitches[:len(ips)]) / max(sum(ips[:len(pitches)]), 0.1))
+    ppbf = np.nan
+    if pitches and bfs and sum(bfs[:len(pitches)]) > 0:
+        ppbf = float(sum(pitches[:len(bfs)]) / max(sum(bfs[:len(pitches)]), 0.1))
+    bad_games = 0
+    for i in range(max(len(ers), len(hits), len(bbs), len(hrs), len(runs))):
+        er = ers[i] if i < len(ers) else 0
+        h = hits[i] if i < len(hits) else 0
+        bb = bbs[i] if i < len(bbs) else 0
+        hr = hrs[i] if i < len(hrs) else 0
+        r = runs[i] if i < len(runs) else 0
+        if er >= 4 or h >= 8 or bb >= 4 or hr >= 2 or r >= 5:
+            bad_games += 1
+    damage_score = min(100, round((bad_games / max(sample, 1)) * 100.0, 1))
+    damage_label = "HIGH_DAMAGE" if damage_score >= 40 else "MED_DAMAGE" if damage_score >= 20 else "LOW_DAMAGE"
+    heart_proxy = np.nan
+    if np.isfinite(ppbf):
+        heart_proxy = max(20.0, min(55.0, 42.0 - (ppbf - 3.85) * 5.5))
+    if np.isfinite(pc_l5) or np.isfinite(max_pc_l10):
+        if (np.isfinite(pc_l5) and pc_l5 >= 92) or (np.isfinite(max_pc_l10) and max_pc_l10 >= 100):
+            pitch_count_signal = "FULL_LEASH_PITCH_COUNT"
+        elif np.isfinite(pc_l5) and pc_l5 >= 84:
+            pitch_count_signal = "NORMAL_PITCH_COUNT"
+        elif np.isfinite(pc_l5) and pc_l5 < 80:
+            pitch_count_signal = "SHORT_PITCH_COUNT"
+        else:
+            pitch_count_signal = "PITCH_COUNT_NEUTRAL"
+    else:
+        pitch_count_signal = "PITCH_COUNT_UNKNOWN"
+    if np.isfinite(ppi) or np.isfinite(ppbf):
+        if (np.isfinite(ppi) and ppi <= 15.8) and (not np.isfinite(ppbf) or ppbf <= 3.75):
+            efficiency_signal = "EFFICIENT_PITCHER"
+        elif (np.isfinite(ppi) and ppi >= 18.2) or (np.isfinite(ppbf) and ppbf >= 4.10):
+            efficiency_signal = "INEFFICIENT_PITCHER"
+        else:
+            efficiency_signal = "AVG_EFFICIENCY"
+    else:
+        efficiency_signal = "EFFICIENCY_UNKNOWN"
+    if np.isfinite(hook_rate) and hook_rate >= 42:
+        leash_signal = "QUICK_HOOK_RISK"
+    elif np.isfinite(deep_rate) and deep_rate >= 55 and (not np.isfinite(pc_l5) or pc_l5 >= 88):
+        leash_signal = "DEEP_LEASH_SUPPORT"
+    elif np.isfinite(pc_l5) and pc_l5 < 80:
+        leash_signal = "SHORT_LEASH_RISK"
+    else:
+        leash_signal = "LEASH_NEUTRAL"
+    if sample < 3:
+        pitch_limit_signal = "LOW_SAMPLE_PITCH_LIMIT_WATCH"
+    elif np.isfinite(last_pc) and np.isfinite(pc_l5) and last_pc <= 70 and pc_l5 <= 78:
+        pitch_limit_signal = "PITCH_LIMIT_WATCH"
+    elif np.isfinite(days_since) and days_since >= 10:
+        pitch_limit_signal = "REST_GAP_WATCH"
+    else:
+        pitch_limit_signal = "NO_LIMIT_FLAG"
+    workload_score = 50.0
+    if np.isfinite(hook_rate):
+        workload_score -= (hook_rate - 25.0) * 0.45
+    if np.isfinite(deep_rate):
+        workload_score += (deep_rate - 45.0) * 0.35
+    if np.isfinite(ppi):
+        workload_score -= (ppi - 16.8) * 1.7
+    workload_score -= bad_games * 4.0
+    workload_score = round(max(1.0, min(99.0, workload_score)), 1)
+    return {
+        "PO Fill Sample": sample,
+        "PO Fill Outs L5": avg(outs, 5),
+        "PO Fill IP L5": avg(ips, 5),
+        "PO Fill BF L5": avg(bfs, 5),
+        "PO Fill Pitch Count L3": pc_l3,
+        "PO Fill Pitch Count L5": pc_l5,
+        "PO Fill Pitch Count L10": pc_l10,
+        "PO Fill Season Pitch Count Avg": season_pc,
+        "PO Fill Last Pitch Count": last_pc,
+        "PO Fill Max Pitch Count L10": max_pc_l10,
+        "PO Fill Last Start IP": last_ip,
+        "PO Fill Last Start BF": last_bf,
+        "PO Fill Days Since Last Start": days_since,
+        "PO Fill Hook Rate": hook_rate,
+        "PO Fill Deep Start Rate": deep_rate,
+        "PO Fill QS Rate": qs_rate,
+        "PO Fill P/IP": ppi,
+        "PO Fill P/BF": ppbf,
+        "PO Fill Pitch Count Signal": pitch_count_signal,
+        "PO Fill Efficiency Signal": efficiency_signal,
+        "PO Fill Leash Signal": leash_signal,
+        "PO Fill Pitch Limit Signal": pitch_limit_signal,
+        "PO Fill Damage Label": damage_label,
+        "PO Fill Damage Score": damage_score,
+        "PO Fill Heart Proxy": heart_proxy,
+        "PO Fill Workload Score": workload_score,
+        "PO Fill Source": "Pitch.csv recent game logs",
+    }
+
+
+def _po_fill_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        pitcher = _po_fill_text(row, ["Pitcher", "pitcher", "Player"], "")
+        prof = _po_fill_pitcher_log_profile(pitcher)
+        if prof:
+            for k, v in prof.items():
+                row[k] = v
+            if not np.isfinite(_po_fill_num(row.get("Recent Hook Rate"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Hook Rate"), np.nan)):
+                row["Recent Hook Rate"] = round(float(prof["PO Fill Hook Rate"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("Deep Start Rate"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Deep Start Rate"), np.nan)):
+                row["Deep Start Rate"] = round(float(prof["PO Fill Deep Start Rate"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("Pitch Efficiency P/IP"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill P/IP"), np.nan)):
+                row["Pitch Efficiency P/IP"] = round(float(prof["PO Fill P/IP"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("Pitch Efficiency P/BF"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill P/BF"), np.nan)):
+                row["Pitch Efficiency P/BF"] = round(float(prof["PO Fill P/BF"]), 2)
+            if not np.isfinite(_po_fill_num(row.get("Pitch Count Avg L3"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Pitch Count L3"), np.nan)):
+                row["Pitch Count Avg L3"] = round(float(prof["PO Fill Pitch Count L3"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("Pitch Count Avg L5"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Pitch Count L5"), np.nan)):
+                row["Pitch Count Avg L5"] = round(float(prof["PO Fill Pitch Count L5"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("Pitch Count Avg L10"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Pitch Count L10"), np.nan)):
+                row["Pitch Count Avg L10"] = round(float(prof["PO Fill Pitch Count L10"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("Season Avg Pitch Count"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Season Pitch Count Avg"), np.nan)):
+                row["Season Avg Pitch Count"] = round(float(prof["PO Fill Season Pitch Count Avg"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("Last Start Pitch Count"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Last Pitch Count"), np.nan)):
+                row["Last Start Pitch Count"] = round(float(prof["PO Fill Last Pitch Count"]), 0)
+            if not np.isfinite(_po_fill_num(row.get("Max Pitch Count L10"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Max Pitch Count L10"), np.nan)):
+                row["Max Pitch Count L10"] = round(float(prof["PO Fill Max Pitch Count L10"]), 0)
+            if not np.isfinite(_po_fill_num(row.get("Pitch Count Trend"), np.nan)):
+                l3 = _po_fill_num(prof.get("PO Fill Pitch Count L3"), np.nan)
+                l10 = _po_fill_num(prof.get("PO Fill Pitch Count L10"), np.nan)
+                if np.isfinite(l3) and np.isfinite(l10):
+                    row["Pitch Count Trend"] = round(float(l3 - l10), 1)
+            for dst, src in [
+                ("PO Pitch Count Signal", "PO Fill Pitch Count Signal"),
+                ("PO Efficiency Signal", "PO Fill Efficiency Signal"),
+                ("PO Leash Signal", "PO Fill Leash Signal"),
+                ("PO Pitch Limit Signal", "PO Fill Pitch Limit Signal"),
+            ]:
+                if prof.get(src):
+                    row[dst] = prof.get(src)
+            if not str(row.get("Damage Risk Label") or "").strip() and prof.get("PO Fill Damage Label"):
+                row["Damage Risk Label"] = prof.get("PO Fill Damage Label")
+                row["Damage Risk Score"] = prof.get("PO Fill Damage Score", "")
+            if not np.isfinite(_po_fill_num(row.get("Heart Zone%"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill Heart Proxy"), np.nan)):
+                row["Heart Zone%"] = round(float(prof["PO Fill Heart Proxy"]), 1)
+            if not np.isfinite(_po_fill_num(row.get("FanGraphs DC IP"), np.nan)) and np.isfinite(_po_fill_num(prof.get("PO Fill IP L5"), np.nan)):
+                row["FanGraphs DC IP"] = round(float(prof["PO Fill IP L5"]) * 28.0, 0)
+        else:
+            row["PO Fill Source"] = "Pitch.csv no matched pitcher logs"
+        role_blob = " ".join(str(row.get(c) or "") for c in [
+            "Beta Flags", "PO Experience Guardrail", "Role/Pitch Limit Flag",
+            "Pitch Limit Flag", "Player Notes", "News", "Injury Note",
+            "Leash Label", "Pitch Count Limit", "IP Confidence"
+        ]).upper()
+        if any(tok in role_blob for tok in ["RETURN FROM IL", "FROM IL", "IL ", "PITCH LIMIT", "LIMITED", "BUILD UP", "RAMP", "REHAB"]):
+            row["PO Role/Pitch Limit Signal"] = "HARD_PITCH_LIMIT_WATCH"
+        elif any(tok in role_blob for tok in ["CALL-UP", "ROOKIE", "OPENER", "BULK", "TANDEM"]):
+            row["PO Role/Pitch Limit Signal"] = "ROLE_VOLATILITY_WATCH"
+        elif not row.get("PO Role/Pitch Limit Signal"):
+            row["PO Role/Pitch Limit Signal"] = row.get("PO Pitch Limit Signal", "NO_LIMIT_FLAG")
+
+        bp_blob = " ".join(str(row.get(c) or "") for c in [
+            "Bullpen Status", "bullpen_status", "Bullpen Fatigue Note", "bullpen_note",
+            "Bullpen", "Bullpen Available", "Away Bullpen Available", "Home Bullpen Available"
+        ]).upper()
+        bp_1d_vals = [
+            _po_fill_num(row.get("Bullpen Pitches 1D"), np.nan),
+            _po_fill_num(row.get("Away Bullpen Pitches 1D"), np.nan),
+            _po_fill_num(row.get("Home Bullpen Pitches 1D"), np.nan),
+        ]
+        bp_3d_vals = [
+            _po_fill_num(row.get("Bullpen Pitches 3D"), np.nan),
+            _po_fill_num(row.get("Away Bullpen Pitches 3D"), np.nan),
+            _po_fill_num(row.get("Home Bullpen Pitches 3D"), np.nan),
+        ]
+        bp_1d_clean = [v for v in bp_1d_vals if np.isfinite(v)]
+        bp_3d_clean = [v for v in bp_3d_vals if np.isfinite(v)]
+        bp_1d = max(bp_1d_clean) if bp_1d_clean else np.nan
+        bp_3d = max(bp_3d_clean) if bp_3d_clean else np.nan
+        if any(tok in bp_blob for tok in ["TIRED", "TAXED", "HEAVY", "UNAVAILABLE"]) or (np.isfinite(bp_1d) and bp_1d >= 55) or (np.isfinite(bp_3d) and bp_3d >= 145):
+            row["PO Bullpen Leash Signal"] = "BULLPEN_TIRED_CAN_EXTEND"
+        elif any(tok in bp_blob for tok in ["FRESH", "RESTED", "AVAILABLE"]) or (np.isfinite(bp_1d) and bp_1d <= 20 and np.isfinite(bp_3d) and bp_3d <= 85):
+            row["PO Bullpen Leash Signal"] = "BULLPEN_FRESH_CAN_SHORTEN"
+        else:
+            row["PO Bullpen Leash Signal"] = "BULLPEN_UNKNOWN"
+        # Keep true missing labels honest for feeds we do not have.
+        if not np.isfinite(_po_fill_num(row.get("Stuff+"), np.nan)):
+            row["Stuff+"] = ""
+            row["PO Stuff+ Need"] = "NEEDS_STUFF_PLUS_FEED"
+        if not np.isfinite(_po_fill_num(row.get("Foul%"), np.nan)) and not np.isfinite(_po_fill_num(row.get("Foul/PA"), np.nan)):
+            row["PO Foul Need"] = "NEEDS_SAVANT_PITCH_LEVEL"
+        try:
+            # The fill layer lands after the older selector/calibration wrappers, so
+            # recompute PO-only calibration/selector after the newly available data is present.
+            if "_po_cal_profile" in globals():
+                cal = _po_cal_profile(row)
+                row.update(cal)
+                cal_proj = _po_fill_num(cal.get("PO Calibrated Projection"), np.nan)
+                if np.isfinite(cal_proj):
+                    row["Beta Projection"] = round(float(cal_proj), 1)
+                    row["Beta Outs"] = row["Beta Projection"]
+                    row["Beta IP"] = round(float(cal_proj) / 3.0, 2)
+                for dst, src in [
+                    ("Beta Lean", "PO Calibrated Lean"),
+                    ("Beta Edge", "PO Calibrated Edge"),
+                    ("Beta Hit %", "PO Calibrated Hit %"),
+                    ("Decision Note", "PO Calibrated Decision Note"),
+                ]:
+                    if cal.get(src) not in [None, "", "nan", "NaN"]:
+                        row[dst] = cal.get(src)
+            if "_po_official_selector" in globals():
+                row.update(_po_official_selector(row))
+        except Exception as e:
+            row["PO Data Fill Recalc Note"] = f"recalc skipped: {str(e)[:90]}"
+        row["PO Data Fill Version"] = PO_DATA_FILL_VERSION
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+_PO_FILL_PREV_BETA_ROWS = _beta_projection_rows if "_beta_projection_rows" in globals() else None
+
+
+def _beta_projection_rows(board, market_kind="OUTS"):
+    df = _PO_FILL_PREV_BETA_ROWS(board, market_kind) if _PO_FILL_PREV_BETA_ROWS is not None else pd.DataFrame()
+    if str(market_kind).upper() == "OUTS":
+        return _po_fill_apply(df)
     return df
 
 
@@ -45461,12 +46096,38 @@ def render_advanced_daily_data_hub(board=None):
         st.info("Post-slate flag report needs current K board rows plus saved true actuals/result grades.")
 
 
-tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_pitcher_fs, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown('<div class="section-title-pro">Moneyline Edge Cards</div>', unsafe_allow_html=True)
+    st.caption("Clean display only. Shows the same ML board with score/blowout/cover support, without exposing raw HTML code.")
+    try:
+        df = ml_build_board(board)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            st.info("No ML board yet. Refresh the K board first.")
+            return
+        _render_moneyline_visual_cards(df)
+        st.markdown('<div class="section-title-pro">ML Score / Blowout Brain</div>', unsafe_allow_html=True)
+        st.caption("Support-only. Helps find better ML/covers/blowout spots; it does not replace the official ML pick.")
+        cols = [c for c in [
+            "Matchup", "ML Card Best Play", "ML Card Best Play Prob %",
+            "ML Score Brain Projected Score", "ML Score Confidence Label", "ML Score Confidence %",
+            "ML Blowout Tier", "ML Blowout Score", "ML Blowout Run Gap",
+            "ML Correct Cover Lean", "ML Correct Cover Prob %", "ML Cover Side Check",
+            "ML Cover Brain Reason", "Away SP", "Home SP", "ML SP Sample Guardrail",
+            "ML Risk Reasons", "ML Support Signals", "ML Score Brain Notes",
+            "ML Score Brain Version", "ML Blowout Brain Version"
+        ] if c in df.columns]
+        st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+        with st.expander("Full ML board debug", expanded=False):
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Moneyline edge unavailable: {e}")
+
+
+tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
     "⚾ 1ST INN PC",
     "🧪 IP DEBUG BETA",
-    "PITCHER FS",
     "MONEYLINE EDGE",
     "LOSS LAB",
     "🧠 BASEBALL IQ",
@@ -45491,9 +46152,6 @@ with tab_first_inning_pc:
 
 with tab_beta_ip_debug:
     render_beta_ip_debug_tab(board)
-
-with tab_pitcher_fs:
-    render_pitcher_fs_tab(board)
 
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
