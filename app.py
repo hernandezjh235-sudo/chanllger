@@ -44115,35 +44115,49 @@ def _kcard_pitch_mix_feed():
     return df
 
 
+def _kcard_csv_arsenal_rows(key):
+    rows = []
+    df = _kcard_pitch_mix_feed()
+    if isinstance(df, pd.DataFrame) and not df.empty and key:
+        d = df[df["_kc_mix_name"].eq(key)].copy()
+        if not d.empty:
+            for _, rr in d.iterrows():
+                rows.append({
+                    "Pitch": _kcard_pitch_name_short(rr.get("pitch_name") or rr.get("pitch_type")),
+                    "Use": _kclean_num(rr.get("pitch_usage"), np.nan),
+                    "K%": _kclean_num(rr.get("k_percent"), np.nan),
+                    "Whiff%": _kclean_num(rr.get("whiff_percent"), np.nan),
+                    "Putaway": _kclean_num(rr.get("put_away"), np.nan),
+                    "Damage": _kclean_num(rr.get("est_woba") if rr.get("est_woba") is not None else rr.get("woba"), np.nan),
+                    "HardHit": _kclean_num(rr.get("hard_hit_percent"), np.nan),
+                })
+    return rows
+
+
 def _kcard_arsenal_profile(row, p):
     raw_pitcher = str((row or {}).get("Pitcher") or (p or {}).get("pitcher") or "").strip()
     key = _kcard_name_key(raw_pitcher)
     pitch_rows = [r for r in ((p or {}).get("pitch_type_rows") or []) if isinstance(r, dict)]
     rows = []
+    csv_rows = _kcard_csv_arsenal_rows(key)
+    # Prefer the installed Savant arsenal CSV when it has real K/whiff/putaway coverage.
+    # Older in-memory pitch rows sometimes carry usage only, which caused visible dashes.
+    if csv_rows and any(np.isfinite(_kclean_num(r.get("K%"), np.nan)) or np.isfinite(_kclean_num(r.get("Putaway"), np.nan)) for r in csv_rows):
+        rows = csv_rows
     if pitch_rows:
         for r in pitch_rows:
+            if rows:
+                break
             rows.append({
                 "Pitch": _kcard_pitch_name_short(r.get("Pitch Type") or r.get("pitch_name") or r.get("pitch_type")),
                 "Use": _kclean_num(r.get("Pitcher Usage %") or r.get("Usage %") or r.get("pitch_usage"), np.nan),
-                "K%": _kclean_num(r.get("Pitch K%") or r.get("k_percent"), np.nan),
-                "Whiff%": _kclean_num(r.get("Pitcher Whiff%") or r.get("Avg Batter Whiff%") or r.get("whiff_percent"), np.nan),
+                "K%": _kclean_num(r.get("Pitch K%") or r.get("K%") or r.get("K Rate") or r.get("k_percent"), np.nan),
+                "Whiff%": _kclean_num(r.get("Pitcher Whiff%") or r.get("Avg Batter Whiff%") or r.get("Whiff%") or r.get("whiff_percent"), np.nan),
+                "Putaway": _kclean_num(r.get("Putaway") or r.get("PutAway") or r.get("put_away"), np.nan),
                 "Damage": _kclean_num(r.get("SLG") or r.get("est_slg") or r.get("Hard Hit%") or r.get("hard_hit_percent"), np.nan),
             })
     if not rows:
-        df = _kcard_pitch_mix_feed()
-        if isinstance(df, pd.DataFrame) and not df.empty and key:
-            d = df[df["_kc_mix_name"].eq(key)].copy()
-            if not d.empty:
-                for _, rr in d.iterrows():
-                    rows.append({
-                        "Pitch": _kcard_pitch_name_short(rr.get("pitch_name") or rr.get("pitch_type")),
-                        "Use": _kclean_num(rr.get("pitch_usage"), np.nan),
-                        "K%": _kclean_num(rr.get("k_percent"), np.nan),
-                        "Whiff%": _kclean_num(rr.get("whiff_percent"), np.nan),
-                        "Putaway": _kclean_num(rr.get("put_away"), np.nan),
-                        "Damage": _kclean_num(rr.get("est_woba") if rr.get("est_woba") is not None else rr.get("woba"), np.nan),
-                        "HardHit": _kclean_num(rr.get("hard_hit_percent"), np.nan),
-                    })
+        rows = csv_rows
     clean = []
     for r in rows:
         use = _kclean_num(r.get("Use"), np.nan)
@@ -44165,6 +44179,8 @@ def _kcard_arsenal_profile(row, p):
     damage_vals = [v for v in damage_vals if np.isfinite(v)]
     damage = float(np.mean(damage_vals)) if damage_vals else np.nan
     score = _kclean_num(_kclean_pick(row or {}, ["APP100 Arsenal Score", "APP88 Arsenal Matchup Score", "Pitch Mix Matchup Score"], np.nan), np.nan)
+    if np.isfinite(score) and score <= 0 and clean:
+        score = np.nan
     if not np.isfinite(score) and clean:
         score = 50.0
         if np.isfinite(wk):
@@ -44206,16 +44222,49 @@ def _kcard_arsenal_html(profile):
     rows = profile.get("rows") or []
     if not rows:
         return '<div class="kc-empty">Pitch arsenal feed not matched yet. Upload pitch_mix_matchups.csv to fill top pitch and pitch-by-pitch whiff/K rows.</div>'
+    def _pct(value, digits=0):
+        v = _kclean_num(value, np.nan)
+        if not np.isfinite(v):
+            return "—"
+        return f"{v:.{digits}f}%"
     trs = []
     for r in rows[:5]:
         pitch = html.escape(str(r.get("Pitch") or "Pitch"))
-        use = _kclean_fmt(r.get("Use"), 0)
-        k = _kclean_fmt(r.get("K%"), 0)
-        whiff = _kclean_fmt(r.get("Whiff%"), 0)
-        put = _kclean_fmt(r.get("Putaway"), 0)
+        use = _pct(r.get("Use"), 0)
+        k = _pct(r.get("K%"), 0)
+        whiff = _pct(r.get("Whiff%"), 0)
+        put = _pct(r.get("Putaway"), 0)
         cls = "hi" if _kclean_num(r.get("Whiff%"), 0) >= 30 or _kclean_num(r.get("K%"), 0) >= 30 else "lo" if _kclean_num(r.get("Whiff%"), 99) <= 18 else ""
-        trs.append(f"<tr><td>{pitch}</td><td>{use}%</td><td class='{cls}'>K:{k}%</td><td class='{cls}'>W:{whiff}%</td><td>{put}%</td></tr>")
+        trs.append(f"<tr><td>{pitch}</td><td>{use}</td><td class='{cls}'>K:{k}</td><td class='{cls}'>W:{whiff}</td><td>{put}</td></tr>")
     return "<table class='kc-arsenal'><thead><tr><th>Pitch</th><th>Use</th><th>K%</th><th>Whiff</th><th>Put</th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>"
+
+
+def _kcard_ceiling_value(row, line=np.nan, proj=np.nan, arsenal=None):
+    """Display-only K ceiling. Prefer true numeric columns, then parse audit strings."""
+    raw = _kclean_pick(row or {}, ["K Sim P90", "APP100 K P90", "Ceiling", "Atlas Ceiling K", "K Ceiling", "P90", "80th Percentile K"], np.nan)
+    val = _kclean_num(raw, np.nan)
+    if np.isfinite(val):
+        return val
+    txt = str(_kclean_pick(row or {}, ["K Ceiling Read", "Ceiling Read"], "") or "")
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*K?", txt, flags=re.I)
+    if m:
+        val = _kclean_num(m.group(1), np.nan)
+        if np.isfinite(val):
+            return val
+    proj_v = _kclean_num(proj, np.nan)
+    if not np.isfinite(proj_v):
+        return np.nan
+    line_v = _kclean_num(line, np.nan)
+    score = _kclean_num((arsenal or {}).get("score"), np.nan)
+    whiff = _kclean_num((arsenal or {}).get("weighted_whiff"), np.nan)
+    bump = 1.25
+    if np.isfinite(line_v) and line_v >= 6.5:
+        bump += 0.55
+    if np.isfinite(score) and score >= 66:
+        bump += 0.45
+    if np.isfinite(whiff) and whiff >= 30:
+        bump += 0.35
+    return proj_v + max(1.0, min(2.8, bump))
 
 
 def _kcard_last10_values(row, p):
@@ -44342,12 +44391,12 @@ def _kclean_render_player_cards(df, board=None, limit=None):
         .kc-prow{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.kc-label{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#929db0;font-weight:900}
         .kc-proj{font-size:42px;line-height:.95;color:#ff2f73;font-weight:950;text-shadow:0 0 18px rgba(255,47,115,.2)}.kc-side{text-align:right;font-size:22px;font-weight:950}.kc-side.over{color:#31f063}.kc-side.under{color:#ffd84a}.kc-side.track{color:#b8b2c4}
         .kc-edge{font-size:12px;color:#e9e0ff;margin-top:6px}.kc-bar{height:5px;background:#231f31;border-radius:999px;overflow:hidden;margin-top:10px}.kc-fill{height:100%;background:linear-gradient(90deg,#2fa7ff,#9b39ff,#ffd43b)}
-        .kc-metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:7px;margin:10px 0}.kc-stat{background:rgba(12,14,25,.84);border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:8px;min-width:0}.kc-stat b{display:block;font-size:15px;white-space:nowrap}.kc-stat span{display:block;font-size:9px;color:#a99fb8;font-weight:900;text-transform:uppercase;margin-bottom:3px}
+        .kc-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:10px 0}.kc-stat{background:rgba(12,14,25,.84);border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:8px;min-width:0;min-height:58px;overflow:hidden}.kc-stat b{display:block;font-size:14px;white-space:normal;overflow-wrap:anywhere;word-break:break-word;line-height:1.12}.kc-stat span{display:block;font-size:9px;color:#a99fb8;font-weight:900;text-transform:uppercase;margin-bottom:4px;line-height:1.1}
         .kc-section{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.22);border-radius:12px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#f4ecff;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#ffd34e;font-size:11px}
         .kc-lineup,.kc-arsenal{width:100%;border-collapse:collapse;font-size:12px}.kc-lineup th,.kc-arsenal th{color:#a99fb8;text-align:left;font-size:10px;text-transform:uppercase;padding:6px;border-bottom:1px solid #2b233b}.kc-lineup td,.kc-arsenal td{padding:6px;border-bottom:1px solid #1f1a2b;white-space:nowrap}.kc-lineup td:nth-child(2),.kc-arsenal td:first-child{white-space:normal;font-weight:850}.kc-lineup .hi,.kc-arsenal .hi{color:#35f071}.kc-lineup .lo,.kc-arsenal .lo{color:#ffd34e}.kc-empty{color:#b8adc8;font-size:12px;line-height:1.4}
-        .kc-arsenal-top{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:9px}.kc-arsenal-box{background:rgba(19,17,30,.88);border:1px solid rgba(255,213,74,.18);border-radius:10px;padding:8px}.kc-arsenal-box span{display:block;font-size:9px;color:#a99fb8;text-transform:uppercase;font-weight:900}.kc-arsenal-box b{display:block;font-size:17px;margin-top:3px;color:#f9f5ff}.kc-arsenal-box.gold b{color:#ffd34e}.kc-arsenal-box.purp b{color:#d06bff}.kc-bars{height:88px;display:flex;align-items:flex-end;gap:7px;border-bottom:1px solid rgba(255,255,255,.32);padding-top:5px}.kc-barcol{flex:1;min-width:18px;border-radius:7px 7px 2px 2px;display:flex;align-items:flex-start;justify-content:center;color:#fff;font-size:11px;font-weight:950;padding-top:4px}.kc-barcol.hit{background:linear-gradient(180deg,#36f06d,#107d32)}.kc-barcol.miss{background:linear-gradient(180deg,#ff5a75,#8b1d2e)}
+        .kc-arsenal-top{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:9px}.kc-arsenal-box{background:rgba(19,17,30,.88);border:1px solid rgba(255,213,74,.18);border-radius:10px;padding:8px;min-width:0;overflow:hidden}.kc-arsenal-box span{display:block;font-size:9px;color:#a99fb8;text-transform:uppercase;font-weight:900}.kc-arsenal-box b{display:block;font-size:16px;margin-top:3px;color:#f9f5ff;line-height:1.12;overflow-wrap:anywhere}.kc-arsenal-box small{font-size:11px;color:#d9c2ff}.kc-arsenal-box.gold b{color:#ffd34e}.kc-arsenal-box.purp b{color:#d06bff}.kc-bars{height:88px;display:flex;align-items:flex-end;gap:7px;border-bottom:1px solid rgba(255,255,255,.32);padding-top:5px}.kc-barcol{flex:1;min-width:18px;border-radius:7px 7px 2px 2px;display:flex;align-items:flex-start;justify-content:center;color:#fff;font-size:11px;font-weight:950;padding-top:4px}.kc-barcol.hit{background:linear-gradient(180deg,#36f06d,#107d32)}.kc-barcol.miss{background:linear-gradient(180deg,#ff5a75,#8b1d2e)}
         .kc-note{font-size:12px;color:#cbd3e0;line-height:1.35}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
-        @media(max-width:640px){.kcard-stack{grid-template-columns:1fr}.kc-metrics{grid-template-columns:repeat(3,1fr)}.kc-proj{font-size:36px}.kc-lineup{font-size:11px}.kc-lineup th:nth-child(7),.kc-lineup td:nth-child(7){display:none}}
+        @media(max-width:640px){.kcard-stack{grid-template-columns:1fr}.kc-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-arsenal-top{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-proj{font-size:36px}.kc-lineup{font-size:11px}.kc-lineup th:nth-child(7),.kc-lineup td:nth-child(7){display:none}}
         </style>
         """
         cards = []
@@ -44407,7 +44456,8 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             arsenal_signal = html.escape(str(arsenal.get("signal") or "Arsenal"))
             match_k = _kclean_fmt(arsenal.get("weighted_k"), 1)
             match_whiff = _kclean_fmt(arsenal.get("weighted_whiff"), 1)
-            ceiling = _kclean_fmt(_kclean_pick(row, ["K Ceiling Read", "Atlas Ceiling K", "Ceiling", "K Sim P90", "APP100 K P90"], ""), 1)
+            ceiling_num = _kcard_ceiling_value(row, line=line, proj=proj, arsenal=arsenal)
+            ceiling = "—" if not np.isfinite(_kclean_num(ceiling_num, np.nan)) else f"{int(round(float(ceiling_num)))}K"
             last10_html = _kcard_last10_html(row, p, line)
             cards.append(f"""
             <div class="kcard">
@@ -44426,7 +44476,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
               <div class="kc-section">
                 <div class="kc-arsenal-top">
                   <div class="kc-arsenal-box"><span>K Grade</span><b>{arsenal_grade}</b></div>
-                  <div class="kc-arsenal-box gold"><span>Ceiling</span><b>{ceiling}K</b></div>
+                  <div class="kc-arsenal-box gold"><span>Ceiling</span><b>{ceiling}</b></div>
                   <div class="kc-arsenal-box purp"><span>Top Pitch</span><b>{top_pitch}<br><small>{top_usage}% use</small></b></div>
                   <div class="kc-arsenal-box"><span>Arsenal</span><b>{arsenal_score}</b></div>
                 </div>
