@@ -44121,15 +44121,22 @@ def _kcard_csv_arsenal_rows(key):
     if isinstance(df, pd.DataFrame) and not df.empty and key:
         d = df[df["_kc_mix_name"].eq(key)].copy()
         if not d.empty:
+            def _alias(rr, names, default=np.nan):
+                for name in names:
+                    if name in rr.index:
+                        val = rr.get(name)
+                        if val not in (None, "", "—", "-", "nan", "NaN"):
+                            return val
+                return default
             for _, rr in d.iterrows():
                 rows.append({
-                    "Pitch": _kcard_pitch_name_short(rr.get("pitch_name") or rr.get("pitch_type")),
-                    "Use": _kclean_num(rr.get("pitch_usage"), np.nan),
-                    "K%": _kclean_num(rr.get("k_percent"), np.nan),
-                    "Whiff%": _kclean_num(rr.get("whiff_percent"), np.nan),
-                    "Putaway": _kclean_num(rr.get("put_away"), np.nan),
-                    "Damage": _kclean_num(rr.get("est_woba") if rr.get("est_woba") is not None else rr.get("woba"), np.nan),
-                    "HardHit": _kclean_num(rr.get("hard_hit_percent"), np.nan),
+                    "Pitch": _kcard_pitch_name_short(_alias(rr, ["pitch_name", "pitch_type", "Pitch", "Pitch Type", "pitch"])),
+                    "Use": _kclean_num(_alias(rr, ["pitch_usage", "Pitch Usage", "Pitcher Usage %", "Usage %", "use", "Use", "pitch_percent", "usage_percent"]), np.nan),
+                    "K%": _kclean_num(_alias(rr, ["k_percent", "K%", "Pitch K%", "K Rate", "strikeout_percent", "strikeouts_percent"]), np.nan),
+                    "Whiff%": _kclean_num(_alias(rr, ["whiff_percent", "Whiff%", "Whiff Rate", "Pitcher Whiff%", "Avg Batter Whiff%", "swing_miss_percent"]), np.nan),
+                    "Putaway": _kclean_num(_alias(rr, ["put_away", "putaway", "put_away_percent", "PutAway%", "Putaway%", "Putaway", "PutAway"]), np.nan),
+                    "Damage": _kclean_num(_alias(rr, ["est_woba", "estimated_woba_using_speedangle", "xwoba", "woba", "SLG", "est_slg", "Hard Hit%", "hard_hit_percent"]), np.nan),
+                    "HardHit": _kclean_num(_alias(rr, ["hard_hit_percent", "Hard Hit%", "hard_hit_rate"]), np.nan),
                 })
     return rows
 
@@ -44150,11 +44157,11 @@ def _kcard_arsenal_profile(row, p):
                 break
             rows.append({
                 "Pitch": _kcard_pitch_name_short(r.get("Pitch Type") or r.get("pitch_name") or r.get("pitch_type")),
-                "Use": _kclean_num(r.get("Pitcher Usage %") or r.get("Usage %") or r.get("pitch_usage"), np.nan),
-                "K%": _kclean_num(r.get("Pitch K%") or r.get("K%") or r.get("K Rate") or r.get("k_percent"), np.nan),
-                "Whiff%": _kclean_num(r.get("Pitcher Whiff%") or r.get("Avg Batter Whiff%") or r.get("Whiff%") or r.get("whiff_percent"), np.nan),
-                "Putaway": _kclean_num(r.get("Putaway") or r.get("PutAway") or r.get("put_away"), np.nan),
-                "Damage": _kclean_num(r.get("SLG") or r.get("est_slg") or r.get("Hard Hit%") or r.get("hard_hit_percent"), np.nan),
+                "Use": _kclean_num(r.get("Pitcher Usage %") or r.get("Usage %") or r.get("pitch_usage") or r.get("pitch_percent") or r.get("usage_percent"), np.nan),
+                "K%": _kclean_num(r.get("Pitch K%") or r.get("K%") or r.get("K Rate") or r.get("k_percent") or r.get("strikeout_percent"), np.nan),
+                "Whiff%": _kclean_num(r.get("Pitcher Whiff%") or r.get("Avg Batter Whiff%") or r.get("Whiff%") or r.get("whiff_percent") or r.get("Whiff Rate"), np.nan),
+                "Putaway": _kclean_num(r.get("Putaway") or r.get("PutAway") or r.get("put_away") or r.get("putaway") or r.get("put_away_percent"), np.nan),
+                "Damage": _kclean_num(r.get("SLG") or r.get("est_slg") or r.get("Hard Hit%") or r.get("hard_hit_percent") or r.get("xwoba") or r.get("est_woba"), np.nan),
             })
     if not rows:
         rows = csv_rows
@@ -46564,6 +46571,390 @@ def render_moneyline_edge_tab(board, dates=None):
         st.info(f"Moneyline edge unavailable: {e}")
 
 
+UNIFIED_PROJECTION_BRAIN_VERSION = "UNIFIED_PROJECTION_BRAIN_2026_07_27"
+
+
+def _upb_num(row, keys, default=np.nan):
+    try:
+        if not isinstance(row, dict):
+            row = row.to_dict()
+    except Exception:
+        pass
+    for key in keys:
+        try:
+            if key in row:
+                val = _kclean_num(row.get(key), np.nan) if "_kclean_num" in globals() else pd.to_numeric(row.get(key), errors="coerce")
+                if np.isfinite(val):
+                    return float(val)
+        except Exception:
+            continue
+    return default
+
+
+def _upb_text(row, keys, default=""):
+    try:
+        if not isinstance(row, dict):
+            row = row.to_dict()
+    except Exception:
+        pass
+    for key in keys:
+        try:
+            val = row.get(key)
+            if val not in (None, "", "—", "-", "nan", "NaN"):
+                return str(val)
+        except Exception:
+            continue
+    return default
+
+
+def _upb_decision(edge, side, gate, support, ceiling=np.nan, line=np.nan):
+    gate_u = str(gate or "").upper()
+    side_u = str(side or "").upper()
+    if "RED" in gate_u or "VERIFY" in gate_u:
+        return "VERIFY/PASS", "Data gate is not clean enough for a slip anchor."
+    if not np.isfinite(edge):
+        return "DATA GAP", "Projection/line edge is missing."
+    if abs(edge) < 0.55:
+        return "THIN EDGE", "Projection is too close to the line."
+    if side_u.startswith("U") and np.isfinite(ceiling) and np.isfinite(line) and ceiling - line >= 1.5:
+        return "UNDER UPSIDE RISK", "Ceiling is high enough to threaten the under."
+    if side_u.startswith("O") and np.isfinite(ceiling) and np.isfinite(line) and ceiling < line + 1.0:
+        return "LOW CEILING OVER", "Over is playable only if volume and matchup agree."
+    if abs(edge) >= 1.0 and str(support or "").upper() not in ("", "NONE", "NAN"):
+        return "SUPPORT", "Edge has supporting data."
+    return "TRACK", "Keep, but do not force into slips."
+
+
+def _upb_market_key(market):
+    text = str(market or "").upper()
+    if text.startswith("K"):
+        return "K"
+    if "OUT" in text or text == "PO":
+        return "PO"
+    if "MONEY" in text or text == "ML":
+        return "ML"
+    if "1ST" in text or "INN" in text:
+        return "1IP"
+    return text or "UNKNOWN"
+
+
+def _upb_side_key(side):
+    text = str(side or "").upper()
+    if text.startswith("O") or "OVER" in text or "HIGHER" in text:
+        return "OVER"
+    if text.startswith("U") or "UNDER" in text or "LOWER" in text:
+        return "UNDER"
+    if " ML" in text or text.endswith("ML"):
+        return "ML"
+    return text[:24]
+
+
+def _upb_line_bucket(line):
+    try:
+        return _hadb_bucket_line(line) if "_hadb_bucket_line" in globals() else "NO_LINE"
+    except Exception:
+        x = _kclean_num(line, np.nan) if "_kclean_num" in globals() else np.nan
+        if not np.isfinite(x):
+            return "NO_LINE"
+        return f"{x:.1f}"
+
+
+@st.cache_data(show_spinner=False)
+def _upb_history_summary_cached():
+    try:
+        actuals = load_historical_actuals_database() if "load_historical_actuals_database" in globals() else pd.DataFrame()
+    except Exception:
+        actuals = pd.DataFrame()
+    if not isinstance(actuals, pd.DataFrame) or actuals.empty:
+        return pd.DataFrame()
+    d = actuals.copy()
+    d["Result"] = d.get("Result", "").astype(str).str.upper().replace({"W": "WIN", "L": "LOSS"})
+    d = d[d["Result"].isin(["WIN", "LOSS"])].copy()
+    if d.empty:
+        return pd.DataFrame()
+    d["Market Key"] = d.get("Market", "").map(_upb_market_key)
+    d["Side Key"] = d.get("Side", "").map(_upb_side_key)
+    d["Line Num"] = pd.to_numeric(d.get("Line"), errors="coerce")
+    d["Line Bucket"] = d["Line Num"].map(_upb_line_bucket)
+    d["Win"] = d["Result"].eq("WIN").astype(float)
+    d["Actual Num"] = pd.to_numeric(d.get("Actual"), errors="coerce")
+    d["Projection Num"] = pd.to_numeric(d.get("Projection"), errors="coerce")
+    d["Error"] = d["Projection Num"] - d["Actual Num"]
+    d["Missed By One"] = ((d["Actual Num"] - d["Line Num"]).abs() <= 1.0) & d["Result"].eq("LOSS")
+    grouped = d.groupby(["Market Key", "Side Key", "Line Bucket"], dropna=False).agg(
+        Plays=("Win", "count"),
+        Wins=("Win", "sum"),
+        Win_Rate=("Win", "mean"),
+        Avg_Error=("Error", "mean"),
+        Missed_By_One=("Missed By One", "mean"),
+    ).reset_index()
+    grouped["Wins"] = grouped["Wins"].astype(int)
+    grouped["Win_Rate"] = (grouped["Win_Rate"] * 100).round(1)
+    grouped["Avg_Error"] = pd.to_numeric(grouped["Avg_Error"], errors="coerce").round(2)
+    grouped["Missed_By_One"] = (grouped["Missed_By_One"] * 100).round(1)
+    return grouped
+
+
+def _upb_history_read(market, side, line):
+    market_key = _upb_market_key(market)
+    side_key = _upb_side_key(side)
+    bucket = _upb_line_bucket(line)
+    out = {
+        "plays": 0,
+        "win_rate": np.nan,
+        "missed_by_one": np.nan,
+        "adj": 0.0,
+        "read": "NO_HISTORY",
+        "bucket": bucket,
+    }
+    try:
+        hist = _upb_history_summary_cached()
+    except Exception:
+        hist = pd.DataFrame()
+    if not isinstance(hist, pd.DataFrame) or hist.empty:
+        return out
+    d = hist[
+        hist["Market Key"].astype(str).eq(market_key)
+        & hist["Side Key"].astype(str).eq(side_key)
+        & hist["Line Bucket"].astype(str).eq(bucket)
+    ].copy()
+    if d.empty:
+        d = hist[
+            hist["Market Key"].astype(str).eq(market_key)
+            & hist["Side Key"].astype(str).eq(side_key)
+        ].copy()
+        bucket = "ALL_LINES"
+    if d.empty:
+        return out
+    rr = d.sort_values("Plays", ascending=False).iloc[0].to_dict()
+    plays = int(_kclean_num(rr.get("Plays"), 0)) if "_kclean_num" in globals() else int(rr.get("Plays", 0))
+    wr = _kclean_num(rr.get("Win_Rate"), np.nan) if "_kclean_num" in globals() else np.nan
+    mbo = _kclean_num(rr.get("Missed_By_One"), np.nan) if "_kclean_num" in globals() else np.nan
+    out.update({"plays": plays, "win_rate": wr, "missed_by_one": mbo, "bucket": bucket})
+    if plays < 12:
+        out["read"] = f"TRACK_ONLY_{plays}_PLAYS"
+        return out
+    if wr >= 62:
+        mag, read = 0.20, "HISTORY_BOOST"
+    elif wr >= 58:
+        mag, read = 0.10, "SMALL_HISTORY_BOOST"
+    elif wr <= 42:
+        mag, read = -0.20, "HISTORY_FADE"
+    elif wr <= 47:
+        mag, read = -0.10, "SMALL_HISTORY_FADE"
+    else:
+        mag, read = 0.0, "HISTORY_NEUTRAL"
+    if market_key in {"K", "PO", "1IP"}:
+        if side_key == "UNDER":
+            mag *= -1.0
+    else:
+        mag = 0.0
+    out["adj"] = round(float(mag), 2)
+    out["read"] = read
+    return out
+
+
+def _upb_attach_history(row, market, side, line, projection):
+    hist = _upb_history_read(market, side, line)
+    proj = _kclean_num(projection, np.nan) if "_kclean_num" in globals() else np.nan
+    adj = float(hist.get("adj") or 0.0)
+    advisory = proj + adj if np.isfinite(proj) else np.nan
+    row["History Plays"] = hist.get("plays", 0)
+    row["History Win %"] = hist.get("win_rate", np.nan)
+    row["History Bucket"] = hist.get("bucket", "")
+    row["Missed By One %"] = hist.get("missed_by_one", np.nan)
+    row["Suggested Adj"] = round(adj, 2)
+    row["Advisory Projection"] = round(float(advisory), 2) if np.isfinite(advisory) else np.nan
+    row["History Read"] = hist.get("read", "NO_HISTORY")
+    return row
+
+
+def build_unified_projection_brain(board=None):
+    rows = []
+    try:
+        kdf = build_kproj_table(board) if "build_kproj_table" in globals() else pd.DataFrame()
+        if isinstance(kdf, pd.DataFrame) and not kdf.empty:
+            for _, rr in kdf.iterrows():
+                r = rr.to_dict()
+                proj = _upb_num(r, ["K PROJ", "Projection", "Final K Projection", "Winning File K Projection"])
+                line = _upb_num(r, ["UD/Line", "Line", "Strikeout Line"])
+                side = _upb_text(r, ["Model Pick", "Decision", "Side", "Pick"], "")
+                if not side and np.isfinite(proj) and np.isfinite(line):
+                    side = "OVER" if proj > line else "UNDER"
+                edge = _upb_num(r, ["Official K Edge", "Final K Edge", "Edge Gap", "Winning File K Edge"], proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan)
+                ceiling = _upb_num(r, ["K Sim P90", "Ceiling", "K Ceiling", "P90"], np.nan)
+                if not np.isfinite(ceiling):
+                    try:
+                        ceiling = _kcard_ceiling_value(r, line, proj, None)
+                    except Exception:
+                        ceiling = np.nan
+                gate = _upb_text(r, ["Projection Data Gate", "APP100 Projection Quality Label", "Savant Status", "Data Gate"], "TRACK")
+                support = _upb_text(r, ["Projection Data Cautions", "APP100 Support Signals", "Support Signals", "Signal"], "")
+                action, reason = _upb_decision(edge, side, gate, support, ceiling, line)
+                rows.append(_upb_attach_history({
+                    "Market": "K",
+                    "Player": _upb_text(r, ["Pitcher", "pitcher"]),
+                    "Matchup": _upb_text(r, ["Matchup", "matchup"]),
+                    "Side": side,
+                    "Line": line,
+                    "Projection": proj,
+                    "Edge": edge,
+                    "Ceiling": ceiling,
+                    "Data Gate": gate,
+                    "Brain Action": action,
+                    "Brain Reason": reason,
+                    "Support": support,
+                    "Pitcher K%": _upb_num(r, ["Pitcher K%", "APP97 Pitcher K%", "Official Pitcher K%"]),
+                    "Opp K%": _upb_num(r, ["Opponent K% vs Pitcher Hand", "Opp K%", "APP100 Opp K%"]),
+                    "Whiff%": _upb_num(r, ["Whiff%", "Official Whiff%", "statcast_whiff"]),
+                    "Arsenal": _upb_num(r, ["APP100 Arsenal Score", "Pitch Mix Matchup Score"]),
+                    "Version": UNIFIED_PROJECTION_BRAIN_VERSION,
+                }, "K", side, line, proj))
+    except Exception as e:
+        rows.append({"Market": "K", "Brain Action": "UNAVAILABLE", "Brain Reason": str(e), "Version": UNIFIED_PROJECTION_BRAIN_VERSION})
+
+    try:
+        pdf = _beta_projection_rows(board, "OUTS") if "_beta_projection_rows" in globals() else pd.DataFrame()
+        if isinstance(pdf, pd.DataFrame) and not pdf.empty:
+            for _, rr in pdf.iterrows():
+                r = rr.to_dict()
+                proj = _upb_num(r, ["Proj Outs", "Projected Outs", "PROJ OUTS", "Projection"])
+                line = _upb_num(r, ["Line", "PO Line", "UD/Line"])
+                side = _upb_text(r, ["Selector", "Decision", "Side"], "")
+                if not side and np.isfinite(proj) and np.isfinite(line):
+                    side = "OVER" if proj > line else "UNDER"
+                edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
+                support = "; ".join([x for x in [
+                    _upb_text(r, ["PO Calibration", "Calibration"], ""),
+                    _upb_text(r, ["PO Selector", "Selector"], ""),
+                    _upb_text(r, ["PO Workload Flags", "Workload Flags"], ""),
+                ] if x])
+                gate = _upb_text(r, ["PO Data Gate", "Data Gate", "Role"], "TRACK")
+                action, reason = _upb_decision(edge, side, gate, support)
+                hook = _upb_text(r, ["Hook", "Hook Risk", "PO Hook"], "")
+                damage = _upb_text(r, ["Damage", "Damage Risk", "PO Damage"], "")
+                if side.upper().startswith("O") and ("QUICK" in hook.upper() or "HIGH" in damage.upper()):
+                    action, reason = "OVER WORKLOAD RISK", "Hook/damage profile can beat the outs projection."
+                rows.append(_upb_attach_history({
+                    "Market": "Pitching Outs",
+                    "Player": _upb_text(r, ["Pitcher", "pitcher"]),
+                    "Matchup": _upb_text(r, ["Matchup", "matchup"]),
+                    "Side": side,
+                    "Line": line,
+                    "Projection": proj,
+                    "Edge": edge,
+                    "Ceiling": np.nan,
+                    "Data Gate": gate,
+                    "Brain Action": action,
+                    "Brain Reason": reason,
+                    "Support": support,
+                    "Pitcher K%": np.nan,
+                    "Opp K%": np.nan,
+                    "Whiff%": np.nan,
+                    "Arsenal": np.nan,
+                    "Version": UNIFIED_PROJECTION_BRAIN_VERSION,
+                }, "PO", side, line, proj))
+    except Exception as e:
+        rows.append({"Market": "Pitching Outs", "Brain Action": "UNAVAILABLE", "Brain Reason": str(e), "Version": UNIFIED_PROJECTION_BRAIN_VERSION})
+
+    try:
+        mdf = ml_build_board(board) if "ml_build_board" in globals() else pd.DataFrame()
+        if isinstance(mdf, pd.DataFrame) and not mdf.empty:
+            for _, rr in mdf.iterrows():
+                r = rr.to_dict()
+                prob = _upb_num(r, ["ML Card Best Play Prob %", "Win Probability", "ML Win Prob %"])
+                tier = _upb_text(r, ["ML Score Confidence Label", "ML Blowout Tier", "ML Card Rating"], "TRACK")
+                action = "SUPPORT" if np.isfinite(prob) and prob >= 60 and "PASS" not in tier.upper() else "TRACK"
+                if np.isfinite(prob) and prob < 54:
+                    action = "PASS"
+                rows.append(_upb_attach_history({
+                    "Market": "Moneyline",
+                    "Player": _upb_text(r, ["ML Card Best Play", "Best Play", "Matchup"]),
+                    "Matchup": _upb_text(r, ["Matchup"]),
+                    "Side": _upb_text(r, ["ML Card Best Play", "Best Play"]),
+                    "Line": np.nan,
+                    "Projection": _upb_num(r, ["ML Score Brain Projected Score", "Projected Score"]),
+                    "Edge": _upb_num(r, ["ML Blowout Run Gap", "Run Gap"]),
+                    "Ceiling": np.nan,
+                    "Data Gate": tier,
+                    "Brain Action": action,
+                    "Brain Reason": _upb_text(r, ["ML Cover Brain Reason", "ML Risk Reasons", "ML Score Brain Notes"], "Score/cover support read."),
+                    "Support": _upb_text(r, ["ML Support Signals", "ML Correct Cover Lean"], ""),
+                    "Pitcher K%": np.nan,
+                    "Opp K%": np.nan,
+                    "Whiff%": np.nan,
+                    "Arsenal": np.nan,
+                    "Version": UNIFIED_PROJECTION_BRAIN_VERSION,
+                }, "ML", _upb_text(r, ["ML Card Best Play", "Best Play"]), np.nan, _upb_num(r, ["ML Score Brain Projected Score", "Projected Score"])))
+    except Exception as e:
+        rows.append({"Market": "Moneyline", "Brain Action": "UNAVAILABLE", "Brain Reason": str(e), "Version": UNIFIED_PROJECTION_BRAIN_VERSION})
+
+    try:
+        fdf = build_first_inning_pitch_count_board(board) if "build_first_inning_pitch_count_board" in globals() else pd.DataFrame()
+        if isinstance(fdf, pd.DataFrame) and not fdf.empty:
+            for _, rr in fdf.iterrows():
+                r = rr.to_dict()
+                proj = _upb_num(r, ["Projection", "FI PC Projection", "Projected Pitch Count"])
+                line = _upb_num(r, ["Line", "1st Inn Pitch Count Line"])
+                side = _upb_text(r, ["Pick", "Side", "Decision"], "")
+                edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
+                support = _upb_text(r, ["Support", "Signals", "Reason"], "")
+                action, reason = _upb_decision(edge, side, _upb_text(r, ["Data Gate"], "TRACK"), support)
+                rows.append(_upb_attach_history({
+                    "Market": "1st Inn Pitch Count",
+                    "Player": _upb_text(r, ["Pitcher", "Player", "pitcher"]),
+                    "Matchup": _upb_text(r, ["Matchup", "matchup"]),
+                    "Side": side,
+                    "Line": line,
+                    "Projection": proj,
+                    "Edge": edge,
+                    "Ceiling": np.nan,
+                    "Data Gate": _upb_text(r, ["Data Gate", "Confidence"], "TRACK"),
+                    "Brain Action": action,
+                    "Brain Reason": reason,
+                    "Support": support,
+                    "Pitcher K%": np.nan,
+                    "Opp K%": np.nan,
+                    "Whiff%": np.nan,
+                    "Arsenal": np.nan,
+                    "Version": UNIFIED_PROJECTION_BRAIN_VERSION,
+                }, "1IP", side, line, proj))
+    except Exception as e:
+        rows.append({"Market": "1st Inn Pitch Count", "Brain Action": "UNAVAILABLE", "Brain Reason": str(e), "Version": UNIFIED_PROJECTION_BRAIN_VERSION})
+    return pd.DataFrame(rows)
+
+
+def render_unified_projection_brain_panel(board=None):
+    st.markdown('<div class="section-title-pro">Projection Brain / Data Quality</div>', unsafe_allow_html=True)
+    st.caption("Advisory only. This flags where to trust, track, or verify projections. It does not move official K, PO, ML, or 1st-inning projections.")
+    df = build_unified_projection_brain(board)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("Projection brain needs a loaded board.")
+        return
+    actions = df.get("Brain Action", pd.Series(dtype=str)).astype(str).str.upper()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows Checked", int(len(df)))
+    c2.metric("Support", int(actions.str.contains("SUPPORT").sum()))
+    c3.metric("Track/Thin", int(actions.str.contains("TRACK|THIN|LOW CEILING").sum()))
+    c4.metric("Verify/Pass/Data Gap", int(actions.str.contains("VERIFY|PASS|DATA GAP|UNAVAILABLE").sum()))
+    show_cols = [c for c in [
+        "Market", "Player", "Matchup", "Side", "Line", "Projection", "Edge", "Ceiling",
+        "History Plays", "History Win %", "History Bucket", "Missed By One %",
+        "Suggested Adj", "Advisory Projection", "History Read",
+        "Data Gate", "Brain Action", "Brain Reason", "Support",
+        "Pitcher K%", "Opp K%", "Whiff%", "Arsenal", "Version"
+    ] if c in df.columns]
+    st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+    with st.expander("How the advisory brain works", expanded=False):
+        st.markdown(
+            "- Keeps official projections unchanged.\n"
+            "- Uses your saved graded_history.csv to produce support-only adjustment suggestions once a side/line bucket has enough samples.\n"
+            "- Flags data gaps before you force a pick into a slip.\n"
+            "- Uses edge, data gate, ceiling, pitcher/opponent K support, workload, damage, cover, and score signals.\n"
+            "- Best use: compare SUPPORT rows against your official decisions; track misses in graded_history.csv before allowing any automatic adjustment."
+        )
+
+
 tab_kproj, tab_beta_outs, tab_first_inning_pc, tab_beta_ip_debug, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "K PROJ / UPSIDE",
     "🎯 OUTS BETA",
@@ -46602,6 +46993,7 @@ with tab_loss_lab:
 
 with tab_iq:
     render_baseball_iq_tab(board)
+    render_unified_projection_brain_panel(board)
 
 with tab_30d_learning:
     render_30_day_gamelog_learning_iq()
