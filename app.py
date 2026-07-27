@@ -40613,7 +40613,7 @@ def _render_first_inning_pitch_count_cards(df, max_cards=18):
         </style>
         <div class="fi-wrap">
         """ + "\n".join(cards) + "</div>"
-        components.html(html_doc, height=max(700, min(18000, 430 * max(1, len(cards)))), scrolling=False)
+        components.html(html_doc, height=max(900, min(32000, 720 * max(1, len(cards))) + 240), scrolling=True)
     except Exception as e:
         st.info(f"1st inning pitch-count cards unavailable: {e}")
 
@@ -40755,7 +40755,7 @@ def _render_moneyline_visual_cards(df, max_cards=12):
             d = d.sort_values("_sort", ascending=False).drop(columns=["_sort"])
         cards = "\n".join(_mlui_row_card(r) for _, r in d.head(int(max_cards)).iterrows())
         html_doc = f"{css}<div class=\"ml-card-wrap\">{cards}</div>"
-        components.html(html_doc, height=max(620, min(12000, 390 * max(1, min(int(max_cards), len(d))))), scrolling=False)
+        components.html(html_doc, height=max(900, min(32000, 620 * max(1, min(int(max_cards), len(d)))) + 240), scrolling=True)
     except Exception as e:
         st.info(f"Moneyline visual cards unavailable: {e}")
 
@@ -44510,7 +44510,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
         html_doc = css + '<div class="kcard-stack">' + "\n".join(cards) + "</div>"
         try:
             import streamlit.components.v1 as components
-            components.html(html_doc, height=max(760, min(26000, 610 * max(1, len(cards)))), scrolling=False)
+            components.html(html_doc, height=max(1000, min(42000, 980 * max(1, len(cards))) + 320), scrolling=True)
         except Exception:
             st.markdown(html_doc, unsafe_allow_html=True)
     except Exception as e:
@@ -45530,7 +45530,7 @@ def _po_render_player_cards(df, board=None, limit=None):
         </style>
         <div class="poc-wrap">{''.join(cards)}</div>
         """
-        components.html(html_doc, height=max(780, min(26000, 500 * max(1, len(cards)))), scrolling=False)
+        components.html(html_doc, height=max(1000, min(42000, 760 * max(1, len(cards))) + 320), scrolling=True)
     except Exception as e:
         st.info(f"Pitching Outs cards unavailable: {e}")
 
