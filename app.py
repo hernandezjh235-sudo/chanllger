@@ -13,6 +13,7 @@ import json
 import math
 import difflib
 import io
+import re
 import unicodedata
 import html
 import hashlib
@@ -14896,6 +14897,7 @@ def render_kproj_pitcher_card(p):
         <div class="mobile-info-card"><div class="small-muted">Pitch Count</div><div class="kpi-value" style="font-size:18px;">{p.get('pitch_count_score', '—')}</div><div class="kpi-sub">{p.get('pitch_count_label', '—')} | L3 {p.get('pitch_count_avg_l3', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Pitcher K% Strength</div><div class="kpi-value" style="font-size:15px;">{pitcher_k_strength_display}</div><div class="kpi-sub">Pitcher K% {pk*100:.1f}% | Board Rank {pitcher_k_rank_display}<br>{pitcher_k_rank_source_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Opponent Team K Rank</div><div class="kpi-value" style="font-size:15px;">{okr_env_display}</div><div class="kpi-sub">Opp {okr_team_display} vs {okr_hand_display}: {okr_k_hand_display} / {okr_rank_hand_display}<br>{okr_overall_line}<br>{okr_overall_so_line}<br>{okr_l30_overall_line}<br>{okr_l30_so_line}<br>{okr_rhp_line}<br>{okr_lhp_line}<br>{okr_l30_rhp_line}<br>{okr_l30_lhp_line}<br>{team_k_read_display}<br>Source: {okr_official_source_line}<br>MI Nudge: {card_row.get("Matchup Intel K Nudge", "—") if isinstance(card_row, dict) else "—"} K | {card_row.get("Matchup Intel Label", "—") if isinstance(card_row, dict) else "—"}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">OG Matchup Intel Shadow</div><div class="kpi-value" style="font-size:15px;">{card_row.get("OG Matchup Intel Shadow K Projection", "—") if isinstance(card_row, dict) else "—"} K</div><div class="kpi-sub">Edge {card_row.get("OG Matchup Intel Shadow Edge", "—") if isinstance(card_row, dict) else "—"} | {html.escape(str(card_row.get("OG Matchup Intel Shadow Decision", "—") if isinstance(card_row, dict) else "—"))}<br>Nudge {card_row.get("OG Matchup Intel Shadow Nudge", "—") if isinstance(card_row, dict) else "—"} K | {html.escape(str(card_row.get("OG Matchup Intel Shadow Label", "—") if isinstance(card_row, dict) else "—"))}<br>{html.escape(str(card_row.get("OG Matchup Intel Shadow Reason", "—") if isinstance(card_row, dict) else "—"))[:220]}</div></div>
         <div class="mobile-info-card"><div class="small-muted">APP97 Current K Interaction</div><div class="kpi-value" style="font-size:15px;">{html.escape(str(card_row.get("APP97 K Interaction Label", "—") if isinstance(card_row, dict) else "—"))}</div><div class="kpi-sub">Raw MLB Season Pitcher K%: {_card_pct(card_row.get("APP97 Raw MLB Season Pitcher K%") if isinstance(card_row, dict) else None)}<br>Pitcher K Source: {html.escape(str(card_row.get("APP97 Pitcher K Source","—") if isinstance(card_row, dict) else "—"))}<br>Season/GameLog: {html.escape(str(card_row.get("APP97 Pitcher Season Fetch Status","—") if isinstance(card_row, dict) else "—"))} / {html.escape(str(card_row.get("APP97 Pitcher GameLog Fetch Status","—") if isinstance(card_row, dict) else "—"))}<br>Current Opp K Env: {_card_pct(card_row.get("APP97 Opponent K Environment") if isinstance(card_row, dict) else None)}<br>Lineup K%: {_card_pct(card_row.get("APP97 Lineup K%") if isinstance(card_row, dict) else None)} ({html.escape(str(card_row.get("APP97 Lineup Status","—") if isinstance(card_row, dict) else "—"))})<br>BF: {card_row.get("APP97 Model Expected BF","—") if isinstance(card_row, dict) else "—"} → {card_row.get("APP97 Reconciled Expected BF","—") if isinstance(card_row, dict) else "—"}<br>Implied K: {card_row.get("APP97 Matchup Implied K","—") if isinstance(card_row, dict) else "—"}<br>Final Shift: {card_row.get("APP97 Projection Shift","—") if isinstance(card_row, dict) else "—"} K<br>{html.escape(str(card_row.get("APP97 Data Freshness","—") if isinstance(card_row, dict) else "—"))}</div></div>
         <div class="mobile-info-card"><div class="small-muted">1st Inning Layer</div><div class="kpi-value" style="font-size:15px;">{fi_label_display}</div><div class="kpi-sub">Sample {fi_sample_display} | Avg Pitches {fi_avg_p_display}<br>BF {fi_avg_bf_display} | 1st-K {fi_avg_k_display}<br>{fi_conf_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Decision Tier 3.0</div><div class="kpi-value" style="font-size:15px;">{decision_tier_display}</div><div class="kpi-sub">{decision_tier_note_display}</div></div>
@@ -29711,9 +29713,10 @@ def _okr_mi_projection_nudge(row, rec, hand):
       L3 + L5 + L10 + L15 + L30 vs pitcher hand, anchored by season vs-hand K%.
 
     It then compares verified team K% to the model's existing opponent K%.
-    ORIGINAL-ANCHOR TESTER: the adjustment is intentionally tiny and capped
-    at +/-0.20 K so K Environment fine-tunes the original K projection without
-    overpowering pitcher skill, BF/IP, leash, learning, or line-aware layers.
+    Balanced Matchup Intel: stronger than the old conservative 12% tester,
+    but still below the OG/Warrior 35% version. This gives elite K and strong
+    opponent-K environments enough room to fix one-K misses without letting
+    team K% overpower pitcher skill, BF/IP, leash, or line-aware layers.
     """
     try:
         verified_k, blend_note = _okr_mi_blended_k_pct(rec, hand)
@@ -29744,18 +29747,18 @@ def _okr_mi_projection_nudge(row, rec, hand):
 
         raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
 
-        # Original-anchor K Environment layer:
-        # use only 12% of raw K-opportunity delta and cap at +/-0.20 Ks.
-        # This keeps the regular K Upside projection close to the older
-        # 18-11 style build while still allowing a small matchup fine-tune.
-        weighted = raw * 0.12
-        capped = max(-0.20, min(0.20, weighted))
+        # Balanced K Environment layer:
+        # 24% of raw K-opportunity delta, capped at +/-0.25 Ks.
+        # Current conservative build was 12% / +/-0.20.
+        # OG/Warrior shadow is 35% / +/-0.30.
+        weighted = raw * 0.24
+        capped = max(-0.25, min(0.25, weighted))
 
-        if capped >= 0.15:
+        if capped >= 0.18:
             label = 'MI_K_ENV_PLUS'
         elif capped >= 0.05:
             label = 'MI_SMALL_K_ENV_PLUS'
-        elif capped <= -0.15:
+        elif capped <= -0.18:
             label = 'MI_CONTACT_TAX'
         elif capped <= -0.05:
             label = 'MI_SMALL_CONTACT_TAX'
@@ -29765,11 +29768,71 @@ def _okr_mi_projection_nudge(row, rec, hand):
         reason = (
             f'official MLB team K blend {verified_k:.2f}% ({blend_note}) '
             f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
-            f'raw {raw:+.2f}K * 0.12 capped +/-0.20 = {capped:+.2f}K'
+            f'raw {raw:+.2f}K * 0.24 capped +/-0.25 = {capped:+.2f}K'
         )
         return round(float(capped), 2), label, reason, verified_k
     except Exception as e:
         return 0.0, 'MI_ERROR', str(e), None
+
+
+def _okr_mi_projection_nudge_og_shadow(row, rec, hand):
+    """OG-file Matchup Intel shadow.
+
+    This mirrors the stronger File90/OG team-K environment read:
+    35% of the verified K-opportunity delta, capped at +/-0.30 K.
+    It is intentionally stored as shadow/audit output only so the current
+    projection is not moved unless we later prove it helps in graded history.
+    """
+    try:
+        verified_k, blend_note = _okr_mi_blended_k_pct(rec, hand)
+        if verified_k is None:
+            return 0.0, 'OG_MI_NO_VERIFIED_TEAM_K', '', verified_k
+
+        current_k = _okr_num(row.get('Opp K%'), None)
+        if current_k is None:
+            current_k = _okr_num(row.get('Opponent K% vs Pitcher Hand'), None)
+
+        if current_k is None:
+            current_k = 22.2
+            current_note = 'league_avg_fallback'
+        else:
+            if abs(current_k) <= 1:
+                current_k *= 100.0
+            current_note = 'existing_opp_k'
+
+        bf = _okr_num(row.get('Exp BF'), None)
+        if bf is None:
+            bf = _okr_num(row.get('BF-K Expected BF 2.1'), None)
+
+        if bf is None:
+            bf = 22.0
+            bf_note = 'bf_fallback_22'
+        else:
+            bf_note = 'exp_bf'
+
+        raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
+        weighted = raw * 0.35
+        capped = max(-0.30, min(0.30, weighted))
+
+        if capped >= 0.22:
+            label = 'OG_MI_ELITE_K_ENV_PLUS'
+        elif capped >= 0.07:
+            label = 'OG_MI_K_ENV_PLUS'
+        elif capped <= -0.22:
+            label = 'OG_MI_ELITE_CONTACT_TAX'
+        elif capped <= -0.07:
+            label = 'OG_MI_CONTACT_TAX'
+        else:
+            label = 'OG_MI_NEUTRAL'
+
+        reason = (
+            f'OG shadow: official team K blend {verified_k:.2f}% ({blend_note}) '
+            f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
+            f'raw {raw:+.2f}K * 0.35 capped +/-0.30 = {capped:+.2f}K'
+        )
+        return round(float(capped), 2), label, reason, verified_k
+    except Exception as e:
+        return 0.0, 'OG_MI_ERROR', str(e), None
 
 
 def _okr_mi_decision_from_proj(proj, line, old_decision):
@@ -29962,6 +30025,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     # Uses PA-shrunk L3/L5/L10/L15/L30 vs-hand K% plus season anchor; caps at +/-0.20 K.
     try:
         mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified, mi_blend_detail = [], [], [], [], [], [], []
+        og_mi_adj, og_mi_final, og_mi_edge, og_mi_decision, og_mi_label, og_mi_reason = [], [], [], [], [], []
         for idx, row in d.iterrows():
             rd = row.to_dict()
             opp = _okr_abbr(rd.get("Opponent Team"))
@@ -29973,8 +30037,18 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
             adj, lab, why, verified = _okr_mi_projection_nudge(rd, rec, hand)
             _, blend_detail = _okr_mi_blended_k_pct(rec, hand)
             final = base if base is None else round(max(0.0, float(base) + float(adj)), 2)
+            og_adj, og_lab, og_why, _og_verified = _okr_mi_projection_nudge_og_shadow(rd, rec, hand)
+            og_final = base if base is None else round(max(0.0, float(base) + float(og_adj)), 2)
+            ln = _okr_num(rd.get("UD/Line"), None)
+            og_edge_val = "" if og_final in [None, ""] or ln is None else round(float(og_final) - float(ln), 2)
             mi_pre.append("" if base is None else round(float(base), 2))
             mi_adj.append(adj); mi_final.append("" if final is None else final); mi_label.append(lab); mi_reason.append(why); mi_verified.append("" if verified is None else round(float(verified), 2)); mi_blend_detail.append(blend_detail)
+            og_mi_adj.append(og_adj)
+            og_mi_final.append("" if og_final is None else og_final)
+            og_mi_edge.append(og_edge_val)
+            og_mi_decision.append(_okr_mi_decision_from_proj(og_final, rd.get("UD/Line"), rd.get("Decision")))
+            og_mi_label.append(og_lab)
+            og_mi_reason.append(og_why)
         d["Pre-Matchup Intel K Projection"] = mi_pre
         d["Matchup Intel K Nudge"] = mi_adj
         d["Matchup Intel Label"] = mi_label
@@ -29983,7 +30057,14 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Recency Team K Blend Detail"] = mi_blend_detail
         d["Recency Team K Blend Method"] = "PA-shrunk L3/L5/L10/L15/L30/season vs hand; short windows are low weight and unsupported recent weight shrinks to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_ADAPTIVE_RECENCY_L5_25_55_L15_L30_SEASON_PA_TREND_SHRINK_WEIGHT_0_12_CAP_0_20_2026_07_11"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_BALANCED_RECENCY_BLEND_WEIGHT_0_24_CAP_0_25_2026_07_27"
+        d["OG Matchup Intel Shadow K Projection"] = og_mi_final
+        d["OG Matchup Intel Shadow Nudge"] = og_mi_adj
+        d["OG Matchup Intel Shadow Edge"] = og_mi_edge
+        d["OG Matchup Intel Shadow Decision"] = og_mi_decision
+        d["OG Matchup Intel Shadow Label"] = og_mi_label
+        d["OG Matchup Intel Shadow Reason"] = og_mi_reason
+        d["OG Matchup Intel Shadow Version"] = "OG_FILE90_SHADOW_TEAM_K_35_WEIGHT_CAP_0_30_AUDIT_ONLY_2026_07_27"
         # Promote this as the final display/export projection, but record the pre-value above.
         for c in ["K PROJ", "Line-Aware Smart Final K Projection", "Final K Projection"]:
             if c in d.columns:
