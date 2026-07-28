@@ -2570,13 +2570,13 @@ def build_mlb_projected_lineup_rows(team_id, pitcher_hand=None, before_date=None
 # - Used only when MLB confirmed lineup is not available yet
 # - Falls back safely to the internal MLB projected lineup engine
 # =========================
-ROTOWIRE_EXPECTED_LINEUPS_ENABLED = False  # legacy-safe mode: external lineup pages are manual/audit only
+ROTOWIRE_EXPECTED_LINEUPS_ENABLED = True  # pre-lineup only; MLB confirmed lineups still override this completely
 ROTOWIRE_DAILY_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 ROTOWIRE_WIDGETS_LINEUPS_URL = "https://www.widgets.rotowire.com/baseball/daily-lineups.php"
 ROTOGRINDERS_LINEUPS_URL = "https://rotogrinders.com/lineups/mlb"
 ROTOWIRE_LINEUP_MIN_VALID_HITTERS = 5
 ROTOWIRE_MANUAL_LINEUPS_FILE = os.path.join(STORAGE_DIR, "rotowire_manual_lineups.csv")
-ROTOWIRE_AUTO_PULL_VERSION = "LEGACY_SAFE_INTERNAL_LINEUPS_NO_AUTO_EXTERNAL_2026_07_26"
+ROTOWIRE_AUTO_PULL_VERSION = "PRELINEUP_ROTOWIRE_FANTASYPROS_FANGRAPHS_SAFE_FALLBACK_2026_07_27"
 LINEUP_CACHE_MAX_HOURS = 30
 # Railway/cloud IPs can occasionally receive a thin/blocked page from RotoWire.
 # Direct RotoWire is ALWAYS attempted first. Jina Reader is only a transport fallback
@@ -4262,7 +4262,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
     selected = candidates[:9]
     selected.sort(key=lambda x: (x[1], -x[0]))
 
-    exposure = [1.08, 1.07, 1.06, 1.04, 1.02, 1.00, 0.97, 0.94, 0.92]
+    exposure = [1.16, 1.13, 1.10, 1.06, 1.00, 0.96, 0.92, 0.88, 0.84]
     output = []
     weighted_num = 0.0
     weighted_den = 0.0
@@ -4330,7 +4330,7 @@ def _expected_lineup_consensus(game_pk, opp_side, pitcher_hand=None):
 
 
 def _weighted_lineup_k_from_rows(rows):
-    exposure = [1.08, 1.07, 1.06, 1.04, 1.02, 1.00, 0.97, 0.94, 0.92]
+    exposure = [1.16, 1.13, 1.10, 1.06, 1.00, 0.96, 0.92, 0.88, 0.84]
     num = den = 0.0
     for i, rr in enumerate((rows or [])[:9]):
         kr = safe_float(rr.get("Raw_K_Rate"), None)
@@ -44096,6 +44096,36 @@ def _kcard_pitch_name_short(value):
     return aliases.get(txt.lower(), txt or "Pitch")
 
 
+def _kcard_pitch_key(value):
+    txt = str(value or "").strip().lower()
+    txt = re.sub(r"[^a-z0-9]+", " ", txt).strip()
+    aliases = {
+        "ff": "four seam fastball",
+        "fa": "four seam fastball",
+        "fastball": "four seam fastball",
+        "4 seam fastball": "four seam fastball",
+        "four seamer": "four seam fastball",
+        "four seam fb": "four seam fastball",
+        "si": "sinker",
+        "sink": "sinker",
+        "sl": "slider",
+        "st": "sweeper",
+        "sweeper": "sweeper",
+        "fc": "cutter",
+        "ct": "cutter",
+        "fs": "splitter",
+        "split finger": "splitter",
+        "splitter": "splitter",
+        "ch": "changeup",
+        "change": "changeup",
+        "cu": "curveball",
+        "kc": "knuckle curve",
+        "knuckle curve": "knuckle curve",
+        "curve": "curveball",
+    }
+    return aliases.get(txt, txt)
+
+
 def _kcard_pitch_mix_feed():
     frames = []
     for name in ["pitch_mix_matchups.csv", "pitch-arsenal-stats.csv"]:
@@ -44246,8 +44276,155 @@ def _kcard_arsenal_html(profile):
     return "<table class='kc-arsenal'><thead><tr><th>Pitch</th><th>Use</th><th>K%</th><th>Whiff</th><th>Put</th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>"
 
 
+def _kcard_batter_pitch_value(rr, names, default=np.nan):
+    for name in names:
+        try:
+            val = (rr or {}).get(name)
+        except Exception:
+            val = None
+        if val not in (None, "", "—", "-", "nan", "NaN"):
+            return val
+    return default
+
+
+def _kcard_opponent_pitch_arsenal_profile(row, p, arsenal):
+    """Opponent hitters vs the pitcher's actual pitch mix.
+
+    Uses true per-batter pitch-profile rows when the scraper/feed has them.
+    If those rows are not present yet, it falls back to the installed Savant
+    pitcher pitch-mix rows so the card still has real arsenal context.
+    """
+    top_pitch = str((arsenal or {}).get("top_pitch") or _kclean_pick(row or {}, ["Pitch Arsenal Top Pitch Used", "Top Pitch", "APP100 Top Pitch"], "") or "")
+    top_key = _kcard_pitch_key(top_pitch)
+    pitch_weights = {}
+    for ar in (arsenal or {}).get("rows", []) or []:
+        pk = _kcard_pitch_key(ar.get("Pitch"))
+        use = _kclean_num(ar.get("Use"), np.nan)
+        if np.isfinite(use) and use > 0:
+            pitch_weights[pk] = use
+
+    raw_rows = [r for r in ((p or {}).get("batter_pitch_profile_rows") or []) if isinstance(r, dict)]
+    matched = []
+    for rr in raw_rows:
+        pitch = _kcard_batter_pitch_value(rr, ["Pitch", "Pitch Type", "pitch_name", "pitch_type", "type"], "")
+        pk = _kcard_pitch_key(pitch)
+        if top_key and pk and pk != top_key:
+            continue
+        batter = _kcard_batter_pitch_value(rr, ["Batter", "Player", "Name", "batter_name", "player_name"], "")
+        pa = _kclean_num(_kcard_batter_pitch_value(rr, ["PA", "pa", "BF", "Pitches", "PC", "pitches"], np.nan), np.nan)
+        kval = _kclean_num(_kcard_batter_pitch_value(rr, ["K%", "k_percent", "K Rate", "strikeout_percent", "vs_pitch_k", "K% vs Pitch"], np.nan), np.nan)
+        whiff = _kclean_num(_kcard_batter_pitch_value(rr, ["Whiff%", "whiff_percent", "Whiff Rate", "swing_miss_percent", "vs_pitch_whiff"], np.nan), np.nan)
+        woba = _kclean_num(_kcard_batter_pitch_value(rr, ["wOBA", "woba", "xwOBA", "xwoba", "est_woba"], np.nan), np.nan)
+        if np.isfinite(kval) and abs(kval) <= 1:
+            kval *= 100.0
+        if np.isfinite(whiff) and abs(whiff) <= 1:
+            whiff *= 100.0
+        matched.append({
+            "Batter": str(batter or ""),
+            "Pitch": _kcard_pitch_name_short(pitch or top_pitch),
+            "PA": pa,
+            "K%": kval,
+            "Whiff%": whiff,
+            "wOBA": woba,
+        })
+
+    if matched:
+        vals_k = [_kclean_num(r.get("K%"), np.nan) for r in matched]
+        vals_w = [_kclean_num(r.get("Whiff%"), np.nan) for r in matched]
+        weights = np.array([max(1.0, _kclean_num(r.get("PA"), 1.0)) for r in matched], dtype=float)
+        k_vals = np.array([v for v in vals_k], dtype=float)
+        w_vals = np.array([v for v in vals_w], dtype=float)
+        k_mask = np.isfinite(k_vals)
+        w_mask = np.isfinite(w_vals)
+        opp_k = float(np.average(k_vals[k_mask], weights=weights[k_mask])) if k_mask.any() else np.nan
+        opp_whiff = float(np.average(w_vals[w_mask], weights=weights[w_mask])) if w_mask.any() else np.nan
+        source = "BATTER_VS_TOP_PITCH"
+    else:
+        # Real pitcher-level Savant pitch-mix fallback. It is not batter-level,
+        # but prevents fake dashes and keeps the support read honest.
+        rows = (arsenal or {}).get("rows", []) or []
+        opp_k = _kclean_num((arsenal or {}).get("weighted_k"), np.nan)
+        opp_whiff = _kclean_num((arsenal or {}).get("weighted_whiff"), np.nan)
+        matched = [{
+            "Batter": "Pitch-mix baseline",
+            "Pitch": r.get("Pitch"),
+            "PA": _kclean_num(r.get("Use"), np.nan),
+            "K%": _kclean_num(r.get("K%"), np.nan),
+            "Whiff%": _kclean_num(r.get("Whiff%"), np.nan),
+            "wOBA": _kclean_num(r.get("Damage"), np.nan),
+        } for r in rows[:5]]
+        source = "PITCHER_ARSENAL_BASELINE"
+
+    top_usage = _kclean_num((arsenal or {}).get("top_usage"), np.nan)
+    score = 0.0
+    if np.isfinite(opp_k):
+        score += (opp_k - 22.0) * 1.15
+    if np.isfinite(opp_whiff):
+        score += (opp_whiff - 24.0) * 1.25
+    if np.isfinite(top_usage) and top_usage >= 40:
+        score *= 1.15
+    if not np.isfinite(opp_k) and not np.isfinite(opp_whiff):
+        read = "PITCH_ARSENAL_DATA_GAP"
+        adj = 0.0
+    elif score >= 9:
+        read = "TOP_PITCH_UPSIDE"
+        adj = 0.12
+    elif score >= 4:
+        read = "PITCH_MIX_SUPPORT"
+        adj = 0.06
+    elif score <= -8:
+        read = "TOP_PITCH_SUPPRESSION"
+        adj = -0.12
+    elif score <= -4:
+        read = "PITCH_MIX_RISK"
+        adj = -0.06
+    else:
+        read = "PITCH_MIX_NEUTRAL"
+        adj = 0.0
+    return {
+        "rows": matched[:9],
+        "source": source,
+        "top_pitch": top_pitch,
+        "top_usage": top_usage,
+        "opp_k": opp_k,
+        "opp_whiff": opp_whiff,
+        "score": score,
+        "read": read,
+        "adj": adj,
+    }
+
+
+def _kcard_opponent_pitch_arsenal_html(profile):
+    rows = (profile or {}).get("rows") or []
+    if not rows:
+        return '<div class="kc-empty">Opponent-vs-pitch arsenal rows not matched yet. Upload pitch_mix_matchups.csv and true batter pitch-profile data to fill this section.</div>'
+    def _fmt(value, digits=0, suffix="%"):
+        v = _kclean_num(value, np.nan)
+        if not np.isfinite(v):
+            return "—"
+        return f"{v:.{digits}f}{suffix}"
+    trs = []
+    for idx, r in enumerate(rows[:9], start=1):
+        batter = html.escape(str(r.get("Batter") or "Pitch-mix baseline"))
+        pitch = html.escape(str(r.get("Pitch") or (profile or {}).get("top_pitch") or "Pitch"))
+        k = _fmt(r.get("K%"), 0)
+        whiff = _fmt(r.get("Whiff%"), 0)
+        pa = _fmt(r.get("PA"), 0, "")
+        woba_val = _kclean_num(r.get("wOBA"), np.nan)
+        woba = "—" if not np.isfinite(woba_val) else f"{woba_val:.3f}" if abs(woba_val) < 2 else f"{woba_val:.0f}%"
+        cls = "hi" if _kclean_num(r.get("Whiff%"), 0) >= 30 or _kclean_num(r.get("K%"), 0) >= 28 else "lo" if _kclean_num(r.get("Whiff%"), 99) <= 18 else ""
+        trs.append(f"<tr><td>{idx}</td><td>{batter}</td><td>{pitch}</td><td>{pa}</td><td class='{cls}'>K:{k}</td><td class='{cls}'>W:{whiff}</td><td>{woba}</td></tr>")
+    return "<table class='kc-lineup'><thead><tr><th>#</th><th>Batter/Profile</th><th>Pitch</th><th>PA/Use</th><th>K%</th><th>Whiff</th><th>wOBA</th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>"
+
+
 def _kcard_ceiling_value(row, line=np.nan, proj=np.nan, arsenal=None):
-    """Display-only K ceiling. Prefer true numeric columns, then parse audit strings."""
+    """Display-only K ceiling.
+
+    Prefer the Monte Carlo P90 because it is generated from the same final K mean,
+    line, role/volume risk, damage risk, and data-completeness volatility used by
+    the probability table. If P90 is missing, use a bounded context fallback from
+    workload, whiff, pitch arsenal, and recent K logs.
+    """
     raw = _kclean_pick(row or {}, ["K Sim P90", "APP100 K P90", "Ceiling", "Atlas Ceiling K", "K Ceiling", "P90", "80th Percentile K"], np.nan)
     val = _kclean_num(raw, np.nan)
     if np.isfinite(val):
@@ -44264,14 +44441,33 @@ def _kcard_ceiling_value(row, line=np.nan, proj=np.nan, arsenal=None):
     line_v = _kclean_num(line, np.nan)
     score = _kclean_num((arsenal or {}).get("score"), np.nan)
     whiff = _kclean_num((arsenal or {}).get("weighted_whiff"), np.nan)
-    bump = 1.25
+    if not np.isfinite(whiff):
+        whiff = _kclean_num(_kclean_pick(row or {}, ["Whiff%", "Official Whiff%", "Savant Custom Whiff%", "APP100 Whiff%"], np.nan), np.nan)
+    if np.isfinite(whiff) and whiff <= 1:
+        whiff *= 100.0
+    bf = _kclean_num(_kclean_pick(row or {}, ["APP100 Projected BF", "APP97 Reconciled Expected BF", "Exp BF", "Projected BF", "BF"], np.nan), np.nan)
+    kbf = proj_v / bf if np.isfinite(bf) and bf > 0 else np.nan
+    last10 = []
+    try:
+        last10 = _kcard_last10_values(row or {}, {}) if "_kcard_last10_values" in globals() else []
+    except Exception:
+        last10 = []
+    last10_p80 = float(np.percentile(last10, 80)) if len(last10) >= 5 else np.nan
+    bump = 1.10
     if np.isfinite(line_v) and line_v >= 6.5:
-        bump += 0.55
+        bump += 0.40
     if np.isfinite(score) and score >= 66:
-        bump += 0.45
-    if np.isfinite(whiff) and whiff >= 30:
         bump += 0.35
-    return proj_v + max(1.0, min(2.8, bump))
+    if np.isfinite(whiff) and whiff >= 30:
+        bump += 0.30
+    if np.isfinite(kbf) and kbf >= 0.25:
+        bump += 0.25
+    if np.isfinite(bf) and bf >= 23:
+        bump += 0.20
+    fallback = proj_v + max(0.9, min(2.6, bump))
+    if np.isfinite(last10_p80):
+        fallback = max(fallback, min(proj_v + 2.8, last10_p80))
+    return fallback
 
 
 def _kcard_last10_values(row, p):
@@ -44463,6 +44659,12 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             arsenal_signal = html.escape(str(arsenal.get("signal") or "Arsenal"))
             match_k = _kclean_fmt(arsenal.get("weighted_k"), 1)
             match_whiff = _kclean_fmt(arsenal.get("weighted_whiff"), 1)
+            opp_pitch_profile = _kcard_opponent_pitch_arsenal_profile(row, p, arsenal)
+            opp_pitch_html = _kcard_opponent_pitch_arsenal_html(opp_pitch_profile)
+            opp_pitch_read = html.escape(str(opp_pitch_profile.get("read") or "PITCH_MIX_NEUTRAL"))
+            opp_pitch_source = html.escape(str(opp_pitch_profile.get("source") or ""))
+            opp_pitch_k = _kclean_fmt(opp_pitch_profile.get("opp_k"), 1)
+            opp_pitch_whiff = _kclean_fmt(opp_pitch_profile.get("opp_whiff"), 1)
             ceiling_num = _kcard_ceiling_value(row, line=line, proj=proj, arsenal=arsenal)
             ceiling = "—" if not np.isfinite(_kclean_num(ceiling_num, np.nan)) else f"{int(round(float(ceiling_num)))}K"
             last10_html = _kcard_last10_html(row, p, line)
@@ -44489,6 +44691,11 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 </div>
                 <div class="kc-section-title"><span>{arsenal_signal}</span><span class="kc-chip">Match K {match_k}% · Opp Whiff {match_whiff}%</span></div>
                 {arsenal_rows}
+              </div>
+              <div class="kc-section">
+                <div class="kc-section-title"><span>Opponent vs Pitch Arsenal</span><span class="kc-chip">{opp_pitch_read} · K {opp_pitch_k}% · W {opp_pitch_whiff}%</span></div>
+                {opp_pitch_html}
+                <div class="kc-empty">{opp_pitch_source}</div>
               </div>
               <div class="kc-metrics">
                 <div class="kc-stat"><span>Pitch K%</span><b>{pk}</b></div>
@@ -46808,6 +47015,20 @@ def build_unified_projection_brain(board=None):
                     "Opp K%": _upb_num(r, ["Opponent K% vs Pitcher Hand", "Opp K%", "APP100 Opp K%"]),
                     "Whiff%": _upb_num(r, ["Whiff%", "Official Whiff%", "statcast_whiff"]),
                     "Arsenal": _upb_num(r, ["APP100 Arsenal Score", "Pitch Mix Matchup Score"]),
+                    "Lineup Stage": _upb_text(r, ["Lineup Trace Stage"], ""),
+                    "Weighted Lineup K%": _upb_num(r, ["Lineup Trace Weighted K%"]),
+                    "Opp-vs-Lineup K Gap": _upb_num(r, ["Lineup Trace Opp-vs-Weighted Delta"]),
+                    "Thin Edge Gate": _upb_text(r, ["Lineup Trace Thin Edge Gate"], ""),
+                    "K/BF": _upb_num(r, ["Lineup Trace K/BF"]),
+                    "Pitch Arsenal Matchup Read": _upb_text(r, ["Pitch Arsenal Matchup Read"], ""),
+                    "Pitch Arsenal Opp K%": _upb_num(r, ["Pitch Arsenal Opp K%"]),
+                    "Pitch Arsenal Opp Whiff%": _upb_num(r, ["Pitch Arsenal Opp Whiff%"]),
+                    "Pitch Arsenal Top Pitch": _upb_text(r, ["Pitch Arsenal Top Pitch"], ""),
+                    "Pitch Arsenal Support Adj": _upb_num(r, ["Pitch Arsenal Support Adj"]),
+                    "Upside Watch": _upb_text(r, ["Lineup Trace Upside Watch"], ""),
+                    "True Advisor Projection": _upb_num(r, ["True K Advisor Projection"]),
+                    "True Advisor Adj": _upb_num(r, ["True K Advisor Adj"]),
+                    "True Advisor Read": _upb_text(r, ["True K Advisor Read"], ""),
                     "Version": UNIFIED_PROJECTION_BRAIN_VERSION,
                 }, "K", side, line, proj))
     except Exception as e:
@@ -46942,7 +47163,12 @@ def render_unified_projection_brain_panel(board=None):
         "History Plays", "History Win %", "History Bucket", "Missed By One %",
         "Suggested Adj", "Advisory Projection", "History Read",
         "Data Gate", "Brain Action", "Brain Reason", "Support",
-        "Pitcher K%", "Opp K%", "Whiff%", "Arsenal", "Version"
+        "Pitcher K%", "Opp K%", "Weighted Lineup K%", "Opp-vs-Lineup K Gap",
+        "Whiff%", "Arsenal", "Lineup Stage", "Thin Edge Gate", "K/BF",
+        "Pitch Arsenal Matchup Read", "Pitch Arsenal Opp K%", "Pitch Arsenal Opp Whiff%",
+        "Pitch Arsenal Top Pitch", "Pitch Arsenal Support Adj",
+        "Upside Watch", "True Advisor Projection", "True Advisor Adj",
+        "True Advisor Read", "Version"
     ] if c in df.columns]
     st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
     with st.expander("How the advisory brain works", expanded=False):
@@ -46952,6 +47178,1167 @@ def render_unified_projection_brain_panel(board=None):
             "- Flags data gaps before you force a pick into a slip.\n"
             "- Uses edge, data gate, ceiling, pitcher/opponent K support, workload, damage, cover, and score signals.\n"
             "- Best use: compare SUPPORT rows against your official decisions; track misses in graded_history.csv before allowing any automatic adjustment."
+        )
+
+
+LINEUP_TRACE_AUDIT_VERSION = "LINEUP_TRACE_AUDIT_2026_07_27"
+LINEUP_SNAPSHOT_FILE = os.path.join("learning_data", "lineup_projection_snapshots.csv")
+TRUE_K_ADVISOR_VERSION = "TRUE_K_ADVISOR_SUPPORT_ONLY_2026_07_27"
+
+
+def _lta_num(value, default=np.nan):
+    try:
+        if "_kclean_num" in globals():
+            return _kclean_num(value, default)
+        out = pd.to_numeric(value, errors="coerce")
+        return float(out) if np.isfinite(out) else default
+    except Exception:
+        return default
+
+
+def _lta_text(value, default=""):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def _lta_pick(row, keys, default=""):
+    try:
+        if "_kclean_pick" in globals():
+            return _kclean_pick(row or {}, keys, default)
+    except Exception:
+        pass
+    try:
+        for key in keys:
+            val = (row or {}).get(key)
+            if val not in (None, "", "—", "-", "nan", "NaN"):
+                return val
+    except Exception:
+        pass
+    return default
+
+
+def _lta_board_lookup(board):
+    out = {}
+    try:
+        for p in board or []:
+            name = str((p or {}).get("pitcher") or (p or {}).get("Pitcher") or "").strip()
+            if name:
+                out[normalize_name(name)] = p
+    except Exception:
+        pass
+    return out
+
+
+def _lta_lineup_rows(row, p):
+    try:
+        rows = _kcard_lineup_rows(row, p) if "_kcard_lineup_rows" in globals() else []
+        if rows:
+            return rows
+    except Exception:
+        pass
+    for src in [p or {}, row or {}]:
+        for key in ["lineup_rows", "Lineup Rows", "confirmed_lineup_rows", "projected_lineup_rows"]:
+            val = src.get(key) if isinstance(src, dict) else None
+            if isinstance(val, list) and val:
+                return val
+    return []
+
+
+def _lta_batter_k(row):
+    for key in ["Used K%", "K% Used", "Split K%", "K% vs Hand", "K% vs RHP", "K% vs LHP", "Season K%", "K%"]:
+        val = _lta_num((row or {}).get(key), np.nan)
+        if np.isfinite(val):
+            return val * 100.0 if abs(val) <= 1.0 else val
+    return np.nan
+
+
+def _lta_order_weights(n):
+    base = [1.16, 1.13, 1.10, 1.06, 1.00, 0.96, 0.92, 0.88, 0.84]
+    weights = np.array(base[: max(0, min(9, int(n or 0)))], dtype=float)
+    if weights.size == 0:
+        return weights
+    return weights / (weights.mean() or 1.0)
+
+
+def _lta_lineup_profile(rows):
+    vals = []
+    hands = []
+    sources = []
+    hitters = []
+    for r in rows[:9]:
+        k = _lta_batter_k(r)
+        if np.isfinite(k):
+            vals.append(float(k))
+        hands.append(_lta_text((r or {}).get("Hand") or (r or {}).get("Bats"), ""))
+        sources.append(_lta_text((r or {}).get("Lineup Source") or (r or {}).get("K Source"), ""))
+        hitters.append(_lta_text((r or {}).get("Batter") or (r or {}).get("Player") or (r or {}).get("Name"), ""))
+    weights = _lta_order_weights(len(vals))
+    weighted = float(np.average(vals, weights=weights[:len(vals)])) if vals and weights.size else np.nan
+    top4 = float(np.mean(vals[:4])) if len(vals) >= 4 else (float(np.mean(vals)) if vals else np.nan)
+    return {
+        "count": len(rows[:9]),
+        "valid_k": len(vals),
+        "avg_k": float(np.mean(vals)) if vals else np.nan,
+        "weighted_k": weighted,
+        "top4_k": top4,
+        "high_k": int(sum(v >= 25.0 for v in vals)),
+        "low_k": int(sum(v <= 16.0 for v in vals)),
+        "top4_high_k": int(sum(v >= 25.0 for v in vals[:4])),
+        "hands": "/".join([h for h in hands[:9] if h]),
+        "sources": " | ".join([s for s in sources[:3] if s])[:180],
+        "hitters": " | ".join([h for h in hitters[:9] if h])[:500],
+    }
+
+
+def _lta_lineup_stage(row, p, profile):
+    text = " ".join([
+        _lta_text(_lta_pick(row, ["Lineup Status", "APP97 Lineup Status", "Projection Source", "Lineup Source"], "")),
+        _lta_text((p or {}).get("lineup_status") if isinstance(p, dict) else ""),
+        _lta_text(profile.get("sources"), ""),
+    ]).upper()
+    if "OFFICIAL" in text or "CONFIRMED" in text or "MLB_OFFICIAL" in text:
+        return "CONFIRMED"
+    if "ROTOWIRE" in text:
+        return "ROTOWIRE_EXPECTED"
+    if "PROJECTED" in text or "EXPECTED" in text:
+        return "EXPECTED"
+    return "FALLBACK"
+
+
+def _lta_projection_trace(row, profile):
+    proj = _lta_num(_lta_pick(row, ["K PROJ", "Projection", "Final K Projection", "Winning File K Projection"], np.nan))
+    line = _lta_num(_lta_pick(row, ["UD/Line", "Line", "Strikeout Line"], np.nan))
+    bf = _lta_num(_lta_pick(row, ["APP100 Projected BF", "APP97 Reconciled Expected BF", "Exp BF", "Projected BF", "BF"], np.nan))
+    ip = _lta_num(_lta_pick(row, ["APP100 Projected IP", "IP", "IP PROJ", "Projected IP"], np.nan))
+    ceiling = _lta_num(_lta_pick(row, ["K Sim P90", "APP100 K P90", "Ceiling", "K Ceiling", "P90"], np.nan))
+    if not np.isfinite(ceiling):
+        try:
+            ceiling = _kcard_ceiling_value(row, line, proj, None) if "_kcard_ceiling_value" in globals() else np.nan
+        except Exception:
+            ceiling = np.nan
+    opp_k = _lta_num(_lta_pick(row, [
+        "Opponent K% vs Pitcher Hand", "Opp K%", "APP100 Opp K%", "APP97 Opponent K Environment",
+        "APP88 Batter Lineup K%", "Confirmed Lineup K%"
+    ], np.nan))
+    if np.isfinite(opp_k) and abs(opp_k) <= 1.0:
+        opp_k *= 100.0
+    weighted_k = _lta_num(profile.get("weighted_k"), np.nan)
+    delta = opp_k - weighted_k if np.isfinite(opp_k) and np.isfinite(weighted_k) else np.nan
+    edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
+    kbf = proj / bf if np.isfinite(proj) and np.isfinite(bf) and bf > 0 else np.nan
+    whiff = _lta_num(_lta_pick(row, ["Whiff%", "Official Whiff%", "statcast_whiff"], np.nan))
+    if np.isfinite(whiff) and abs(whiff) <= 1.0:
+        whiff *= 100.0
+    if not np.isfinite(delta):
+        materiality = "NO_LINEUP_K_TRACE"
+    elif abs(delta) >= 2.0:
+        materiality = "MATERIAL_K_ENV_GAP"
+    elif abs(delta) >= 1.0:
+        materiality = "SMALL_K_ENV_GAP"
+    else:
+        materiality = "K_ENV_ALIGNED"
+    if not np.isfinite(edge):
+        thin_gate = "NO_LINE"
+    elif abs(edge) < 0.35:
+        thin_gate = "PASS_THIN_EDGE"
+    elif abs(edge) < 0.55:
+        thin_gate = "TRACK_THIN_EDGE"
+    else:
+        thin_gate = "EDGE_CLEAR"
+    ceiling_gap = ceiling - proj if np.isfinite(ceiling) and np.isfinite(proj) else np.nan
+    if np.isfinite(ceiling_gap) and ceiling_gap >= 2.0 and np.isfinite(weighted_k) and weighted_k >= 22.0 and np.isfinite(bf) and bf >= 21.5 and np.isfinite(whiff) and whiff >= 24.0:
+        upside = "UPSIDE_READY_TRACK"
+    elif np.isfinite(ceiling_gap) and ceiling_gap >= 2.0:
+        upside = "CEILING_DISPLAY_ONLY"
+    else:
+        upside = "CENTER_RANGE"
+    return {
+        "proj": proj,
+        "line": line,
+        "bf": bf,
+        "ip": ip,
+        "bf_low": round(bf * 0.84, 1) if np.isfinite(bf) else np.nan,
+        "bf_high": round(bf * 1.12, 1) if np.isfinite(bf) else np.nan,
+        "ip_low": round(ip * 0.84, 2) if np.isfinite(ip) else np.nan,
+        "ip_high": round(ip * 1.12, 2) if np.isfinite(ip) else np.nan,
+        "opp_k": opp_k,
+        "delta": delta,
+        "edge": edge,
+        "kbf": kbf,
+        "ceiling": ceiling,
+        "ceiling_gap": ceiling_gap,
+        "materiality": materiality,
+        "thin_gate": thin_gate,
+        "upside": upside,
+        "formula": f"K={proj:.2f} = BF {bf:.1f} x K/BF {kbf:.3f}" if np.isfinite(proj) and np.isfinite(bf) and np.isfinite(kbf) else "K=BF x K/BF needs BF/proj",
+    }
+
+
+def _lta_pitch_arsenal_matchup(row, p):
+    try:
+        arsenal = _kcard_arsenal_profile(row or {}, p or {}) if "_kcard_arsenal_profile" in globals() else {}
+        prof = _kcard_opponent_pitch_arsenal_profile(row or {}, p or {}, arsenal) if "_kcard_opponent_pitch_arsenal_profile" in globals() else {}
+        return {
+            "Pitch Arsenal Matchup Read": _lta_text(prof.get("read"), "PITCH_MIX_NEUTRAL"),
+            "Pitch Arsenal Support Adj": round(_lta_num(prof.get("adj"), 0.0), 2),
+            "Pitch Arsenal Top Pitch": _lta_text(prof.get("top_pitch"), _lta_pick(row or {}, ["APP100 Top Pitch", "Pitch Arsenal Top Pitch Used", "Top Pitch"], "")),
+            "Pitch Arsenal Top Usage": round(_lta_num(prof.get("top_usage"), np.nan), 1) if np.isfinite(_lta_num(prof.get("top_usage"), np.nan)) else np.nan,
+            "Pitch Arsenal Opp K%": round(_lta_num(prof.get("opp_k"), np.nan), 1) if np.isfinite(_lta_num(prof.get("opp_k"), np.nan)) else np.nan,
+            "Pitch Arsenal Opp Whiff%": round(_lta_num(prof.get("opp_whiff"), np.nan), 1) if np.isfinite(_lta_num(prof.get("opp_whiff"), np.nan)) else np.nan,
+            "Pitch Arsenal Matchup Source": _lta_text(prof.get("source"), ""),
+        }
+    except Exception:
+        return {
+            "Pitch Arsenal Matchup Read": "PITCH_MIX_TRACE_ERROR",
+            "Pitch Arsenal Support Adj": 0.0,
+            "Pitch Arsenal Top Pitch": _lta_pick(row or {}, ["APP100 Top Pitch", "Pitch Arsenal Top Pitch Used", "Top Pitch"], ""),
+            "Pitch Arsenal Top Usage": np.nan,
+            "Pitch Arsenal Opp K%": np.nan,
+            "Pitch Arsenal Opp Whiff%": np.nan,
+            "Pitch Arsenal Matchup Source": "",
+        }
+
+
+def _tka_quality_adjustments(row, trace):
+    """Support-only center calibration. This never rewrites K PROJ.
+
+    The adjustment is intentionally small and bounded because the existing board
+    has winning pockets. It only answers: if we were auditing a true center,
+    which component is likely pulling low/high?
+    """
+    proj = _lta_num(trace.get("proj"), np.nan)
+    line = _lta_num(trace.get("line"), np.nan)
+    bf = _lta_num(trace.get("bf"), np.nan)
+    kbf = _lta_num(trace.get("kbf"), np.nan)
+    weighted_k = _lta_num(row.get("Lineup Trace Weighted K%") if isinstance(row, dict) else np.nan, np.nan)
+    opp_k = _lta_num(trace.get("opp_k"), np.nan)
+    whiff = _lta_num(_lta_pick(row, ["Whiff%", "Official Whiff%", "Savant Custom Whiff%", "APP100 Whiff%"], np.nan), np.nan)
+    if np.isfinite(whiff) and whiff <= 1:
+        whiff *= 100.0
+    pitch_k = _lta_num(_lta_pick(row, ["APP100 Pitcher K%", "Pitcher K%", "Official Pitcher K%", "Savant Custom K%"], np.nan), np.nan)
+    if np.isfinite(pitch_k) and pitch_k <= 1:
+        pitch_k *= 100.0
+    match_k = _lta_num(_lta_pick(row, ["Match K%", "APP100 Match K%", "Pitch Mix Match K%", "Lineup Match K%"], np.nan), np.nan)
+    if np.isfinite(match_k) and match_k <= 1:
+        match_k *= 100.0
+    recent = str(_lta_pick(row, ["APP100 Recent Skill", "Recent Skill", "Skill"], "") or "").upper()
+    workload = str(_lta_pick(row, ["APP100 BF Coverage", "BF Gate", "Workload Gate"], "") or "").upper()
+    stage = str(row.get("Lineup Trace Stage") or "").upper() if isinstance(row, dict) else ""
+    ceiling_gap = _lta_num(trace.get("ceiling_gap"), np.nan)
+    edge = _lta_num(trace.get("edge"), np.nan)
+    adj = 0.0
+    notes = []
+
+    if stage == "CONFIRMED" and np.isfinite(weighted_k) and np.isfinite(opp_k):
+        gap = weighted_k - opp_k
+        if abs(gap) >= 1.0 and np.isfinite(bf):
+            # 1 percentage point of lineup K environment over 22 BF is about 0.22 K;
+            # only let a minority of that move the support read until backtested.
+            move = max(-0.22, min(0.22, gap * bf / 100.0 * 0.38))
+            adj += move
+            notes.append(f"confirmed weighted lineup gap {gap:+.1f}% -> {move:+.2f}K")
+
+    if "CAUTION" in recent and np.isfinite(match_k) and np.isfinite(pitch_k) and np.isfinite(weighted_k):
+        if match_k >= pitch_k + 2.0 and weighted_k >= 21.5:
+            adj += 0.12
+            notes.append("recent-skill caution softened by matchup support +0.12K")
+        elif match_k <= pitch_k - 2.0 and weighted_k <= 20.0:
+            adj -= 0.10
+            notes.append("recent-skill caution reinforced by weak matchup -0.10K")
+
+    if np.isfinite(ceiling_gap) and ceiling_gap >= 2.0:
+        upside_ready = (
+            np.isfinite(weighted_k) and weighted_k >= 22.0
+            and np.isfinite(whiff) and whiff >= 24.0
+            and np.isfinite(bf) and bf >= 20.5
+            and "LOW" not in workload
+        )
+        if upside_ready:
+            adj += 0.15
+            notes.append("conditional ceiling bridge +0.15K")
+        else:
+            notes.append("ceiling gap display-only")
+
+    if np.isfinite(edge) and abs(edge) < 0.35:
+        notes.append("thin edge: decision should stay pass/track")
+    if "LOW" in workload:
+        adj -= 0.08
+        notes.append("low-BF workload drag -0.08K")
+    pa_adj = _lta_num(row.get("Pitch Arsenal Support Adj") if isinstance(row, dict) else np.nan, np.nan)
+    pa_read = str(row.get("Pitch Arsenal Matchup Read") or "") if isinstance(row, dict) else ""
+    if np.isfinite(pa_adj) and abs(pa_adj) > 0:
+        adj += pa_adj
+        notes.append(f"{pa_read.lower()} {pa_adj:+.2f}K")
+
+    adj = max(-0.35, min(0.35, adj))
+    advisory = proj + adj if np.isfinite(proj) else np.nan
+    if not notes:
+        notes.append("no support-only center adjustment")
+    return {
+        "True K Advisor Projection": round(advisory, 2) if np.isfinite(advisory) else np.nan,
+        "True K Advisor Adj": round(adj, 2),
+        "True K Advisor Read": "; ".join(notes),
+        "True K Advisor Version": TRUE_K_ADVISOR_VERSION,
+    }
+
+
+def _lineup_trace_apply(df, board=None):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    lookup = _lta_board_lookup(board)
+    rows_out = []
+    for _, sr in out.iterrows():
+        r = sr.to_dict()
+        name = _lta_text(_lta_pick(r, ["Pitcher", "pitcher"], ""))
+        p = lookup.get(normalize_name(name), {})
+        lineup_rows = _lta_lineup_rows(r, p)
+        prof = _lta_lineup_profile(lineup_rows)
+        stage = _lta_lineup_stage(r, p, prof)
+        trace = _lta_projection_trace(r, prof)
+        stale = ""
+        src_u = str(prof.get("sources") or "").upper()
+        if stage == "CONFIRMED" and ("PROJECTED" in src_u or "EXPECTED" in src_u) and "OFFICIAL" not in src_u and "CONFIRMED" not in src_u:
+            stale = "STALE_EXPECTED_CHECK"
+        trace_row = {
+            "Lineup Trace Stage": stage,
+            "Lineup Trace Count": prof.get("count", 0),
+            "Lineup Trace Valid K": prof.get("valid_k", 0),
+            "Lineup Trace Avg K%": round(prof.get("avg_k"), 1) if np.isfinite(_lta_num(prof.get("avg_k"), np.nan)) else np.nan,
+            "Lineup Trace Weighted K%": round(prof.get("weighted_k"), 1) if np.isfinite(_lta_num(prof.get("weighted_k"), np.nan)) else np.nan,
+            "Lineup Trace Top4 K%": round(prof.get("top4_k"), 1) if np.isfinite(_lta_num(prof.get("top4_k"), np.nan)) else np.nan,
+            "Lineup Trace High-K": prof.get("high_k", 0),
+            "Lineup Trace Low-K": prof.get("low_k", 0),
+            "Lineup Trace Top4 High-K": prof.get("top4_high_k", 0),
+            "Lineup Trace Opp K%": round(trace.get("opp_k"), 1) if np.isfinite(_lta_num(trace.get("opp_k"), np.nan)) else np.nan,
+            "Lineup Trace Opp-vs-Weighted Delta": round(trace.get("delta"), 2) if np.isfinite(_lta_num(trace.get("delta"), np.nan)) else np.nan,
+            "Lineup Trace Materiality": trace.get("materiality", ""),
+            "Lineup Trace Stale Expected Flag": stale,
+            "Lineup Trace Thin Edge Gate": trace.get("thin_gate", ""),
+            "Lineup Trace K/BF": round(trace.get("kbf"), 3) if np.isfinite(_lta_num(trace.get("kbf"), np.nan)) else np.nan,
+            "Lineup Trace Projected BF": round(trace.get("bf"), 1) if np.isfinite(_lta_num(trace.get("bf"), np.nan)) else np.nan,
+            "Lineup Trace BF Low": trace.get("bf_low", np.nan),
+            "Lineup Trace BF High": trace.get("bf_high", np.nan),
+            "Lineup Trace IP Low": trace.get("ip_low", np.nan),
+            "Lineup Trace IP High": trace.get("ip_high", np.nan),
+            "Lineup Trace Ceiling": round(trace.get("ceiling"), 1) if np.isfinite(_lta_num(trace.get("ceiling"), np.nan)) else np.nan,
+            "Lineup Trace Ceiling Gap": round(trace.get("ceiling_gap"), 2) if np.isfinite(_lta_num(trace.get("ceiling_gap"), np.nan)) else np.nan,
+            "Lineup Trace Upside Watch": trace.get("upside", ""),
+            "Lineup Trace Formula": trace.get("formula", ""),
+            "Lineup Trace Hitters": prof.get("hitters", ""),
+            "Lineup Trace Version": LINEUP_TRACE_AUDIT_VERSION,
+        }
+        trace_row.update(_lta_pitch_arsenal_matchup(r, p))
+        advisor_input = dict(r)
+        advisor_input.update(trace_row)
+        trace_row.update(_tka_quality_adjustments(advisor_input, trace))
+        rows_out.append(trace_row)
+    trace_df = pd.DataFrame(rows_out, index=out.index)
+    for col in trace_df.columns:
+        out[col] = trace_df[col]
+    return out
+
+
+_LINEUP_TRACE_PREV_BUILD_KPROJ_TABLE = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    base = _LINEUP_TRACE_PREV_BUILD_KPROJ_TABLE(board) if _LINEUP_TRACE_PREV_BUILD_KPROJ_TABLE is not None else pd.DataFrame()
+    return _lineup_trace_apply(base, board)
+
+
+def _lta_snapshot_rows(board=None):
+    df = build_kproj_table(board) if "build_kproj_table" in globals() else pd.DataFrame()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    rows = []
+    today = str(pd.Timestamp.today().date())
+    for _, sr in df.iterrows():
+        r = sr.to_dict()
+        proj = _lta_num(_lta_pick(r, ["K PROJ", "Projection", "Final K Projection"], np.nan))
+        line = _lta_num(_lta_pick(r, ["UD/Line", "Line", "Strikeout Line"], np.nan))
+        rows.append({
+            "snapshot_date": today,
+            "snapshot_time": str(pd.Timestamp.now()),
+            "pitcher": _lta_text(_lta_pick(r, ["Pitcher", "pitcher"], "")),
+            "matchup": _lta_text(_lta_pick(r, ["Matchup", "matchup"], "")),
+            "pitcher_hand": _lta_text(_lta_pick(r, ["Hand", "Pitcher Hand", "hand"], "")),
+            "lineup_stage": _lta_text(r.get("Lineup Trace Stage"), "FALLBACK"),
+            "hitters_1_9": _lta_text(r.get("Lineup Trace Hitters"), ""),
+            "lineup_count": _lta_num(r.get("Lineup Trace Count"), np.nan),
+            "lineup_avg_k": _lta_num(r.get("Lineup Trace Avg K%"), np.nan),
+            "lineup_weighted_k": _lta_num(r.get("Lineup Trace Weighted K%"), np.nan),
+            "lineup_top4_k": _lta_num(r.get("Lineup Trace Top4 K%"), np.nan),
+            "high_k_count": _lta_num(r.get("Lineup Trace High-K"), np.nan),
+            "low_k_count": _lta_num(r.get("Lineup Trace Low-K"), np.nan),
+            "opp_k": _lta_num(r.get("Lineup Trace Opp K%"), np.nan),
+            "opp_vs_weighted_delta": _lta_num(r.get("Lineup Trace Opp-vs-Weighted Delta"), np.nan),
+            "projection": proj,
+            "true_advisor_projection": _lta_num(r.get("True K Advisor Projection"), np.nan),
+            "true_advisor_adj": _lta_num(r.get("True K Advisor Adj"), np.nan),
+            "true_advisor_read": _lta_text(r.get("True K Advisor Read"), ""),
+            "line": line,
+            "edge": proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan,
+            "decision": _lta_text(_lta_pick(r, ["Model Pick", "Decision", "Side", "Pick"], "")),
+            "bf": _lta_num(r.get("Lineup Trace Projected BF"), np.nan),
+            "k_per_bf": _lta_num(r.get("Lineup Trace K/BF"), np.nan),
+            "pitch_arsenal_read": _lta_text(r.get("Pitch Arsenal Matchup Read"), ""),
+            "pitch_arsenal_top_pitch": _lta_text(r.get("Pitch Arsenal Top Pitch"), ""),
+            "pitch_arsenal_opp_k": _lta_num(r.get("Pitch Arsenal Opp K%"), np.nan),
+            "pitch_arsenal_opp_whiff": _lta_num(r.get("Pitch Arsenal Opp Whiff%"), np.nan),
+            "pitch_arsenal_adj": _lta_num(r.get("Pitch Arsenal Support Adj"), np.nan),
+            "thin_edge_gate": _lta_text(r.get("Lineup Trace Thin Edge Gate"), ""),
+            "upside_watch": _lta_text(r.get("Lineup Trace Upside Watch"), ""),
+            "stale_expected_flag": _lta_text(r.get("Lineup Trace Stale Expected Flag"), ""),
+            "version": LINEUP_TRACE_AUDIT_VERSION,
+        })
+    return pd.DataFrame(rows)
+
+
+def _lta_load_snapshots():
+    try:
+        if os.path.exists(LINEUP_SNAPSHOT_FILE):
+            return pd.read_csv(LINEUP_SNAPSHOT_FILE)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+def _lta_save_snapshots(board=None):
+    current = _lta_snapshot_rows(board)
+    if current.empty:
+        return 0, "No projection rows available."
+    os.makedirs(os.path.dirname(LINEUP_SNAPSHOT_FILE), exist_ok=True)
+    old = _lta_load_snapshots()
+    all_rows = pd.concat([old, current], ignore_index=True) if isinstance(old, pd.DataFrame) and not old.empty else current
+    dedupe_cols = ["snapshot_date", "pitcher", "matchup", "lineup_stage", "version"]
+    all_rows = all_rows.drop_duplicates(subset=[c for c in dedupe_cols if c in all_rows.columns], keep="last")
+    all_rows.to_csv(LINEUP_SNAPSHOT_FILE, index=False)
+    return int(len(current)), LINEUP_SNAPSHOT_FILE
+
+
+def _lta_transition_compare(snapshots):
+    if not isinstance(snapshots, pd.DataFrame) or snapshots.empty:
+        return pd.DataFrame()
+    d = snapshots.copy()
+    d["lineup_stage"] = d.get("lineup_stage", "").astype(str).str.upper()
+    pre = d[d["lineup_stage"].isin(["EXPECTED", "ROTOWIRE_EXPECTED", "FALLBACK"])].copy()
+    conf = d[d["lineup_stage"].eq("CONFIRMED")].copy()
+    if pre.empty or conf.empty:
+        return pd.DataFrame()
+    key = ["snapshot_date", "pitcher", "matchup"]
+    pre = pre.sort_values("snapshot_time").drop_duplicates(key, keep="last")
+    conf = conf.sort_values("snapshot_time").drop_duplicates(key, keep="last")
+    m = pre.merge(conf, on=key, suffixes=("_pre", "_confirmed"))
+    if m.empty:
+        return pd.DataFrame()
+    m["projection_delta"] = pd.to_numeric(m.get("projection_confirmed"), errors="coerce") - pd.to_numeric(m.get("projection_pre"), errors="coerce")
+    m["weighted_k_delta"] = pd.to_numeric(m.get("lineup_weighted_k_confirmed"), errors="coerce") - pd.to_numeric(m.get("lineup_weighted_k_pre"), errors="coerce")
+    m["bf_delta"] = pd.to_numeric(m.get("bf_confirmed"), errors="coerce") - pd.to_numeric(m.get("bf_pre"), errors="coerce")
+    return m
+
+
+def _lta_ip_to_float(value):
+    try:
+        if "_hadb_ip_to_float" in globals():
+            return _hadb_ip_to_float(value)
+    except Exception:
+        pass
+    try:
+        txt = str(value).strip()
+        if not txt or txt.lower() in {"nan", "none", "-"}:
+            return np.nan
+        if "." in txt:
+            whole, frac = txt.split(".", 1)
+            if frac[:1] in {"1", "2"}:
+                return float(whole or 0) + (int(frac[:1]) / 3.0)
+        return float(txt)
+    except Exception:
+        return np.nan
+
+
+def _lta_actuals_for_k():
+    try:
+        d = load_historical_actuals_database() if "load_historical_actuals_database" in globals() else pd.DataFrame()
+    except Exception:
+        d = pd.DataFrame()
+    if not isinstance(d, pd.DataFrame) or d.empty:
+        return pd.DataFrame()
+    out = d.copy()
+    if "Market" in out.columns:
+        out = out[out["Market"].astype(str).str.upper().eq("K")].copy()
+    for c in ["Projection", "Actual", "Actual K", "Actual BF"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    if "Actual IP" in out.columns:
+        out["Actual IP Float"] = out["Actual IP"].map(_lta_ip_to_float)
+    return out
+
+
+def _lta_classify_miss(row):
+    proj = _lta_num(row.get("projection"), np.nan)
+    advisor_proj = _lta_num(row.get("true_advisor_projection"), np.nan)
+    actual_k = _lta_num(row.get("actual_k"), np.nan)
+    proj_bf = _lta_num(row.get("bf"), np.nan)
+    actual_bf = _lta_num(row.get("actual_bf"), np.nan)
+    kbf = _lta_num(row.get("k_per_bf"), np.nan)
+    actual_kbf = actual_k / actual_bf if np.isfinite(actual_k) and np.isfinite(actual_bf) and actual_bf > 0 else np.nan
+    weighted_delta = _lta_num(row.get("weighted_k_delta"), np.nan)
+    proj_error = proj - actual_k if np.isfinite(proj) and np.isfinite(actual_k) else np.nan
+    advisor_error = advisor_proj - actual_k if np.isfinite(advisor_proj) and np.isfinite(actual_k) else np.nan
+    workload_error = actual_bf - proj_bf if np.isfinite(actual_bf) and np.isfinite(proj_bf) else np.nan
+    kbf_error = actual_kbf - kbf if np.isfinite(actual_kbf) and np.isfinite(kbf) else np.nan
+    tags = []
+    if np.isfinite(workload_error) and abs(workload_error) >= 3.0:
+        tags.append("WORKLOAD")
+    if np.isfinite(kbf_error) and abs(kbf_error) >= 0.055:
+        tags.append("K_CONVERSION")
+    if np.isfinite(weighted_delta) and abs(weighted_delta) >= 1.5:
+        tags.append("LINEUP")
+    if not tags and np.isfinite(proj_error) and abs(proj_error) <= 1.0:
+        tags.append("CENTER_OK_OR_VARIANCE")
+    if not tags:
+        tags.append("VARIANCE_OR_UNCLASSIFIED")
+    return {
+        "projection_error": round(proj_error, 2) if np.isfinite(proj_error) else np.nan,
+        "advisor_error": round(advisor_error, 2) if np.isfinite(advisor_error) else np.nan,
+        "advisor_helped": bool(np.isfinite(advisor_error) and np.isfinite(proj_error) and abs(advisor_error) < abs(proj_error)),
+        "workload_bf_error": round(workload_error, 1) if np.isfinite(workload_error) else np.nan,
+        "actual_k_per_bf": round(actual_kbf, 3) if np.isfinite(actual_kbf) else np.nan,
+        "k_per_bf_error": round(kbf_error, 3) if np.isfinite(kbf_error) else np.nan,
+        "miss_class": "+".join(tags),
+    }
+
+
+def build_k_outcome_learning_audit():
+    snaps = _lta_load_snapshots()
+    actuals = _lta_actuals_for_k()
+    if not isinstance(snaps, pd.DataFrame) or snaps.empty or not isinstance(actuals, pd.DataFrame) or actuals.empty:
+        return pd.DataFrame()
+    s = snaps.copy()
+    s["pitcher_key"] = s.get("pitcher", "").map(normalize_name)
+    s["snapshot_date"] = s.get("snapshot_date", "").astype(str).str[:10]
+    s["lineup_stage"] = s.get("lineup_stage", "").astype(str).str.upper()
+    preferred = s[s["lineup_stage"].eq("CONFIRMED")].copy()
+    if preferred.empty:
+        preferred = s.copy()
+    preferred = preferred.sort_values("snapshot_time").drop_duplicates(["snapshot_date", "pitcher_key"], keep="last")
+    a = actuals.copy()
+    a["pitcher_key"] = a.get("Pitcher", a.get("Entity", "")).map(normalize_name)
+    a["actual_date"] = a.get("Date", "").astype(str).str[:10]
+    merged = preferred.merge(a, left_on=["snapshot_date", "pitcher_key"], right_on=["actual_date", "pitcher_key"], how="inner", suffixes=("", "_actual"))
+    if merged.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, rr in merged.iterrows():
+        rec = rr.to_dict()
+        actual_k = _lta_num(rec.get("Actual K"), _lta_num(rec.get("Actual"), np.nan))
+        actual_bf = _lta_num(rec.get("Actual BF"), np.nan)
+        if not np.isfinite(actual_bf):
+            ipf = _lta_num(rec.get("Actual IP Float"), np.nan)
+            actual_bf = ipf * 3.0 if np.isfinite(ipf) else np.nan
+        weighted_k_delta = np.nan
+        try:
+            cmp_df = _lta_transition_compare(snaps)
+            if isinstance(cmp_df, pd.DataFrame) and not cmp_df.empty:
+                cm = cmp_df[(cmp_df["snapshot_date"].astype(str).str[:10] == str(rec.get("snapshot_date"))[:10]) & (cmp_df["pitcher"].map(normalize_name) == rec.get("pitcher_key"))]
+                if not cm.empty:
+                    weighted_k_delta = _lta_num(cm.iloc[-1].get("weighted_k_delta"), np.nan)
+        except Exception:
+            weighted_k_delta = np.nan
+        base = {
+            "date": rec.get("snapshot_date"),
+            "pitcher": rec.get("pitcher"),
+            "matchup": rec.get("matchup"),
+            "lineup_stage": rec.get("lineup_stage"),
+            "line": _lta_num(rec.get("line"), np.nan),
+            "projection": _lta_num(rec.get("projection"), np.nan),
+            "true_advisor_projection": _lta_num(rec.get("true_advisor_projection"), np.nan),
+            "actual_k": actual_k,
+            "bf": _lta_num(rec.get("bf"), np.nan),
+            "actual_bf": actual_bf,
+            "k_per_bf": _lta_num(rec.get("k_per_bf"), np.nan),
+            "weighted_lineup_k": _lta_num(rec.get("lineup_weighted_k"), np.nan),
+            "weighted_k_delta": weighted_k_delta,
+            "thin_edge_gate": rec.get("thin_edge_gate"),
+            "upside_watch": rec.get("upside_watch"),
+            "result": rec.get("Result"),
+        }
+        base.update(_lta_classify_miss(base))
+        rows.append(base)
+    return pd.DataFrame(rows)
+
+
+def render_lineup_transition_audit_panel(board=None):
+    st.markdown('<div class="section-title-pro">Lineup Trace / Pre-to-Confirmed Audit</div>', unsafe_allow_html=True)
+    st.caption("Support-only. This checks whether official lineups, OPP K%, weighted batter K%, BF/IP, and ceiling are actually flowing into the projection board.")
+    df = build_kproj_table(board) if "build_kproj_table" in globals() else pd.DataFrame()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("Load a K slate to see lineup trace diagnostics.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    stage = df.get("Lineup Trace Stage", pd.Series(dtype=str)).astype(str).str.upper()
+    c1.metric("Confirmed", int(stage.eq("CONFIRMED").sum()))
+    c2.metric("Expected/Fallback", int(stage.ne("CONFIRMED").sum()))
+    c3.metric("Thin Edge", int(df.get("Lineup Trace Thin Edge Gate", pd.Series(dtype=str)).astype(str).str.contains("THIN", case=False, na=False).sum()))
+    c4.metric("K Env Gaps", int(df.get("Lineup Trace Materiality", pd.Series(dtype=str)).astype(str).str.contains("GAP", case=False, na=False).sum()))
+    trace_cols = [c for c in [
+        "Pitcher", "Matchup", "UD/Line", "K PROJ", "Model Pick",
+        "Lineup Trace Stage", "Lineup Trace Count", "Lineup Trace Avg K%",
+        "Lineup Trace Weighted K%", "Lineup Trace Top4 K%", "Lineup Trace Opp K%",
+        "Lineup Trace Opp-vs-Weighted Delta", "Lineup Trace Materiality",
+        "Lineup Trace Thin Edge Gate", "Lineup Trace Projected BF", "Lineup Trace K/BF",
+        "Lineup Trace BF Low", "Lineup Trace BF High", "Lineup Trace IP Low", "Lineup Trace IP High",
+        "Lineup Trace Ceiling", "Lineup Trace Ceiling Gap", "Lineup Trace Upside Watch",
+        "Pitch Arsenal Matchup Read", "Pitch Arsenal Top Pitch", "Pitch Arsenal Top Usage",
+        "Pitch Arsenal Opp K%", "Pitch Arsenal Opp Whiff%", "Pitch Arsenal Support Adj",
+        "Pitch Arsenal Matchup Source",
+        "True K Advisor Projection", "True K Advisor Adj", "True K Advisor Read",
+        "Lineup Trace Stale Expected Flag", "Lineup Trace Formula"
+    ] if c in df.columns]
+    st.dataframe(df[trace_cols], use_container_width=True, hide_index=True)
+    if st.button("Save current lineup/projection snapshot", key="save_lineup_trace_snapshot"):
+        n, path = _lta_save_snapshots(board)
+        st.success(f"Saved {n} rows to {path}.")
+    snaps = _lta_load_snapshots()
+    if isinstance(snaps, pd.DataFrame) and not snaps.empty:
+        cmp_df = _lta_transition_compare(snaps)
+        with st.expander("Saved pre-lineup vs confirmed comparisons", expanded=not cmp_df.empty):
+            if isinstance(cmp_df, pd.DataFrame) and not cmp_df.empty:
+                cols = [c for c in [
+                    "snapshot_date", "pitcher", "matchup",
+                    "lineup_stage_pre", "lineup_stage_confirmed",
+                    "projection_pre", "projection_confirmed", "projection_delta",
+                    "true_advisor_projection_pre", "true_advisor_projection_confirmed",
+                    "true_advisor_adj_pre", "true_advisor_adj_confirmed",
+                    "lineup_weighted_k_pre", "lineup_weighted_k_confirmed", "weighted_k_delta",
+                    "bf_pre", "bf_confirmed", "bf_delta",
+                    "thin_edge_gate_pre", "thin_edge_gate_confirmed",
+                    "upside_watch_pre", "upside_watch_confirmed",
+                    "stale_expected_flag_confirmed"
+                ] if c in cmp_df.columns]
+                st.dataframe(cmp_df[cols], use_container_width=True, hide_index=True)
+            else:
+                st.info("Snapshots are saved, but no pitcher has both a pre-lineup and confirmed snapshot yet.")
+        outcome_df = build_k_outcome_learning_audit()
+        with st.expander("Post-game miss classifier from saved snapshots + graded history", expanded=False):
+            if isinstance(outcome_df, pd.DataFrame) and not outcome_df.empty:
+                st.dataframe(outcome_df, use_container_width=True, hide_index=True)
+                if "miss_class" in outcome_df.columns:
+                    summary = outcome_df.groupby("miss_class", dropna=False).agg(
+                        Rows=("pitcher", "count"),
+                        Avg_Error=("projection_error", "mean"),
+                        Avg_Advisor_Error=("advisor_error", "mean"),
+                        Advisor_Helped_Rate=("advisor_helped", "mean"),
+                        Avg_BF_Error=("workload_bf_error", "mean"),
+                        Avg_KBF_Error=("k_per_bf_error", "mean"),
+                    ).reset_index()
+                    summary["Advisor_Helped_Rate"] = (pd.to_numeric(summary["Advisor_Helped_Rate"], errors="coerce") * 100).round(1)
+                    for c in ["Avg_Error", "Avg_Advisor_Error", "Avg_BF_Error", "Avg_KBF_Error"]:
+                        summary[c] = pd.to_numeric(summary[c], errors="coerce").round(3)
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+            else:
+                st.info("Save snapshots and load/grade actuals to classify losses by LINEUP, WORKLOAD, K_CONVERSION, or variance.")
+    with st.expander("What to grade after games", expanded=False):
+        st.markdown(
+            "- Workload miss: actual BF/IP far below or above projected BF/IP.\n"
+            "- K-conversion miss: actual K/BF far from projected K/BF.\n"
+            "- Lineup miss: confirmed weighted K% differs from expected weighted K%.\n"
+            "- Thin-edge miss: edge below 0.35 should usually stay PASS/track.\n"
+            "- Ceiling activation: only study it when workload + whiff + weighted lineup K all agree."
+        )
+
+
+PROJECTION_DOCTOR_VERSION = "PROJECTION_DOCTOR_9_0_SUPPORT_2026_07_27"
+
+
+def _pdoc_num(row, keys, default=np.nan):
+    try:
+        return _upb_num(row, keys, default)
+    except Exception:
+        try:
+            if not isinstance(row, dict):
+                row = row.to_dict()
+        except Exception:
+            pass
+        for key in keys:
+            try:
+                if key in row:
+                    val = pd.to_numeric(row.get(key), errors="coerce")
+                    if np.isfinite(val):
+                        return float(val)
+            except Exception:
+                continue
+    return default
+
+
+def _pdoc_text(row, keys, default=""):
+    try:
+        return _upb_text(row, keys, default)
+    except Exception:
+        try:
+            if not isinstance(row, dict):
+                row = row.to_dict()
+        except Exception:
+            pass
+        for key in keys:
+            try:
+                val = row.get(key)
+                if val not in (None, "", "—", "-", "nan", "NaN"):
+                    return str(val)
+            except Exception:
+                continue
+    return default
+
+
+def _pdoc_side(side, proj=np.nan, line=np.nan):
+    side_u = str(side or "").upper()
+    if side_u.startswith("O") or "OVER" in side_u or "HIGHER" in side_u:
+        return "OVER"
+    if side_u.startswith("U") or "UNDER" in side_u or "LOWER" in side_u:
+        return "UNDER"
+    if np.isfinite(proj) and np.isfinite(line):
+        return "OVER" if proj > line else "UNDER"
+    return side_u or "PASS"
+
+
+def _pdoc_join(parts):
+    out = []
+    for item in parts:
+        text = str(item or "").strip()
+        if text and text.upper() not in {"NAN", "NONE", "—", "-"} and text not in out:
+            out.append(text)
+    return "; ".join(out) if out else "none"
+
+
+def _pdoc_k_row(row):
+    proj = _pdoc_num(row, ["K PROJ", "Projection", "Final K Projection", "Winning File K Projection"])
+    line = _pdoc_num(row, ["UD/Line", "Line", "Strikeout Line"])
+    side = _pdoc_side(_pdoc_text(row, ["Model Pick", "Decision", "Side", "Pick"], ""), proj, line)
+    edge = _pdoc_num(row, ["Official K Edge", "Final K Edge", "Edge Gap", "Winning File K Edge"], proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan)
+    edge_abs = abs(edge) if np.isfinite(edge) else np.nan
+    ceiling = _pdoc_num(row, ["K Sim P90", "Ceiling", "K Ceiling", "P90"], np.nan)
+    if not np.isfinite(ceiling):
+        try:
+            ceiling = _kcard_ceiling_value(row, line, proj, None)
+        except Exception:
+            ceiling = np.nan
+    ceiling_gap = _pdoc_num(row, ["Lineup Trace Ceiling Gap"], ceiling - proj if np.isfinite(ceiling) and np.isfinite(proj) else np.nan)
+    bf = _pdoc_num(row, ["Lineup Trace Projected BF", "BF", "Projected BF"])
+    bf_low = _pdoc_num(row, ["Lineup Trace BF Low"])
+    bf_high = _pdoc_num(row, ["Lineup Trace BF High"])
+    ip_low = _pdoc_num(row, ["Lineup Trace IP Low"])
+    ip_high = _pdoc_num(row, ["Lineup Trace IP High"])
+    kbf = _pdoc_num(row, ["Lineup Trace K/BF"], proj / bf if np.isfinite(proj) and np.isfinite(bf) and bf else np.nan)
+    weighted_k = _pdoc_num(row, ["Lineup Trace Weighted K%", "Weighted Lineup K%"])
+    opp_k = _pdoc_num(row, ["Lineup Trace Opp K%", "Opponent K% vs Pitcher Hand", "Opp K%", "APP100 Opp K%"])
+    opp_delta = _pdoc_num(row, ["Lineup Trace Opp-vs-Weighted Delta"], opp_k - weighted_k if np.isfinite(opp_k) and np.isfinite(weighted_k) else np.nan)
+    stage = _pdoc_text(row, ["Lineup Trace Stage"], "")
+    thin_gate = _pdoc_text(row, ["Lineup Trace Thin Edge Gate"], "")
+    materiality = _pdoc_text(row, ["Lineup Trace Materiality"], "")
+    upside = _pdoc_text(row, ["Lineup Trace Upside Watch"], "")
+    arsenal = _pdoc_text(row, ["Pitch Arsenal Matchup Read"], "")
+    arsenal_adj = _pdoc_num(row, ["Pitch Arsenal Support Adj"], 0.0)
+    recent = _pdoc_text(row, ["APP100 Recent Skill", "Recent Skill", "Skill"], "")
+    bf_gate = _pdoc_text(row, ["APP100 BF Coverage", "BF Gate"], "")
+    damage = _pdoc_text(row, ["K Damage Risk Label", "Damage Risk Label", "Damage Risk"], "")
+    advisor_proj = _pdoc_num(row, ["True K Advisor Projection", "Advisory Projection"])
+    advisor_delta = _pdoc_num(row, ["True K Advisor Adj", "Suggested Adj"], advisor_proj - proj if np.isfinite(advisor_proj) and np.isfinite(proj) else np.nan)
+
+    issues = []
+    support = []
+    risk = 18.0
+    if not np.isfinite(edge):
+        issues.append("NO_EDGE")
+        risk += 30
+    elif edge_abs < 0.25:
+        issues.append("MICRO_EDGE")
+        risk += 30
+    elif edge_abs < 0.55:
+        issues.append("THIN_EDGE")
+        risk += 18
+    elif edge_abs >= 1.0:
+        support.append("CLEAR_EDGE")
+        risk -= 8
+    if "THIN" in thin_gate.upper() or "PASS" in thin_gate.upper():
+        issues.append(thin_gate or "THIN_EDGE_GATE")
+        risk += 12
+    if "LOW" in bf_gate.upper() or (np.isfinite(bf_low) and bf_low < 18):
+        issues.append("WORKLOAD_RANGE_RISK")
+        risk += 18
+    elif np.isfinite(bf_high) and np.isfinite(bf_low) and bf_high - bf_low <= 5:
+        support.append("STABLE_WORKLOAD_RANGE")
+        risk -= 4
+    if side == "UNDER" and np.isfinite(ceiling) and np.isfinite(line) and ceiling >= line + 1.5:
+        issues.append("UNDER_CEILING_DANGER")
+        risk += 20
+    if side == "OVER" and np.isfinite(ceiling_gap) and ceiling_gap >= 2.0:
+        support.append("CEILING_UPSIDE_AVAILABLE")
+        risk -= 5
+    if side == "OVER" and np.isfinite(ceiling) and np.isfinite(line) and ceiling < line + 1.0:
+        issues.append("LOW_CEILING_OVER")
+        risk += 12
+    if "CAUTION" in recent.upper():
+        issues.append("RECENT_SKILL_CAUTION")
+        risk += 9
+    if "DAMAGE" in damage.upper() or "HIGH" in damage.upper():
+        issues.append("DAMAGE_HOOK_RISK")
+        risk += 12
+    if np.isfinite(opp_delta) and abs(opp_delta) >= 1.5:
+        issues.append("TEAM_VS_CONFIRMED_K_GAP")
+        risk += 8
+    if str(stage).upper() == "CONFIRMED":
+        support.append("CONFIRMED_LINEUP")
+        risk -= 4
+    if "SUPPORT" in arsenal.upper() or "UPSIDE" in arsenal.upper() or (np.isfinite(arsenal_adj) and arsenal_adj > 0):
+        support.append("ARSENAL_SUPPORT")
+        risk -= 8
+    if np.isfinite(weighted_k) and weighted_k >= 23.5:
+        support.append("HIGH_WEIGHTED_LINEUP_K")
+        risk -= 4
+    if np.isfinite(advisor_delta) and abs(advisor_delta) >= 0.15:
+        support.append("HISTORY_ADVISOR_MOVED")
+
+    risk = int(max(0, min(100, round(risk))))
+    if risk >= 65:
+        action = "PASS/VERIFY"
+    elif risk >= 48:
+        action = "TRACK"
+    elif edge_abs >= 0.75:
+        action = "PLAYABLE_SUPPORT"
+    else:
+        action = "LEAN_SUPPORT"
+    if side == "UNDER" and "UNDER_CEILING_DANGER" in issues:
+        action = "TRACK_UNDER_CEILING"
+    if side == "OVER" and "WORKLOAD_RANGE_RISK" in issues and edge_abs < 1.0:
+        action = "TRACK_OVER_WORKLOAD"
+
+    return {
+        "Market": "K",
+        "Player": _pdoc_text(row, ["Pitcher", "pitcher"]),
+        "Matchup": _pdoc_text(row, ["Matchup", "matchup"]),
+        "Pick": side,
+        "Line": line,
+        "Projection": round(float(proj), 2) if np.isfinite(proj) else np.nan,
+        "Edge": round(float(edge), 2) if np.isfinite(edge) else np.nan,
+        "Doctor Action": action,
+        "Doctor Risk": risk,
+        "Loss Type Watch": _pdoc_join(issues),
+        "Support Signals": _pdoc_join(support),
+        "Advisor Projection": round(float(advisor_proj), 2) if np.isfinite(advisor_proj) else np.nan,
+        "Advisor Delta": round(float(advisor_delta), 2) if np.isfinite(advisor_delta) else np.nan,
+        "BF Range": f"{bf_low:.1f}-{bf_high:.1f}" if np.isfinite(bf_low) and np.isfinite(bf_high) else "",
+        "IP Range": f"{ip_low:.2f}-{ip_high:.2f}" if np.isfinite(ip_low) and np.isfinite(ip_high) else "",
+        "K/BF": round(float(kbf), 3) if np.isfinite(kbf) else np.nan,
+        "Ceiling": round(float(ceiling), 1) if np.isfinite(ceiling) else np.nan,
+        "Ceiling Gap": round(float(ceiling_gap), 2) if np.isfinite(ceiling_gap) else np.nan,
+        "Lineup Stage": stage,
+        "Weighted Lineup K%": round(float(weighted_k), 1) if np.isfinite(weighted_k) else np.nan,
+        "Opp K%": round(float(opp_k), 1) if np.isfinite(opp_k) else np.nan,
+        "Opp-vs-Lineup Gap": round(float(opp_delta), 1) if np.isfinite(opp_delta) else np.nan,
+        "Lineup Materiality": materiality,
+        "Upside Watch": upside,
+        "Arsenal Read": arsenal,
+        "Recent Skill": recent,
+        "BF Gate": bf_gate,
+        "Damage": damage,
+        "Version": PROJECTION_DOCTOR_VERSION,
+    }
+
+
+def _pdoc_po_row(row):
+    proj = _pdoc_num(row, ["Beta Projection", "Proj Outs", "Projected Outs", "PROJ OUTS", "Projection"])
+    line = _pdoc_num(row, ["UD Line", "Line", "PO Line", "UD/Line"])
+    side = _pdoc_side(_pdoc_text(row, ["Beta Lean", "Selector", "Decision", "Side"], ""), proj, line)
+    edge = _pdoc_num(row, ["Beta Edge", "PO Calibrated Edge"], proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan)
+    hit = _pdoc_num(row, ["Beta Hit %", "PO Calibrated Hit %"])
+    bf = _pdoc_num(row, ["Beta BF", "BF"])
+    ip = _pdoc_num(row, ["Beta IP", "IP"])
+    hook = _pdoc_num(row, ["Recent Hook Rate", "PO Hook Rate"])
+    deep = _pdoc_num(row, ["Deep Start Rate", "PO Deep Start Rate"])
+    pip = _pdoc_num(row, ["Pitch Efficiency P/IP", "PO Fill P/IP"])
+    pbf = _pdoc_num(row, ["Pitch Efficiency P/BF", "PO Fill P/BF"])
+    last_pc = _pdoc_num(row, ["Last Start Pitch Count", "PO Fill Last Pitch Count"])
+    max_pc = _pdoc_num(row, ["Max Pitch Count L10", "PO Fill Max Pitch Count L10"])
+    damage = _pdoc_text(row, ["Damage Risk Label", "PO Damage Signal", "Damage Risk"], "")
+    role = _pdoc_text(row, ["PO Role/Pitch Limit Signal", "PO Role/Sample Signal"], "")
+    leash = _pdoc_text(row, ["PO Leash Signal", "PO Leash/Hook Signal"], "")
+    efficiency = _pdoc_text(row, ["PO Efficiency Signal", "PO Pitch Efficiency Signal"], "")
+    bullpen = _pdoc_text(row, ["PO Bullpen Leash Signal"], "")
+    foul = _pdoc_text(row, ["PO Foul Workload Signal"], "")
+
+    issues = []
+    support = []
+    risk = 20.0
+    if not np.isfinite(edge):
+        issues.append("NO_EDGE")
+        risk += 30
+    elif abs(edge) < 1.0:
+        issues.append("THIN_PO_EDGE")
+        risk += 20
+    elif abs(edge) >= 2.0:
+        support.append("CLEAR_PO_EDGE")
+        risk -= 8
+    if side == "OVER" and np.isfinite(hook) and hook >= 0.35:
+        issues.append("HOOK_BEFORE_LINE_RISK")
+        risk += 16
+    if side == "UNDER" and np.isfinite(deep) and deep >= 0.55:
+        issues.append("DEEP_START_UNDER_RISK")
+        risk += 14
+    if side == "OVER" and ("LIMIT" in role.upper() or "SHORT" in role.upper()):
+        issues.append("ROLE_PITCH_LIMIT_RISK")
+        risk += 18
+    if "HIGH" in damage.upper() or "DAMAGE" in damage.upper():
+        issues.append("DAMAGE_RISK")
+        risk += 12
+    if "EFFICIENT" in efficiency.upper() or (np.isfinite(pip) and pip <= 15.5):
+        support.append("EFFICIENT_PITCH_PROFILE")
+        risk -= 6
+    if np.isfinite(last_pc) and np.isfinite(max_pc) and last_pc >= max_pc - 5:
+        support.append("RECENT_FULL_LEASH")
+        risk -= 5
+    if "SUPPORT" in leash.upper() or "FULL" in leash.upper():
+        support.append("LEASH_SUPPORT")
+        risk -= 5
+    if "TIRED" in bullpen.upper() or "LONGER" in bullpen.upper():
+        support.append("BULLPEN_CAN_EXTEND")
+        risk -= 3
+    if "STRESS" in foul.upper() or "HIGH" in foul.upper():
+        issues.append("FOUL_WORKLOAD_STRESS")
+        risk += 7
+    risk = int(max(0, min(100, round(risk))))
+    if risk >= 62:
+        action = "PASS/VERIFY"
+    elif risk >= 45:
+        action = "TRACK"
+    elif abs(edge) >= 1.75:
+        action = "PLAYABLE_SUPPORT"
+    else:
+        action = "LEAN_SUPPORT"
+
+    return {
+        "Market": "Pitching Outs",
+        "Player": _pdoc_text(row, ["Pitcher", "pitcher"]),
+        "Matchup": _pdoc_text(row, ["Matchup", "matchup"]),
+        "Pick": side,
+        "Line": line,
+        "Projection": round(float(proj), 1) if np.isfinite(proj) else np.nan,
+        "Edge": round(float(edge), 2) if np.isfinite(edge) else np.nan,
+        "Doctor Action": action,
+        "Doctor Risk": risk,
+        "Loss Type Watch": _pdoc_join(issues),
+        "Support Signals": _pdoc_join(support),
+        "Hit %": round(float(hit), 1) if np.isfinite(hit) else np.nan,
+        "BF": round(float(bf), 1) if np.isfinite(bf) else np.nan,
+        "IP": round(float(ip), 2) if np.isfinite(ip) else np.nan,
+        "Hook Rate": round(float(hook), 2) if np.isfinite(hook) else np.nan,
+        "Deep Rate": round(float(deep), 2) if np.isfinite(deep) else np.nan,
+        "P/IP": round(float(pip), 1) if np.isfinite(pip) else np.nan,
+        "P/BF": round(float(pbf), 2) if np.isfinite(pbf) else np.nan,
+        "Last PC": round(float(last_pc), 0) if np.isfinite(last_pc) else np.nan,
+        "Max PC L10": round(float(max_pc), 0) if np.isfinite(max_pc) else np.nan,
+        "Damage": damage,
+        "Role/Limit": role,
+        "Leash": leash,
+        "Efficiency": efficiency,
+        "Bullpen": bullpen,
+        "Foul": foul,
+        "Version": PROJECTION_DOCTOR_VERSION,
+    }
+
+
+def build_projection_doctor_board(board=None):
+    rows = []
+    try:
+        kdf = build_kproj_table(board) if "build_kproj_table" in globals() else pd.DataFrame()
+        if isinstance(kdf, pd.DataFrame) and not kdf.empty:
+            try:
+                if "_owp_one_final_row_per_pitcher" in globals():
+                    kdf = _owp_one_final_row_per_pitcher(kdf)
+            except Exception:
+                pass
+            for _, rr in kdf.iterrows():
+                rows.append(_pdoc_k_row(rr.to_dict()))
+    except Exception as e:
+        rows.append({"Market": "K", "Doctor Action": "UNAVAILABLE", "Loss Type Watch": str(e), "Version": PROJECTION_DOCTOR_VERSION})
+    try:
+        pdf = _beta_projection_rows(board, "OUTS") if "_beta_projection_rows" in globals() else pd.DataFrame()
+        if isinstance(pdf, pd.DataFrame) and not pdf.empty:
+            for _, rr in pdf.iterrows():
+                rows.append(_pdoc_po_row(rr.to_dict()))
+    except Exception as e:
+        rows.append({"Market": "Pitching Outs", "Doctor Action": "UNAVAILABLE", "Loss Type Watch": str(e), "Version": PROJECTION_DOCTOR_VERSION})
+    return pd.DataFrame(rows)
+
+
+def render_projection_doctor_panel(board=None):
+    st.markdown('<div class="section-title-pro">Projection Doctor 9.0 Read</div>', unsafe_allow_html=True)
+    st.caption("Support-only. Turns lineup, workload, ceiling, arsenal, PO leash, and historical miss signals into a slip-building audit without overwriting the official projections.")
+    df = build_projection_doctor_board(board)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("Projection Doctor needs a loaded K/PO board.")
+        return
+    actions = df.get("Doctor Action", pd.Series(dtype=str)).astype(str).str.upper()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows Checked", int(len(df)))
+    c2.metric("Playable Support", int(actions.str.contains("PLAYABLE").sum()))
+    c3.metric("Track", int(actions.str.contains("TRACK|LEAN").sum()))
+    c4.metric("Pass/Verify", int(actions.str.contains("PASS|VERIFY|UNAVAILABLE").sum()))
+    priority = {"PASS/VERIFY": 0, "TRACK_OVER_WORKLOAD": 1, "TRACK_UNDER_CEILING": 2, "TRACK": 3, "LEAN_SUPPORT": 4, "PLAYABLE_SUPPORT": 5}
+    show = df.copy()
+    show["_order"] = show.get("Doctor Action", "").map(lambda x: priority.get(str(x), 9))
+    show = show.sort_values(["_order", "Doctor Risk", "Market"], ascending=[True, False, True]).drop(columns=["_order"], errors="ignore")
+    cols = [c for c in [
+        "Market", "Player", "Matchup", "Pick", "Line", "Projection", "Edge",
+        "Doctor Action", "Doctor Risk", "Loss Type Watch", "Support Signals",
+        "Advisor Projection", "Advisor Delta", "BF Range", "IP Range", "K/BF",
+        "Ceiling", "Ceiling Gap", "Lineup Stage", "Weighted Lineup K%", "Opp K%",
+        "Opp-vs-Lineup Gap", "Lineup Materiality", "Upside Watch", "Arsenal Read",
+        "Recent Skill", "BF Gate", "Hit %", "BF", "IP", "Hook Rate", "Deep Rate",
+        "P/IP", "P/BF", "Last PC", "Max PC L10", "Damage", "Role/Limit", "Leash",
+        "Efficiency", "Bullpen", "Foul", "Version"
+    ] if c in show.columns]
+    st.dataframe(show[cols] if cols else show, use_container_width=True, hide_index=True)
+    with st.expander("9.0 checklist this panel is grading", expanded=False):
+        st.markdown(
+            "- K projection is split into BF/workload, K-per-BF conversion, lineup quality, arsenal support, ceiling, and risk gates.\n"
+            "- Pitching Outs is checked against BF, IP, pitch count, efficiency, hook/deep-start rates, role limits, bullpen, damage, and foul workload.\n"
+            "- The panel is intentionally advisory first. Keep grading these flags before letting them move the official projection math.\n"
+            "- A realistic 9.0 app still needs fresh confirmed lineups, stronger depth-chart leash data, true Stuff+/Pitching+ feeds, and clean post-slate actuals every day."
+        )
+
+
+HAND_MATCHUP_TRUTH_AUDIT_VERSION = "HAND_MATCHUP_TRUE_K_AUDIT_2026_07_27"
+
+
+def build_hand_matchup_truth_audit(board=None):
+    rows = []
+    try:
+        df = build_kproj_table(board) if "build_kproj_table" in globals() else pd.DataFrame()
+    except Exception:
+        df = pd.DataFrame()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    try:
+        if "_owp_one_final_row_per_pitcher" in globals():
+            df = _owp_one_final_row_per_pitcher(df)
+    except Exception:
+        pass
+    for _, rr in df.iterrows():
+        r = rr.to_dict()
+        pitcher = _pdoc_text(r, ["Pitcher", "pitcher"])
+        proj = _pdoc_num(r, ["K PROJ", "Projection", "Final K Projection", "Winning File K Projection"])
+        line = _pdoc_num(r, ["UD/Line", "Line", "Strikeout Line"])
+        bf = _pdoc_num(r, ["Lineup Trace Projected BF", "APP100 Projected BF", "APP97 Reconciled Expected BF", "Exp BF", "Projected BF", "BF"])
+        model_kbf = _pdoc_num(r, ["Lineup Trace K/BF"], proj / bf if np.isfinite(proj) and np.isfinite(bf) and bf else np.nan)
+        pitcher_k = _pdoc_num(r, ["APP100 Pitcher K%", "Pitcher K%", "Official Pitcher K%", "Savant Custom K%", "APP97 Live Pitcher K%"])
+        team_hand_k = _pdoc_num(r, ["Opponent K% vs Pitcher Hand", "Lineup Trace Opp K%", "APP97 Opponent K Environment", "Opp K%"])
+        weighted_k = _pdoc_num(r, ["Lineup Trace Weighted K%", "APP88 Batter Lineup K%", "Lineup K%"])
+        pitcher_k = pitcher_k * 100.0 if np.isfinite(pitcher_k) and abs(pitcher_k) <= 1.0 else pitcher_k
+        team_hand_k = team_hand_k * 100.0 if np.isfinite(team_hand_k) and abs(team_hand_k) <= 1.0 else team_hand_k
+        weighted_k = weighted_k * 100.0 if np.isfinite(weighted_k) and abs(weighted_k) <= 1.0 else weighted_k
+        stage = _pdoc_text(r, ["Lineup Trace Stage"], "")
+        hand = _pdoc_text(r, ["Pitcher Hand", "APP100 Pitcher Hand", "Hand", "Throws"], "")
+        source = _pdoc_text(r, ["Opponent K% vs Pitcher Hand Source", "Opp K Source", "Lineup Trace Version"], "")
+        warning = _pdoc_text(r, ["Handedness Split Warning", "Lineup Trace Stale Expected Flag"], "")
+
+        env_parts = []
+        env_weights = []
+        if np.isfinite(weighted_k):
+            env_parts.append(weighted_k)
+            env_weights.append(0.68 if str(stage).upper() == "CONFIRMED" else 0.54)
+        if np.isfinite(team_hand_k):
+            env_parts.append(team_hand_k)
+            env_weights.append(0.32 if str(stage).upper() == "CONFIRMED" else 0.46)
+        blended_env = float(np.average(env_parts, weights=env_weights)) if env_parts and sum(env_weights) else np.nan
+        try:
+            true_kbf = calculate_log5_k_rate((pitcher_k / 100.0), (blended_env / 100.0)) if np.isfinite(pitcher_k) and np.isfinite(blended_env) else np.nan
+        except Exception:
+            true_kbf = np.nan
+        true_proj = true_kbf * bf if np.isfinite(true_kbf) and np.isfinite(bf) else np.nan
+        proj_gap = true_proj - proj if np.isfinite(true_proj) and np.isfinite(proj) else np.nan
+        kbf_gap = true_kbf - model_kbf if np.isfinite(true_kbf) and np.isfinite(model_kbf) else np.nan
+        env_gap = weighted_k - team_hand_k if np.isfinite(weighted_k) and np.isfinite(team_hand_k) else np.nan
+        if not np.isfinite(pitcher_k) or not np.isfinite(blended_env):
+            read = "DATA_GAP"
+        elif abs(proj_gap) >= 0.45:
+            read = "MODEL_HELD_LOW" if proj_gap > 0 else "MODEL_HELD_HIGH"
+        elif abs(env_gap) >= 1.5:
+            read = "TEAM_LINEUP_ENV_GAP"
+        else:
+            read = "MATCHUP_ALIGNED"
+        hand_check = "PASS" if hand and np.isfinite(team_hand_k) else "MISSING_HAND_OR_TEAM_SPLIT"
+        confirmed_check = "CONFIRMED_FLOW" if str(stage).upper() == "CONFIRMED" and np.isfinite(weighted_k) else "EXPECTED_OR_FALLBACK_FLOW"
+        if not np.isfinite(kbf_gap):
+            conversion_check = "KBF_DATA_GAP"
+        elif abs(kbf_gap) >= 0.025:
+            conversion_check = "KBF_GAP_REVIEW"
+        else:
+            conversion_check = "KBF_ALIGNED"
+        rows.append({
+            "Pitcher": pitcher,
+            "Matchup": _pdoc_text(r, ["Matchup", "matchup"]),
+            "Pitcher Hand": hand,
+            "Line": line,
+            "K PROJ": round(float(proj), 2) if np.isfinite(proj) else np.nan,
+            "BF": round(float(bf), 1) if np.isfinite(bf) else np.nan,
+            "Pitcher K%": round(float(pitcher_k), 1) if np.isfinite(pitcher_k) else np.nan,
+            "Team K% vs Pitcher Hand": round(float(team_hand_k), 1) if np.isfinite(team_hand_k) else np.nan,
+            "Weighted Confirmed/Lineup K%": round(float(weighted_k), 1) if np.isfinite(weighted_k) else np.nan,
+            "Team-vs-Lineup Gap": round(float(env_gap), 1) if np.isfinite(env_gap) else np.nan,
+            "Blended True Opp K%": round(float(blended_env), 1) if np.isfinite(blended_env) else np.nan,
+            "Model K/BF": round(float(model_kbf), 3) if np.isfinite(model_kbf) else np.nan,
+            "Log5 True K/BF Check": round(float(true_kbf), 3) if np.isfinite(true_kbf) else np.nan,
+            "True-K Check Projection": round(float(true_proj), 2) if np.isfinite(true_proj) else np.nan,
+            "True-K Check Gap": round(float(proj_gap), 2) if np.isfinite(proj_gap) else np.nan,
+            "Read": read,
+            "Team vs Hand Check": hand_check,
+            "Confirmed Lineup Check": confirmed_check,
+            "K/BF Conversion Check": conversion_check,
+            "Lineup Stage": stage,
+            "K Source": source,
+            "Warning": warning,
+            "Version": HAND_MATCHUP_TRUTH_AUDIT_VERSION,
+        })
+    return pd.DataFrame(rows)
+
+
+def render_hand_matchup_truth_audit_panel(board=None):
+    st.markdown('<div class="section-title-pro">LHP/RHP True K Matchup Check</div>', unsafe_allow_html=True)
+    st.caption("Audit only. Confirms pitcher hand, opponent team K% vs that hand, confirmed/weighted batter K%, and the model K/BF are aligned.")
+    df = build_hand_matchup_truth_audit(board)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("Load a K slate to audit team-vs-hand and confirmed-lineup K matching.")
+        return
+    reads = df.get("Read", pd.Series(dtype=str)).astype(str).str.upper()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", int(len(df)))
+    c2.metric("Aligned", int(reads.eq("MATCHUP_ALIGNED").sum()))
+    c3.metric("Held Low/High", int(reads.str.contains("HELD").sum()))
+    c4.metric("Env/Data Gaps", int(reads.str.contains("GAP").sum()))
+    cols = [c for c in [
+        "Pitcher", "Matchup", "Pitcher Hand", "Line", "K PROJ", "BF",
+        "Pitcher K%", "Team K% vs Pitcher Hand", "Weighted Confirmed/Lineup K%",
+        "Team-vs-Lineup Gap", "Blended True Opp K%", "Model K/BF",
+        "Log5 True K/BF Check", "True-K Check Projection", "True-K Check Gap",
+        "Read", "Team vs Hand Check", "Confirmed Lineup Check", "K/BF Conversion Check",
+        "Lineup Stage", "K Source", "Warning", "Version"
+    ] if c in df.columns]
+    st.dataframe(df[cols], use_container_width=True, hide_index=True)
+    with st.expander("What this means for true projections", expanded=False):
+        st.markdown(
+            "- `Team K% vs Pitcher Hand` is the broader opponent split: how that team strikes out vs LHP/RHP.\n"
+            "- `Weighted Confirmed/Lineup K%` is the actual/projected nine hitters, weighted by batting-order exposure.\n"
+            "- `Log5 True K/BF Check` combines pitcher K% with the blended opponent K environment.\n"
+            "- `MODEL_HELD_LOW` means the support check thinks the center may be too low. `MODEL_HELD_HIGH` means it may be too high.\n"
+            "- `Team vs Hand Check` confirms the app has a real LHP/RHP opponent K split available for that pitcher hand.\n"
+            "- `Confirmed Lineup Check` confirms whether the official/confirmed nine are flowing into the matchup read instead of only being displayed.\n"
+            "- `K/BF Conversion Check` compares the model's current K per batter faced against the independent log5 hand-matchup check.\n"
+            "- This stays audit-only until the same read wins over a larger graded sample."
         )
 
 
@@ -46994,6 +48381,9 @@ with tab_loss_lab:
 with tab_iq:
     render_baseball_iq_tab(board)
     render_unified_projection_brain_panel(board)
+    render_lineup_transition_audit_panel(board)
+    render_projection_doctor_panel(board)
+    render_hand_matchup_truth_audit_panel(board)
 
 with tab_30d_learning:
     render_30_day_gamelog_learning_iq()
