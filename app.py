@@ -29748,11 +29748,11 @@ def _okr_mi_projection_nudge(row, rec, hand):
         raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
 
         # Balanced K Environment layer:
-        # 28% of raw K-opportunity delta, capped at +/-0.28 Ks.
+        # 30% of raw K-opportunity delta, capped at +/-0.30 Ks.
         # Current conservative build was 12% / +/-0.20.
         # OG/Warrior shadow is 35% / +/-0.30.
-        weighted = raw * 0.28
-        capped = max(-0.28, min(0.28, weighted))
+        weighted = raw * 0.30
+        capped = max(-0.30, min(0.30, weighted))
 
         if capped >= 0.18:
             label = 'MI_K_ENV_PLUS'
@@ -29768,7 +29768,7 @@ def _okr_mi_projection_nudge(row, rec, hand):
         reason = (
             f'official MLB team K blend {verified_k:.2f}% ({blend_note}) '
             f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
-            f'raw {raw:+.2f}K * 0.28 capped +/-0.28 = {capped:+.2f}K'
+            f'raw {raw:+.2f}K * 0.30 capped +/-0.30 = {capped:+.2f}K'
         )
         return round(float(capped), 2), label, reason, verified_k
     except Exception as e:
@@ -30057,7 +30057,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Recency Team K Blend Detail"] = mi_blend_detail
         d["Recency Team K Blend Method"] = "PA-shrunk L3/L5/L10/L15/L30/season vs hand; short windows are low weight and unsupported recent weight shrinks to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_BALANCED_RECENCY_BLEND_WEIGHT_0_28_CAP_0_28_2026_07_27"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_BALANCED_RECENCY_BLEND_WEIGHT_0_30_CAP_0_30_2026_07_27"
         d["OG Matchup Intel Shadow K Projection"] = og_mi_final
         d["OG Matchup Intel Shadow Nudge"] = og_mi_adj
         d["OG Matchup Intel Shadow Edge"] = og_mi_edge
@@ -44260,17 +44260,38 @@ def _kcard_arsenal_profile(row, p):
     raw_pitcher = str((row or {}).get("Pitcher") or (p or {}).get("pitcher") or "").strip()
     key = _kcard_name_key(raw_pitcher)
     pitch_rows = [r for r in ((p or {}).get("pitch_type_rows") or []) if isinstance(r, dict)]
-    rows = []
     csv_rows = _kcard_csv_arsenal_rows(key)
-    # Prefer the installed Savant arsenal CSV when it has real K/whiff/putaway coverage.
-    # Older in-memory pitch rows sometimes carry usage only, which caused visible dashes.
-    if csv_rows and any(np.isfinite(_kclean_num(r.get("K%"), np.nan)) or np.isfinite(_kclean_num(r.get("Putaway"), np.nan)) for r in csv_rows):
-        rows = csv_rows
+    rows_by_pitch = {}
+
+    def _merge_pitch_row(src):
+        pitch = _kcard_pitch_name_short(src.get("Pitch") or src.get("Pitch Type") or src.get("pitch_name") or src.get("pitch_type"))
+        pk = _kcard_pitch_key(pitch)
+        if not pk:
+            return
+        item = rows_by_pitch.setdefault(pk, {"Pitch": pitch})
+        if pitch and pitch != "Pitch":
+            item["Pitch"] = pitch
+        for dst, keys in {
+            "Use": ["Use", "Pitcher Usage %", "Usage %", "pitch_usage", "pitch_percent", "usage_percent"],
+            "K%": ["K%", "Pitch K%", "K Rate", "k_percent", "strikeout_percent"],
+            "Whiff%": ["Whiff%", "Pitcher Whiff%", "Avg Batter Whiff%", "whiff_percent", "Whiff Rate"],
+            "Putaway": ["Putaway", "PutAway", "put_away", "putaway", "put_away_percent"],
+            "Damage": ["Damage", "SLG", "est_slg", "Hard Hit%", "hard_hit_percent", "xwoba", "est_woba"],
+            "HardHit": ["HardHit", "hard_hit_percent", "Hard Hit%", "hard_hit_rate"],
+        }.items():
+            cur = _kclean_num(item.get(dst), np.nan)
+            if np.isfinite(cur):
+                continue
+            for k in keys:
+                val = src.get(k) if isinstance(src, dict) else None
+                num = _kclean_num(val, np.nan)
+                if np.isfinite(num):
+                    item[dst] = num
+                    break
+
     if pitch_rows:
         for r in pitch_rows:
-            if rows:
-                break
-            rows.append({
+            _merge_pitch_row({
                 "Pitch": _kcard_pitch_name_short(r.get("Pitch Type") or r.get("pitch_name") or r.get("pitch_type")),
                 "Use": _kclean_num(r.get("Pitcher Usage %") or r.get("Usage %") or r.get("pitch_usage") or r.get("pitch_percent") or r.get("usage_percent"), np.nan),
                 "K%": _kclean_num(r.get("Pitch K%") or r.get("K%") or r.get("K Rate") or r.get("k_percent") or r.get("strikeout_percent"), np.nan),
@@ -44278,8 +44299,11 @@ def _kcard_arsenal_profile(row, p):
                 "Putaway": _kclean_num(r.get("Putaway") or r.get("PutAway") or r.get("put_away") or r.get("putaway") or r.get("put_away_percent"), np.nan),
                 "Damage": _kclean_num(r.get("SLG") or r.get("est_slg") or r.get("Hard Hit%") or r.get("hard_hit_percent") or r.get("xwoba") or r.get("est_woba"), np.nan),
             })
-    if not rows:
-        rows = csv_rows
+    # Overlay richer uploaded CSV stats, but do not let a partial CSV hide
+    # lower-usage pitches already present in the board pitch mix.
+    for r in csv_rows:
+        _merge_pitch_row(r)
+    rows = list(rows_by_pitch.values())
     clean = []
     for r in rows:
         use = _kclean_num(r.get("Use"), np.nan)
