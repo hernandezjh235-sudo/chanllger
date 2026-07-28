@@ -29748,11 +29748,11 @@ def _okr_mi_projection_nudge(row, rec, hand):
         raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
 
         # Balanced K Environment layer:
-        # 24% of raw K-opportunity delta, capped at +/-0.25 Ks.
+        # 28% of raw K-opportunity delta, capped at +/-0.28 Ks.
         # Current conservative build was 12% / +/-0.20.
         # OG/Warrior shadow is 35% / +/-0.30.
-        weighted = raw * 0.24
-        capped = max(-0.25, min(0.25, weighted))
+        weighted = raw * 0.28
+        capped = max(-0.28, min(0.28, weighted))
 
         if capped >= 0.18:
             label = 'MI_K_ENV_PLUS'
@@ -29768,7 +29768,7 @@ def _okr_mi_projection_nudge(row, rec, hand):
         reason = (
             f'official MLB team K blend {verified_k:.2f}% ({blend_note}) '
             f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
-            f'raw {raw:+.2f}K * 0.24 capped +/-0.25 = {capped:+.2f}K'
+            f'raw {raw:+.2f}K * 0.28 capped +/-0.28 = {capped:+.2f}K'
         )
         return round(float(capped), 2), label, reason, verified_k
     except Exception as e:
@@ -30057,7 +30057,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Recency Team K Blend Detail"] = mi_blend_detail
         d["Recency Team K Blend Method"] = "PA-shrunk L3/L5/L10/L15/L30/season vs hand; short windows are low weight and unsupported recent weight shrinks to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_BALANCED_RECENCY_BLEND_WEIGHT_0_24_CAP_0_25_2026_07_27"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_BALANCED_RECENCY_BLEND_WEIGHT_0_28_CAP_0_28_2026_07_27"
         d["OG Matchup Intel Shadow K Projection"] = og_mi_final
         d["OG Matchup Intel Shadow Nudge"] = og_mi_adj
         d["OG Matchup Intel Shadow Edge"] = og_mi_edge
@@ -44292,6 +44292,25 @@ def _kcard_arsenal_profile(row, p):
         clean.append(item)
     clean = sorted(clean, key=lambda x: _kclean_num(x.get("Use"), 0), reverse=True)[:6]
 
+    summary_match_k = _kclean_num(_kclean_pick(row or {}, [
+        "Match K%", "APP100 Match K%", "Pitch Mix Match K%", "Lineup Match K%",
+        "Opponent K% vs Pitcher Hand", "APP88 Batter Lineup K%"
+    ], np.nan), np.nan)
+    summary_putaway = _kclean_num(_kclean_pick(row or {}, [
+        "Putaway/Whiff", "PutAway%", "Putaway %", "Putaway", "APP85 PutAway Rate"
+    ], np.nan), np.nan)
+    if np.isfinite(summary_match_k) and abs(summary_match_k) <= 1:
+        summary_match_k *= 100.0
+    if np.isfinite(summary_putaway) and abs(summary_putaway) <= 1:
+        summary_putaway *= 100.0
+    for item in clean:
+        if not np.isfinite(_kclean_num(item.get("K%"), np.nan)) and np.isfinite(summary_match_k):
+            item["K% Display"] = summary_match_k
+            item["K% Display Source"] = "matchup"
+        if not np.isfinite(_kclean_num(item.get("Putaway"), np.nan)) and np.isfinite(summary_putaway):
+            item["Putaway Display"] = summary_putaway
+            item["Putaway Display Source"] = "pitcher"
+
     top = clean[0] if clean else {}
     weights = [max(0.0, _kclean_num(r.get("Use"), 0.0)) for r in clean]
     wsum = sum(weights) or 1.0
@@ -44353,10 +44372,12 @@ def _kcard_arsenal_html(profile):
     for r in rows[:5]:
         pitch = html.escape(str(r.get("Pitch") or "Pitch"))
         use = _pct(r.get("Use"), 0)
-        k = _pct(r.get("K%"), 0)
+        k_val = r.get("K%") if np.isfinite(_kclean_num(r.get("K%"), np.nan)) else r.get("K% Display")
+        put_val = r.get("Putaway") if np.isfinite(_kclean_num(r.get("Putaway"), np.nan)) else r.get("Putaway Display")
+        k = _pct(k_val, 0)
         whiff = _pct(r.get("Whiff%"), 0)
-        put = _pct(r.get("Putaway"), 0)
-        cls = "hi" if _kclean_num(r.get("Whiff%"), 0) >= 30 or _kclean_num(r.get("K%"), 0) >= 30 else "lo" if _kclean_num(r.get("Whiff%"), 99) <= 18 else ""
+        put = _pct(put_val, 0)
+        cls = "hi" if _kclean_num(r.get("Whiff%"), 0) >= 30 or _kclean_num(k_val, 0) >= 30 else "lo" if _kclean_num(r.get("Whiff%"), 99) <= 18 else ""
         trs.append(f"<tr><td>{pitch}</td><td>{use}</td><td class='{cls}'>K:{k}</td><td class='{cls}'>W:{whiff}</td><td>{put}</td></tr>")
     return "<table class='kc-arsenal'><thead><tr><th>Pitch</th><th>Use</th><th>K%</th><th>Whiff</th><th>Put</th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>"
 
@@ -44744,12 +44765,6 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             arsenal_signal = html.escape(str(arsenal.get("signal") or "Arsenal"))
             match_k = _kclean_fmt(arsenal.get("weighted_k"), 1)
             match_whiff = _kclean_fmt(arsenal.get("weighted_whiff"), 1)
-            opp_pitch_profile = _kcard_opponent_pitch_arsenal_profile(row, p, arsenal)
-            opp_pitch_html = _kcard_opponent_pitch_arsenal_html(opp_pitch_profile)
-            opp_pitch_read = html.escape(str(opp_pitch_profile.get("read") or "PITCH_MIX_NEUTRAL"))
-            opp_pitch_source = html.escape(str(opp_pitch_profile.get("source") or ""))
-            opp_pitch_k = _kclean_fmt(opp_pitch_profile.get("opp_k"), 1)
-            opp_pitch_whiff = _kclean_fmt(opp_pitch_profile.get("opp_whiff"), 1)
             ceiling_num = _kcard_ceiling_value(row, line=line, proj=proj, arsenal=arsenal)
             ceiling = "—" if not np.isfinite(_kclean_num(ceiling_num, np.nan)) else f"{int(round(float(ceiling_num)))}K"
             last10_html = _kcard_last10_html(row, p, line)
@@ -44776,11 +44791,6 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 </div>
                 <div class="kc-section-title"><span>{arsenal_signal}</span><span class="kc-chip">Match K {match_k}% · Opp Whiff {match_whiff}%</span></div>
                 {arsenal_rows}
-              </div>
-              <div class="kc-section">
-                <div class="kc-section-title"><span>Opponent vs Pitch Arsenal</span><span class="kc-chip">{opp_pitch_read} · K {opp_pitch_k}% · W {opp_pitch_whiff}%</span></div>
-                {opp_pitch_html}
-                <div class="kc-empty">{opp_pitch_source}</div>
               </div>
               <div class="kc-metrics">
                 <div class="kc-stat"><span>Pitch K%</span><b>{pk}</b></div>
