@@ -47252,9 +47252,24 @@ def _lta_lineup_rows(row, p):
     return []
 
 
+def _lta_row_dict(row):
+    try:
+        if isinstance(row, pd.Series):
+            return row.to_dict()
+        if isinstance(row, dict):
+            return row
+        if hasattr(row, "to_dict"):
+            d = row.to_dict()
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
 def _lta_batter_k(row):
+    row = _lta_row_dict(row)
     for key in ["Used K%", "K% Used", "Split K%", "K% vs Hand", "K% vs RHP", "K% vs LHP", "Season K%", "K%"]:
-        val = _lta_num((row or {}).get(key), np.nan)
+        val = _lta_num(row.get(key), np.nan)
         if np.isfinite(val):
             return val * 100.0 if abs(val) <= 1.0 else val
     return np.nan
@@ -47274,12 +47289,13 @@ def _lta_lineup_profile(rows):
     sources = []
     hitters = []
     for r in rows[:9]:
+        rd = _lta_row_dict(r)
         k = _lta_batter_k(r)
         if np.isfinite(k):
             vals.append(float(k))
-        hands.append(_lta_text((r or {}).get("Hand") or (r or {}).get("Bats"), ""))
-        sources.append(_lta_text((r or {}).get("Lineup Source") or (r or {}).get("K Source"), ""))
-        hitters.append(_lta_text((r or {}).get("Batter") or (r or {}).get("Player") or (r or {}).get("Name"), ""))
+        hands.append(_lta_text(rd.get("Hand") or rd.get("Bats"), ""))
+        sources.append(_lta_text(rd.get("Lineup Source") or rd.get("K Source"), ""))
+        hitters.append(_lta_text(rd.get("Batter") or rd.get("Player") or rd.get("Name"), ""))
     weights = _lta_order_weights(len(vals))
     weighted = float(np.average(vals, weights=weights[:len(vals)])) if vals and weights.size else np.nan
     top4 = float(np.mean(vals[:4])) if len(vals) >= 4 else (float(np.mean(vals)) if vals else np.nan)
