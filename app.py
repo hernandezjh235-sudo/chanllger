@@ -43348,9 +43348,9 @@ def _ksr_apply_split_sanity(df):
             )
 
             if supported and raw_gap > 0.12:
-                cap = 0.34 if (pitcher_k >= 31.0 or arsenal_ok) else 0.26
+                cap = 0.38 if (pitcher_k >= 31.0 or arsenal_ok) else 0.26
                 if line >= 7.5:
-                    cap = min(cap, 0.28)
+                    cap = min(cap, 0.38)
                 move = min(cap, raw_gap * 0.42)
                 note = (
                     f"ELITE_SPLIT_RECONCILE +{move:.2f}; verified {verified_team_k:.1f}, "
@@ -43358,6 +43358,20 @@ def _ksr_apply_split_sanity(df):
                 )
                 if env_gap >= 2.5:
                     note += f"; team/lineup gap {env_gap:+.1f}"
+            elif supported and np.isfinite(line) and line >= 7.5 and pitcher_k >= 30.0 and verified_team_k >= 24.0:
+                # Elite high-line pitchers can look artificially low when a confirmed/projected
+                # lineup average is contact-heavy but the broader team-vs-hand environment,
+                # whiff profile, arsenal, and BF all agree. This is a small upside floor,
+                # not an over-forcer; it should help ace 8.5 spots without breaking unders.
+                team_ratio = max(0.72, min(1.38, verified_team_k / APP97_LEAGUE_K_PCT))
+                team_kbf = max(10.0, min(43.0, pitcher_k * (team_ratio ** 0.60)))
+                team_target = bf * team_kbf / 100.0
+                if np.isfinite(team_target) and team_target > proj + 0.08 and (whiff_ok or arsenal_ok):
+                    move = min(0.38, (team_target - proj) * 0.50)
+                    note = (
+                        f"ACE_HIGH_LINE_TEAM_SPLIT_FLOOR +{move:.2f}; team target {team_target:.2f}, "
+                        f"verified {verified_team_k:.1f}, lineup {lineup_for_gap:.1f}, BF {bf:.1f}"
+                    )
             elif contact_protect:
                 move = max(-0.20, raw_gap * 0.35)
                 note = (
@@ -48221,6 +48235,158 @@ _LINEUP_TRACE_PREV_BUILD_KPROJ_TABLE = build_kproj_table if "build_kproj_table" 
 def build_kproj_table(board):
     base = _LINEUP_TRACE_PREV_BUILD_KPROJ_TABLE(board) if _LINEUP_TRACE_PREV_BUILD_KPROJ_TABLE is not None else pd.DataFrame()
     return _lineup_trace_apply(base, board)
+
+
+# =============================================================================
+# ELITE ACE CLEAR-LINE GATE
+#
+# Runs after the support/trace layers. This is intentionally strict: it only lets
+# the center projection clear a very high line when the pitcher skill, opponent
+# split, whiff profile, workload, ceiling, and slip brain all agree. It protects
+# normal unders by requiring multiple independent upside signals.
+# =============================================================================
+ELITE_ACE_CLEAR_LINE_VERSION = "ELITE_ACE_CLEAR_LINE_GATE_2026_07_29"
+
+
+def _eacl_num(row, keys, default=np.nan):
+    for key in keys:
+        if key in row:
+            raw = row.get(key)
+            val = pd.to_numeric(pd.Series([raw]), errors="coerce").iloc[0]
+            if not np.isfinite(val) and raw is not None and not pd.isna(raw):
+                txt = str(raw).strip().upper().replace("%", "").replace("K", "")
+                cleaned = "".join(ch if (ch.isdigit() or ch in ".-") else " " for ch in txt).split()
+                if cleaned:
+                    val = pd.to_numeric(pd.Series([cleaned[0]]), errors="coerce").iloc[0]
+            if np.isfinite(val):
+                return float(val)
+    return default
+
+
+def _eacl_text(row, keys, default=""):
+    for key in keys:
+        val = row.get(key)
+        if val is not None and not pd.isna(val):
+            txt = str(val).strip()
+            if txt:
+                return txt
+    return default
+
+
+def _eacl_decision(proj, line):
+    if not np.isfinite(proj) or not np.isfinite(line):
+        return "PASS"
+    edge = proj - line
+    if abs(edge) < 0.15:
+        return "PASS"
+    side = "OVER" if edge > 0 else "UNDER"
+    if abs(edge) >= 1.00:
+        return f"🔥 {side}"
+    if abs(edge) >= 0.55:
+        return f"⚠️ {side} LEAN"
+    return f"TRACK {side}"
+
+
+def _eacl_apply(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    final_cols = [
+        "K PROJ", "Final K Projection", "Official K PROJ",
+        "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection",
+        "Winning File K Projection", "APP97 True K Projection", "APP100 Projected Strikeouts",
+    ]
+    edge_cols = [
+        "Edge", "Edge Gap", "Official K Edge", "Final K Edge", "Line-Aware Smart Edge",
+        "Winning File K Edge",
+    ]
+    for idx, sr in out.iterrows():
+        row = sr.to_dict()
+        proj = _eacl_num(row, [
+            "K PROJ", "Matchup Intelligence Final K Projection", "Winning File K Projection",
+            "Final K Projection", "Official K PROJ", "APP97 True K Projection",
+        ])
+        line = _eacl_num(row, ["UD/Line", "Line", "Strikeout Line"])
+        pitcher_k = _eacl_num(row, [
+            "APP97 Live Pitcher K%", "APP100 Pitcher K%", "Official Savant K%",
+            "APP97 Raw MLB Season Pitcher K%", "Pitcher K%",
+        ])
+        opp_k = _eacl_num(row, [
+            "Opponent K% vs Pitcher Hand", "Lineup Trace Opp K%", "Opp K% vs Pitcher Hand",
+            "Opp K%", "Opponent K%",
+        ])
+        whiff = _eacl_num(row, [
+            "Whiff%", "Official Savant Whiff%", "Savant Custom Whiff%", "APP100 Whiff%",
+        ])
+        bf = _eacl_num(row, [
+            "Lineup Trace Projected BF", "APP97 Reconciled Expected BF", "APP100 Projected BF",
+            "Exp BF", "Projected BF", "BF",
+        ])
+        ceiling = _eacl_num(row, ["K Ceiling Read", "Lineup Trace Ceiling", "Ceiling", "K Ceiling"])
+        app98 = _eacl_num(row, ["APP98 Loss Target Projection"])
+        slip_score = _eacl_num(row, ["K Slip Brain Score"])
+        slip_side = _eacl_text(row, ["K Slip Brain Side"]).upper()
+        bf_gate = _eacl_text(row, ["APP100 BF Coverage", "BF Gate", "Projection Data Gate"]).upper()
+        skill = _eacl_text(row, ["APP100 Recent Skill", "Skill", "Projection Data Cautions"]).upper()
+
+        reason = "NO_CLEAR_LINE"
+        move = 0.0
+        new_proj = proj
+        role_limited = any(token in (bf_gate + " " + skill) for token in ["LOW_BF", "ROLE_LIMIT", "OPENER", "BULK", "LIMIT"])
+        elite_clear = bool(
+            np.isfinite(proj) and np.isfinite(line) and line >= 7.5 and proj < line
+            and np.isfinite(pitcher_k) and pitcher_k >= 30.0
+            and np.isfinite(opp_k) and opp_k >= 24.0
+            and np.isfinite(whiff) and whiff >= 30.0
+            and np.isfinite(bf) and bf >= 22.0
+            and np.isfinite(ceiling) and ceiling >= line + 2.25
+            and np.isfinite(slip_score) and slip_score >= 92.0
+            and slip_side == "OVER"
+            and not role_limited
+        )
+        if elite_clear:
+            # Use the existing ceiling only as an upside distribution clue. Cap the
+            # final clear just above the line so this does not become a blind ceiling chase.
+            ceiling_bridge = proj + ((ceiling - proj) * 0.38)
+            support_bridge = max(app98 if np.isfinite(app98) else proj, ceiling_bridge)
+            clear_target = min(line + 0.25, support_bridge)
+            if clear_target > proj + 0.10:
+                new_proj = round(clear_target, 2)
+                move = new_proj - proj
+                reason = (
+                    f"ELITE_CLEAR_LINE +{move:.2f}; pitcherK {pitcher_k:.1f}, oppK {opp_k:.1f}, "
+                    f"whiff {whiff:.1f}, BF {bf:.1f}, ceiling {ceiling:.1f}, slip {slip_score:.0f}"
+                )
+
+        out.at[idx, "Elite Ace Clear-Line Pre Projection"] = round(proj, 2) if np.isfinite(proj) else np.nan
+        out.at[idx, "Elite Ace Clear-Line Projection"] = round(new_proj, 2) if np.isfinite(new_proj) else np.nan
+        out.at[idx, "Elite Ace Clear-Line Move"] = round(move, 3)
+        out.at[idx, "Elite Ace Clear-Line Reason"] = reason
+        out.at[idx, "Elite Ace Clear-Line Version"] = ELITE_ACE_CLEAR_LINE_VERSION
+        if np.isfinite(new_proj) and np.isfinite(proj) and abs(new_proj - proj) >= 0.005:
+            for col in final_cols:
+                if col in out.columns:
+                    out.at[idx, col] = new_proj
+            if np.isfinite(line):
+                edge = round(new_proj - line, 2)
+                for col in edge_cols:
+                    if col in out.columns:
+                        out.at[idx, col] = edge
+                decision = _eacl_decision(new_proj, line)
+                for col in ["Decision", "Main Engine Action", "Line-Aware Smart Decision", "Winning File K Decision"]:
+                    if col in out.columns:
+                        out.at[idx, col] = decision
+                out.at[idx, "Elite Ace Clear-Line Side"] = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
+                out.at[idx, "Elite Ace Clear-Line Decision"] = decision
+    return out
+
+
+_EACL_PREV_BUILD_KPROJ_TABLE = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    base = _EACL_PREV_BUILD_KPROJ_TABLE(board) if _EACL_PREV_BUILD_KPROJ_TABLE is not None else pd.DataFrame()
+    return _eacl_apply(base)
 
 
 def _lta_snapshot_rows(board=None):
