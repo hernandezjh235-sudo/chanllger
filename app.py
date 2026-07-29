@@ -29764,7 +29764,7 @@ def _okr_mi_projection_nudge(row, rec, hand):
         raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
 
         # Selective K Environment layer:
-        # Base blend is 32.5% of raw K-opportunity delta. Extra room is only
+        # Base blend is 34% of raw K-opportunity delta. Extra room is only
         # granted when pitcher skill, opponent K environment, and BF support agree.
         pitcher_k = _okr_num(row.get('Pitcher K%'), None)
         if pitcher_k is not None and abs(pitcher_k) <= 1:
@@ -29894,7 +29894,7 @@ def _okr_mi_projection_nudge(row, rec, hand):
             finish_problem
         )
 
-        weighted = raw * 0.325
+        weighted = raw * 0.34
         up_cap = 0.35
         down_cap = 0.35
         cap_note = 'base_cap'
@@ -29927,7 +29927,7 @@ def _okr_mi_projection_nudge(row, rec, hand):
         reason = (
             f'official MLB team K blend {verified_k:.2f}% ({blend_note}) '
             f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
-            f'raw {raw:+.2f}K * 0.325 capped -{down_cap:.2f}/+{up_cap:.2f} '
+            f'raw {raw:+.2f}K * 0.34 capped -{down_cap:.2f}/+{up_cap:.2f} '
             f'({cap_note}; pitcherK {pitcher_k if pitcher_k is not None else "—"}; '
             f'K9 {k9 if k9 is not None else "—"}; whiff {whiff if whiff is not None else "—"}; '
             f'chase {chase if chase is not None else "—"}; zoneContact {zone_contact if zone_contact is not None else "—"}; '
@@ -30223,7 +30223,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Recency Team K Blend Detail"] = mi_blend_detail
         d["Recency Team K Blend Method"] = "PA-shrunk L3/L5/L10/L15/L30/season vs hand; short windows are low weight and unsupported recent weight shrinks to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_K_CONVERSION_FOUL_WALK_DAMAGE_LOCATION_2026_07_28"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_K_CONVERSION_FOUL_WALK_DAMAGE_LOCATION_BLEND34_2026_07_28"
         d["OG Matchup Intel Shadow K Projection"] = og_mi_final
         d["OG Matchup Intel Shadow Nudge"] = og_mi_adj
         d["OG Matchup Intel Shadow Edge"] = og_mi_edge
