@@ -40065,7 +40065,7 @@ def _pcx_add_single_pitcher_df(df, name_col="Pitcher"):
 #   * Suspect recent handedness splits are detected and downweighted.
 #   * Opener/bulk/pitch-limit/short-leash roles do not get automatic BF inflation.
 # =============================================================================
-APP97_CURRENT_K_VERSION = "APP97_CURRENT_K_INTERACTION_V8_FULL_SOURCE_FIX_2026_07_25"
+APP97_CURRENT_K_VERSION = "APP97_CURRENT_K_INTERACTION_V9_ELITE_TEAM_ENV_GUARD_2026_07_29"
 APP97_LEAGUE_K_PCT = 22.5
 
 def _app97_num(v, default=None):
@@ -40419,6 +40419,54 @@ def _app97_apply(df, board=None):
             lw = 0.0
             opp_env = team_env
 
+        raw_opp_env = opp_env
+        env_guard_note = "NO_GUARD"
+        env_guard_add = 0.0
+        whiff_hint = None
+        for _c in ["Whiff%", "Savant Custom Whiff%", "APP100 Whiff%", "Pitcher Whiff%"]:
+            whiff_hint = _app97_pct(row.get(_c), None)
+            if whiff_hint is not None:
+                break
+        arsenal_hint = None
+        for _c in ["APP100 Arsenal Score", "Pitch Arsenal Score", "Arsenal", "Pitch Mix Matchup Score"]:
+            arsenal_hint = _app97_num(row.get(_c), None)
+            if arsenal_hint is not None:
+                break
+        base_bf_hint = _app97_num(row.get("Exp BF"), None)
+        if base_bf_hint is None:
+            base_bf_hint = _app97_num(row.get("APP85 Expected BF"), None)
+        hard_limited_for_env, _env_role_txt = _app97_role_limited(row)
+
+        # Elite/high-K team environments should not be overly suppressed by a
+        # projected lineup average that may be stale or too order-sensitive.
+        # This is a guarded bridge, not a blind over boost: it requires elite
+        # pitcher K skill, a strong team-vs-hand K split, a material team/lineup
+        # gap, safe workload/role, plus whiff or arsenal support.
+        if lineup_k is not None and team_env is not None:
+            env_gap = team_env - lineup_k
+            workload_safe_for_env = (base_bf_hint is None or base_bf_hint >= 20.0) and not hard_limited_for_env
+            matchup_support_for_env = (
+                (whiff_hint is not None and whiff_hint >= 28.0)
+                or (arsenal_hint is not None and arsenal_hint >= 58.0)
+                or pitcher_k >= 31.0
+            )
+            if (
+                pitcher_k >= 28.0
+                and team_env >= 24.0
+                and env_gap >= 2.5
+                and workload_safe_for_env
+                and matchup_support_for_env
+            ):
+                team_floor_weight = 0.68 if lineup_status == "CONFIRMED" else 0.78
+                guarded_env = min(team_env, lineup_k + env_gap * team_floor_weight)
+                if guarded_env > opp_env:
+                    env_guard_add = guarded_env - opp_env
+                    opp_env = guarded_env
+                    env_guard_note = (
+                        f"ELITE_TEAM_K_FLOOR +{env_guard_add:.2f}; "
+                        f"team {team_env:.1f} vs lineup {lineup_k:.1f}"
+                    )
+
         bf, bf_note = _app97_reconcile_bf(row, live, pitcher_k)
 
         # Multiplicative pitcher × opponent interaction. Exponent is deliberately
@@ -40484,6 +40532,9 @@ def _app97_apply(df, board=None):
             "APP97 Lineup K%": round(lineup_k,2) if lineup_k is not None else np.nan,
             "APP97 Lineup Status": lineup_status,
             "APP97 Lineup Weight": round(lw,2),
+            "APP97 K Environment Pre-Guard": round(raw_opp_env,2),
+            "APP97 K Environment Guard": env_guard_note,
+            "APP97 K Environment Guard Add": round(env_guard_add,2),
             "APP97 Opponent K Environment": round(opp_env,2),
             "APP97 K Interaction %": round(interaction_k_pct,2),
             "APP97 K Interaction Label": interaction_label,
@@ -42826,8 +42877,8 @@ def _kreal_render_panel():
 # that older public K source while keeping APP97/APP88/Savant/APP99 as audit and
 # risk data. Pitching Outs, Moneyline, and copy/paste formatting stay separate.
 # =============================================================================
-WINNING_FILE_K_BRIDGE_VERSION = "WINNING_FILE_K_SOURCE_BRIDGE_2026_07_26"
-WINNING_FILE_K_SOURCE_MODE = "17_11_FIRST"  # options: 17_11_FIRST, 15_9_FIRST, APP70_FIRST, CURRENT_ONLY
+WINNING_FILE_K_BRIDGE_VERSION = "WINNING_FILE_K_SOURCE_BRIDGE_CURRENT34_FIRST_2026_07_29"
+WINNING_FILE_K_SOURCE_MODE = "CURRENT_34_FIRST"  # options: CURRENT_34_FIRST, 17_11_FIRST, 15_9_FIRST, APP70_FIRST, CURRENT_ONLY
 
 
 def _wfk_num(value, default=np.nan):
@@ -42850,7 +42901,14 @@ def _wfk_line(row):
 
 def _wfk_source_order(mode=None):
     mode = str(mode or WINNING_FILE_K_SOURCE_MODE or "").upper()
-    current = ["K PROJ", "Final K Projection", "Official K PROJ"]
+    current = [
+        "Matchup Intelligence Final K Projection",
+        "APP97 True K Projection",
+        "Line-Aware Smart Final K Projection",
+        "K PROJ",
+        "Final K Projection",
+        "Official K PROJ",
+    ]
     file17 = [
         "File33 Matched K Projection",
         "Pre-App70 K PROJ",
@@ -42864,6 +42922,8 @@ def _wfk_source_order(mode=None):
     ]
     if mode in {"CURRENT_ONLY", "APP97", "CURRENT"}:
         return current
+    if mode in {"CURRENT_34_FIRST", "MI_FIRST"}:
+        return current + file17 + file15
     if mode in {"15_9_FIRST", "APP70_FIRST"}:
         return file15 + file17 + current
     return file17 + file15 + current
@@ -43130,6 +43190,221 @@ def build_kproj_table(board):
     if _HSK_PREV_BUILD_K is None:
         return pd.DataFrame()
     return _hsk_apply_handedness_verifier(_HSK_PREV_BUILD_K(board), board)
+
+
+# =============================================================================
+# K SPLIT SANITY RECONCILER
+#
+# The handedness verifier runs after APP97/current K math. That means the card can
+# display a cleaner opponent-vs-hand split than the split APP97 saw when it
+# calculated the final number. This layer reconciles only material mismatches.
+#
+# Safety:
+#   * It is capped tightly and requires multiple support signals.
+#   * It can move elite/high-K matchups up a little, but also protects low-K/contact
+#     unders from being boosted by a noisy team number.
+#   * It does not touch Pitching Outs, Moneyline, copy/paste formatting, or CSVs.
+# =============================================================================
+K_SPLIT_SANITY_VERSION = "K_SPLIT_SANITY_RECONCILER_V1_2026_07_29"
+
+
+def _ksr_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "None", "nan", "NaN", "NO LINE", "NO_UD_LINE"):
+            return default
+        v = float(str(value).replace("%", "").replace(",", "").strip())
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _ksr_pct(value, default=np.nan):
+    v = _ksr_num(value, default)
+    if not np.isfinite(v):
+        return default
+    return v * 100.0 if abs(v) <= 1.0 else v
+
+
+def _ksr_pick(row, keys, default=np.nan, pct=False):
+    for key in keys:
+        if key in row:
+            v = _ksr_pct(row.get(key), np.nan) if pct else _ksr_num(row.get(key), np.nan)
+            if np.isfinite(v):
+                return v, key
+    return default, ""
+
+
+def _ksr_line(row):
+    v, _ = _ksr_pick(row, ["UD/Line", "UD Line", "Line", "K Line", "Underdog Line"], np.nan)
+    return v
+
+
+def _ksr_role_limited(row):
+    txt = " | ".join(str(row.get(c) or "") for c in [
+        "Open/Bulk Role Signal 2.1", "Hook/Role Signal", "Experience Gate",
+        "Experience Risk Flags", "Leash Label", "Deep Leash Risk",
+        "APP82 Role Validation", "Pitch Count Label", "Pull Label",
+        "APP100 BF Coverage", "APP97 BF Reconciliation",
+    ]).upper()
+    hard_terms = [
+        "OPENER", "BULK", "TANDEM", "PITCH_LIMIT", "STRICT_HOOK",
+        "RETURN_FROM_IL_LIMIT", "SHORT_SAMPLE_RISK", "LOW_BF",
+    ]
+    return any(term in txt for term in hard_terms), txt[:140]
+
+
+def _ksr_decision(proj, line):
+    if not np.isfinite(proj) or not np.isfinite(line):
+        return "NO LINE/PROJECTION"
+    edge = proj - line
+    if abs(edge) < 0.15:
+        return "PASS"
+    side = "OVER" if edge > 0 else "UNDER"
+    if abs(edge) >= 1.00:
+        return f"🔥 {side}"
+    if abs(edge) >= 0.55:
+        return f"⚠️ {side} LEAN"
+    return f"TRACK {side}"
+
+
+def _ksr_apply_split_sanity(df):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    final_cols = [
+        "K PROJ", "Final K Projection", "Official K PROJ",
+        "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection",
+    ]
+    edge_cols = ["Edge", "Edge Gap", "Official K Edge", "Final K Edge", "Line-Aware Smart Edge"]
+
+    for idx, rr in out.iterrows():
+        row = rr.to_dict()
+        proj, proj_src = _ksr_pick(row, [
+            "K PROJ", "Matchup Intelligence Final K Projection", "APP97 True K Projection",
+            "Final K Projection", "Official K PROJ",
+        ], np.nan)
+        line = _ksr_line(row)
+        pitcher_k, pitcher_src = _ksr_pick(row, [
+            "APP97 Live Pitcher K%", "Pitcher K%", "APP100 Pitcher K%",
+            "APP97 Raw MLB Season Pitcher K%",
+        ], np.nan, pct=True)
+        verified_team_k, team_src = _ksr_pick(row, [
+            "Opponent K% vs Pitcher Hand", "APP97 Team K% Current Blend",
+            "Opp K% vs Pitcher Hand", "Opp K%", "Opponent K%",
+        ], np.nan, pct=True)
+        lineup_k, lineup_src = _ksr_pick(row, [
+            "APP97 Lineup K%", "APP88 Batter Lineup K%", "Weighted Lineup K%",
+            "Lineup K%", "APP100 Avg Batter K%",
+        ], np.nan, pct=True)
+        bf, bf_src = _ksr_pick(row, [
+            "APP97 Reconciled Expected BF", "Exp BF", "APP100 Projected BF",
+            "APP85 Expected BF", "Projected BF", "BF",
+        ], np.nan)
+        whiff, whiff_src = _ksr_pick(row, [
+            "Whiff%", "Savant Custom Whiff%", "APP100 Whiff%", "Pitcher Whiff%",
+        ], np.nan, pct=True)
+        opp_whiff, opp_whiff_src = _ksr_pick(row, [
+            "Opponent Whiff%", "Opp Whiff%", "APP100 Opp Whiff%", "Team Whiff%",
+        ], np.nan, pct=True)
+        arsenal, arsenal_src = _ksr_pick(row, [
+            "APP100 Arsenal Score", "Pitch Arsenal Score", "Arsenal", "Pitch Mix Matchup Score",
+        ], np.nan)
+        role_limited, role_note = _ksr_role_limited(row)
+
+        move = 0.0
+        note = "NO_ADJUST"
+        target = np.nan
+        kbf = np.nan
+        supported = False
+        contact_protect = False
+
+        if np.isfinite(proj) and np.isfinite(pitcher_k) and np.isfinite(verified_team_k) and np.isfinite(bf):
+            lineup_for_gap = lineup_k if np.isfinite(lineup_k) else verified_team_k
+            env_gap = verified_team_k - lineup_for_gap
+            blend_env = verified_team_k
+            if np.isfinite(lineup_k):
+                # Verified team-vs-hand remains the anchor, confirmed/projected nine refines it.
+                blend_env = 0.62 * verified_team_k + 0.38 * lineup_k
+
+            ratio = max(0.72, min(1.38, blend_env / APP97_LEAGUE_K_PCT))
+            kbf = max(10.0, min(43.0, pitcher_k * (ratio ** 0.60)))
+            target = bf * kbf / 100.0
+            raw_gap = target - proj
+
+            whiff_ok = (np.isfinite(whiff) and whiff >= 28.0) or (np.isfinite(opp_whiff) and opp_whiff >= 24.5)
+            arsenal_ok = np.isfinite(arsenal) and arsenal >= 58.0
+            bf_ok = bf >= 20.0 and not role_limited
+            elite_ok = pitcher_k >= 28.0 and verified_team_k >= 23.5
+            supported = bool(elite_ok and bf_ok and (whiff_ok or arsenal_ok or pitcher_k >= 31.0))
+
+            contact_protect = bool(
+                not role_limited
+                and raw_gap < -0.12
+                and (
+                    pitcher_k <= 21.0
+                    or (np.isfinite(lineup_k) and lineup_k <= 19.5 and verified_team_k <= 21.5)
+                    or (np.isfinite(whiff) and whiff <= 18.5)
+                )
+            )
+
+            if supported and raw_gap > 0.12:
+                cap = 0.34 if (pitcher_k >= 31.0 or arsenal_ok) else 0.26
+                if line >= 7.5:
+                    cap = min(cap, 0.28)
+                move = min(cap, raw_gap * 0.42)
+                note = (
+                    f"ELITE_SPLIT_RECONCILE +{move:.2f}; verified {verified_team_k:.1f}, "
+                    f"lineup {lineup_for_gap:.1f}, BF {bf:.1f}"
+                )
+                if env_gap >= 2.5:
+                    note += f"; team/lineup gap {env_gap:+.1f}"
+            elif contact_protect:
+                move = max(-0.20, raw_gap * 0.35)
+                note = (
+                    f"CONTACT_UNDER_PROTECT {move:.2f}; verified {verified_team_k:.1f}, "
+                    f"lineup {lineup_for_gap:.1f}, pitcher {pitcher_k:.1f}"
+                )
+
+        new_proj = round(proj + move, 2) if np.isfinite(proj) else np.nan
+        out.at[idx, "K Split Sanity Pre Projection"] = round(proj, 2) if np.isfinite(proj) else np.nan
+        out.at[idx, "K Split Sanity Projection"] = new_proj
+        out.at[idx, "K Split Sanity Move"] = round(move, 3)
+        out.at[idx, "K Split Sanity Note"] = note
+        out.at[idx, "K Split Sanity Team K Used"] = round(verified_team_k, 2) if np.isfinite(verified_team_k) else np.nan
+        out.at[idx, "K Split Sanity Lineup K Used"] = round(lineup_k, 2) if np.isfinite(lineup_k) else np.nan
+        out.at[idx, "K Split Sanity K/BF"] = round(kbf, 2) if np.isfinite(kbf) else np.nan
+        out.at[idx, "K Split Sanity Target K"] = round(target, 2) if np.isfinite(target) else np.nan
+        out.at[idx, "K Split Sanity Sources"] = f"proj={proj_src}; pitcher={pitcher_src}; team={team_src}; lineup={lineup_src}; bf={bf_src}; whiff={whiff_src or opp_whiff_src}; arsenal={arsenal_src}"
+        out.at[idx, "K Split Sanity Role Limited"] = bool(role_limited)
+        out.at[idx, "K Split Sanity Version"] = K_SPLIT_SANITY_VERSION
+
+        if np.isfinite(new_proj) and abs(move) >= 0.005:
+            for c in final_cols:
+                if c in out.columns:
+                    old = pd.to_numeric(out[c], errors="coerce")
+                    out.at[idx, c] = new_proj if np.isfinite(new_proj) else old.loc[idx]
+            if np.isfinite(line):
+                edge = round(new_proj - line, 2)
+                for c in edge_cols:
+                    if c in out.columns:
+                        out.at[idx, c] = edge
+                decision = _ksr_decision(new_proj, line)
+                for c in ["Decision", "Main Engine Action", "Line-Aware Smart Decision"]:
+                    if c in out.columns:
+                        out.at[idx, c] = decision
+                out.at[idx, "K Split Sanity Side"] = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
+                out.at[idx, "K Split Sanity Decision"] = decision
+
+    return out
+
+
+_KSR_PREV_BUILD_K = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    if _KSR_PREV_BUILD_K is None:
+        return pd.DataFrame()
+    return _ksr_apply_split_sanity(_KSR_PREV_BUILD_K(board))
 
 
 # =============================================================================
