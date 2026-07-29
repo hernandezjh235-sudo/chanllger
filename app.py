@@ -44419,8 +44419,38 @@ def _kclean_pct_display(value, digits=1, blank="—"):
     return round(float(v), digits)
 
 
+def _kclean_final_proj_line(row):
+    proj = _kclean_num(_kclean_pick(row, [
+        "Elite Ace Clear-Line Projection",
+        "K PROJ", "Final K Projection", "Official K PROJ",
+        "Matchup Intelligence Final K Projection", "Line-Aware Smart Final K Projection",
+        "Winning File K Projection", "APP97 True K Projection", "APP98 Loss Target Projection",
+        "APP100 Projected Strikeouts",
+    ], ""), np.nan)
+    line = _kclean_num(_kclean_pick(row, ["UD/Line", "Line", "Underdog Line", "Strikeout Line"], ""), np.nan)
+    return proj, line
+
+
+def _kclean_final_edge(row, default=np.nan):
+    proj, line = _kclean_final_proj_line(row)
+    if np.isfinite(proj) and np.isfinite(line):
+        return round(float(proj - line), 2)
+    return _kclean_num(_kclean_pick(row, [
+        "Elite Ace Clear-Line Edge",
+        "Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge",
+        "Line-Aware Smart Edge", "Winning File K Edge",
+    ], default), default)
+
+
 def _kclean_side_label(row):
-    side = str(_kclean_pick(row, ["Winning File K Side", "APP97 Final Side", "APP88 Final Side", "APP98 Loss Target Side"], "")).upper()
+    proj, line = _kclean_final_proj_line(row)
+    if np.isfinite(proj) and np.isfinite(line):
+        if proj > line:
+            return "OVER"
+        if proj < line:
+            return "UNDER"
+        return "PASS"
+    side = str(_kclean_pick(row, ["Elite Ace Clear-Line Side", "Winning File K Side", "APP97 Final Side", "APP88 Final Side", "APP98 Loss Target Side"], "")).upper()
     if side in {"OVER", "UNDER"}:
         return side
     text = str(_kclean_pick(row, ["Decision", "Final Decision", "Model Lean"], "")).upper()
@@ -44433,10 +44463,12 @@ def _kclean_side_label(row):
 
 def _kclean_display_decision(row):
     side = _kclean_side_label(row)
-    edge = _app98_num(_kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], np.nan), np.nan) if "_app98_num" in globals() else np.nan
+    edge = _kclean_final_edge(row, np.nan)
     reason = str(row.get("APP98 Loss Target Reason") or "").lower()
     gate = str(row.get("APP99 Right Wins Gate") or "").upper()
     if not side:
+        return "PASS"
+    if side == "PASS":
         return "PASS"
     if "RED" in gate:
         return f"PASS {side}"
@@ -44450,6 +44482,8 @@ def _kclean_display_decision(row):
             return f"FIRE {side}"
         if abs_edge >= 0.55:
             return f"LEAN {side}"
+        if abs_edge >= 0.15:
+            return f"TRACK {side}"
     return f"PASS {side}"
 
 
@@ -44459,6 +44493,7 @@ def _kclean_main_df(df):
     rows = []
     for _, rr in df.iterrows():
         row = rr.to_dict()
+        final_proj, _final_line = _kclean_final_proj_line(row)
         pitcher_k_raw = _kclean_pick(row, ["APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K% Used", "Pitcher K%", "Official Savant K%"], "")
         pitcher_k_display = _kclean_pct_display(pitcher_k_raw)
         pitcher_k_source = _kclean_pick(row, ["APP97 Pitcher K Source", "APP97 Pitcher K% Display Source", "Savant Custom Source", "Official Savant Source"], "")
@@ -44466,14 +44501,14 @@ def _kclean_main_df(df):
             "Pitcher": _kclean_pick(row, ["Pitcher", "pitcher", "Player"], ""),
             "Matchup": _kclean_pick(row, ["Matchup", "matchup"], ""),
             "Line": _kclean_pick(row, ["UD/Line", "Line", "Underdog Line"], ""),
-            "K Projection": _kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection", "APP98 Loss Target Projection"], ""),
-            "Proj SO": _kclean_pick(row, ["APP100 Projected Strikeouts", "K PROJ", "Final K Projection"], ""),
+            "K Projection": _kclean_fmt(final_proj, 2),
+            "Proj SO": _kclean_fmt(final_proj, 2),
             "Proj BF": _kclean_pick(row, ["APP100 Projected BF", "APP97 Reconciled Expected BF", "Exp BF"], ""),
             "Proj IP": _kclean_pick(row, ["APP100 Projected IP", "IP Floor", "IP PROJ"], ""),
-            "Edge": _kclean_pick(row, ["Official K Edge", "Edge Gap", "Final K Edge", "APP98 Loss Target Edge"], ""),
+            "Edge": _kclean_final_edge(row, ""),
             "Pick": _kclean_display_decision(row),
             "Slip Brain": _kclean_pick(row, ["K Slip Brain Flag"], ""),
-            "Slip Side": _kclean_pick(row, ["K Slip Brain Side"], ""),
+            "Slip Side": _kclean_side_label(row),
             "Slip Score": _kclean_pick(row, ["K Slip Brain Score"], ""),
             "Slip Reason": _kclean_pick(row, ["K Slip Brain Reason"], ""),
             "Arsenal Signal": _kclean_pick(row, ["K Arsenal Signal"], ""),
@@ -44562,14 +44597,15 @@ def _kclean_copy_paste_slate(df, include_thin=False):
             block = []
             for _, rr in group.iterrows():
                 row = rr.to_dict()
-                line = _kclean_num(row.get("UD/Line"), np.nan)
-                proj = _kclean_num(_kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "Winning File K Projection"], ""), np.nan)
+                proj, line = _kclean_final_proj_line(row)
                 if not np.isfinite(line) or not np.isfinite(proj):
                     continue
-                edge = proj - line
-                side = str(_kclean_pick(row, ["Winning File K Side", "APP97 Final Side", "APP88 Final Side"], "")).upper()
-                if side not in {"OVER", "UNDER"}:
-                    side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
+                edge = _kclean_final_edge(row, np.nan)
+                if not np.isfinite(edge):
+                    edge = proj - line
+                # The copy slate must follow the final displayed projection, not stale
+                # saved side labels from earlier projection layers.
+                side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
                 if side == "PUSH":
                     if not include_thin:
                         continue
@@ -44593,12 +44629,16 @@ def _kclean_copy_paste_slate(df, include_thin=False):
 
 
 def _kclean_card_decision(row):
-    line = _kclean_num(_kclean_pick(row, ["UD/Line", "Line", "Underdog Line"], ""), np.nan)
-    proj = _kclean_num(_kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "Winning File K Projection"], ""), np.nan)
+    proj, line = _kclean_final_proj_line(row)
     side = _kclean_side_label(row)
-    if side not in {"OVER", "UNDER"} and np.isfinite(proj) and np.isfinite(line):
+    # Player cards are projection-first: if the final displayed K projection is
+    # above the line, show OVER; if it is below, show UNDER. Older side fields
+    # can lag behind late blend/elite-gate changes.
+    if np.isfinite(proj) and np.isfinite(line):
         side = "OVER" if proj > line else "UNDER" if proj < line else "PASS"
-    edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
+        edge = round(float(proj - line), 2)
+    else:
+        edge = _kclean_final_edge(row, np.nan)
     prob = _kclean_num(_kclean_pick(row, ["K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
     if np.isfinite(prob) and prob <= 1:
         prob *= 100.0
@@ -45253,10 +45293,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             d["UD/Line"] = d.get("Line")
         if "_owp_one_final_row_per_pitcher" in globals():
             d = _owp_one_final_row_per_pitcher(d)
-        d["_edge_abs"] = [
-            abs(_kclean_num(_kclean_pick(r.to_dict(), ["Official K Edge", "Edge Gap", "Final K Edge", "Winning File K Edge"], ""), 0.0) or 0.0)
-            for _, r in d.iterrows()
-        ]
+        d["_edge_abs"] = [abs(_kclean_final_edge(r.to_dict(), 0.0) or 0.0) for _, r in d.iterrows()]
         d = d.sort_values("_edge_abs", ascending=False)
         if limit is not None:
             d = d.head(int(limit))
@@ -45279,7 +45316,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
         .kc-section{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.22);border-radius:12px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#f4ecff;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#ffd34e;font-size:11px}
         .kc-lineup,.kc-arsenal{width:100%;border-collapse:collapse;font-size:12px}.kc-lineup th,.kc-arsenal th{color:#a99fb8;text-align:left;font-size:10px;text-transform:uppercase;padding:6px;border-bottom:1px solid #2b233b}.kc-lineup td,.kc-arsenal td{padding:6px;border-bottom:1px solid #1f1a2b;white-space:nowrap}.kc-lineup td:nth-child(2),.kc-arsenal td:first-child{white-space:normal;font-weight:850}.kc-lineup .hi,.kc-arsenal .hi{color:#35f071}.kc-lineup .lo,.kc-arsenal .lo{color:#ffd34e}.kc-empty{color:#b8adc8;font-size:12px;line-height:1.4}
         .kc-arsenal-top{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:9px}.kc-arsenal-box{background:rgba(19,17,30,.88);border:1px solid rgba(255,213,74,.18);border-radius:10px;padding:8px;min-width:0;overflow:hidden}.kc-arsenal-box span{display:block;font-size:9px;color:#a99fb8;text-transform:uppercase;font-weight:900}.kc-arsenal-box b{display:block;font-size:16px;margin-top:3px;color:#f9f5ff;line-height:1.12;overflow-wrap:anywhere}.kc-arsenal-box small{font-size:11px;color:#d9c2ff}.kc-arsenal-box.gold b{color:#ffd34e}.kc-arsenal-box.purp b{color:#d06bff}.kc-bars{height:88px;display:flex;align-items:flex-end;gap:7px;border-bottom:1px solid rgba(255,255,255,.32);padding-top:5px}.kc-barcol{flex:1;min-width:18px;border-radius:7px 7px 2px 2px;display:flex;align-items:flex-start;justify-content:center;color:#fff;font-size:11px;font-weight:950;padding-top:4px}.kc-barcol.hit{background:linear-gradient(180deg,#36f06d,#107d32)}.kc-barcol.miss{background:linear-gradient(180deg,#ff5a75,#8b1d2e)}
-        .kc-note{font-size:12px;color:#cbd3e0;line-height:1.35}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
+        .kc-note,.kc-data-note,.kc-data-gate,.kc-verdict,.kc-card-note,.kcard-note{display:none!important;font-size:12px;color:#cbd3e0;line-height:1.35}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
         @media(max-width:640px){.kcard-stack{grid-template-columns:1fr}.kc-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-arsenal-top{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-proj{font-size:36px}.kc-lineup{font-size:11px}.kc-lineup th:nth-child(7),.kc-lineup td:nth-child(7){display:none}}
         </style>
         """
@@ -45297,8 +45334,9 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             tlogo = _kcard_team_logo(team)
             ologo = _kcard_team_logo(opp)
             logo_html = f"<img class='kc-logo' src='{html.escape(tlogo)}' />" if tlogo else f"<div class='kc-logo'>{html.escape(team[:3] or 'MLB')}</div>"
-            line = _kclean_fmt(_kclean_pick(row, ["UD/Line", "Line", "Underdog Line"], ""), 1)
-            proj = _kclean_fmt(_kclean_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "Winning File K Projection"], ""), 2)
+            proj_raw, line_raw = _kclean_final_proj_line(row)
+            line = _kclean_fmt(line_raw, 1)
+            proj = _kclean_fmt(proj_raw, 2)
             side, edge, prob, tier = _kclean_card_decision(row)
             side_class = "over" if side == "OVER" else "under" if side == "UNDER" else "track"
             side_txt = html.escape(str(side or "TRACK"))
@@ -45385,9 +45423,6 @@ def _kclean_render_player_cards(df, board=None, limit=None):
               <div class="kc-section">
                 <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{html.escape(lineup_status or 'lineup')} · avg {avg_lineup_k} · high-K {high_bats} · low-K {low_bats}</span></div>
                 {lineup_table}
-              </div>
-              <div class="kc-section kc-note">
-                <span class="{note_class}">{html.escape(data_gate or 'DATA GATE')}</span> · {html.escape(win_gate or 'WIN GATE')} · {quality} · {pitch_mix_quality}<br>{html.escape(lineup_src)}<br>{html.escape(note or 'No major data issues flagged')}
               </div>
             </div>
             """)
@@ -45551,6 +45586,12 @@ def _kslip_pick(row, keys, default=""):
 
 
 def _kslip_side(row):
+    try:
+        side = _kclean_side_label(row) if "_kclean_side_label" in globals() else ""
+        if side in {"OVER", "UNDER"}:
+            return side
+    except Exception:
+        pass
     txt = str(_kslip_pick(row, ["Decision", "Final Decision", "Model Lean", "APP97 Final Side"], "")).upper()
     if "OVER" in txt or txt.strip() == "O":
         return "OVER"
@@ -45567,8 +45608,14 @@ def _kslip_pct(row, keys, default=np.nan):
 
 
 def _kslip_profile(row):
-    line = _kslip_num(_kslip_pick(row, ["UD/Line", "Line", "Underdog Line"], np.nan), np.nan)
-    proj = _kslip_num(_kslip_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection"], np.nan), np.nan)
+    try:
+        proj, line = _kclean_final_proj_line(row) if "_kclean_final_proj_line" in globals() else (np.nan, np.nan)
+    except Exception:
+        proj, line = np.nan, np.nan
+    if not np.isfinite(line):
+        line = _kslip_num(_kslip_pick(row, ["UD/Line", "Line", "Underdog Line"], np.nan), np.nan)
+    if not np.isfinite(proj):
+        proj = _kslip_num(_kslip_pick(row, ["K PROJ", "Final K Projection", "Official K PROJ", "APP97 True K Projection"], np.nan), np.nan)
     edge = proj - line if np.isfinite(proj) and np.isfinite(line) else np.nan
     active_side = _kslip_side(row)
     pitcher_k = _kslip_pct(row, ["APP100 Pitcher K%", "APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K%"], np.nan)
@@ -48245,7 +48292,7 @@ def build_kproj_table(board):
 # split, whiff profile, workload, ceiling, and slip brain all agree. It protects
 # normal unders by requiring multiple independent upside signals.
 # =============================================================================
-ELITE_ACE_CLEAR_LINE_VERSION = "ELITE_ACE_CLEAR_LINE_GATE_2026_07_29"
+ELITE_ACE_CLEAR_LINE_VERSION = "ELITE_ACE_CLEAR_LINE_GATE_2026_07_29_CAP38"
 
 
 def _eacl_num(row, keys, default=np.nan):
@@ -48325,7 +48372,6 @@ def _eacl_apply(df):
         ceiling = _eacl_num(row, ["K Ceiling Read", "Lineup Trace Ceiling", "Ceiling", "K Ceiling"])
         app98 = _eacl_num(row, ["APP98 Loss Target Projection"])
         slip_score = _eacl_num(row, ["K Slip Brain Score"])
-        slip_side = _eacl_text(row, ["K Slip Brain Side"]).upper()
         bf_gate = _eacl_text(row, ["APP100 BF Coverage", "BF Gate", "Projection Data Gate"]).upper()
         skill = _eacl_text(row, ["APP100 Recent Skill", "Skill", "Projection Data Cautions"]).upper()
 
@@ -48341,7 +48387,6 @@ def _eacl_apply(df):
             and np.isfinite(bf) and bf >= 22.0
             and np.isfinite(ceiling) and ceiling >= line + 2.25
             and np.isfinite(slip_score) and slip_score >= 92.0
-            and slip_side == "OVER"
             and not role_limited
         )
         if elite_clear:
@@ -48349,7 +48394,7 @@ def _eacl_apply(df):
             # final clear just above the line so this does not become a blind ceiling chase.
             ceiling_bridge = proj + ((ceiling - proj) * 0.38)
             support_bridge = max(app98 if np.isfinite(app98) else proj, ceiling_bridge)
-            clear_target = min(line + 0.25, support_bridge)
+            clear_target = min(line + 0.38, support_bridge)
             if clear_target > proj + 0.10:
                 new_proj = round(clear_target, 2)
                 move = new_proj - proj
@@ -48369,14 +48414,26 @@ def _eacl_apply(df):
                     out.at[idx, col] = new_proj
             if np.isfinite(line):
                 edge = round(new_proj - line, 2)
+                out.at[idx, "Elite Ace Clear-Line Edge"] = edge
                 for col in edge_cols:
                     if col in out.columns:
                         out.at[idx, col] = edge
                 decision = _eacl_decision(new_proj, line)
-                for col in ["Decision", "Main Engine Action", "Line-Aware Smart Decision", "Winning File K Decision"]:
+                side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
+                for col in [
+                    "Decision", "Final Decision", "Model Lean", "Main Engine Action",
+                    "Line-Aware Smart Decision", "Winning File K Decision",
+                    "APP98 Loss Target Decision",
+                ]:
                     if col in out.columns:
                         out.at[idx, col] = decision
-                out.at[idx, "Elite Ace Clear-Line Side"] = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PUSH"
+                for col in [
+                    "Elite Ace Clear-Line Side", "Winning File K Side", "APP97 Final Side",
+                    "APP88 Final Side", "APP98 Loss Target Side", "Slip Side",
+                    "Model Side", "Side", "Pick Side",
+                ]:
+                    if col in out.columns or col == "Elite Ace Clear-Line Side":
+                        out.at[idx, col] = side
                 out.at[idx, "Elite Ace Clear-Line Decision"] = decision
     return out
 
