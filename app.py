@@ -15102,6 +15102,22 @@ def build_kproj_table(board):
             "Opp K%": round((safe_float(p.get("opp_k"),0) or 0)*100,1),
             "Exp BF": p.get("expected_bf"),
             "Putaway/Whiff": p.get("statcast_whiff") or p.get("statcast_csw"),
+            "Statcast Chase%": p.get("statcast_chase"),
+            "Statcast Zone Contact%": p.get("statcast_zone_contact"),
+            "Statcast BB%": None if p.get("savant_bb_pct") is None else round((safe_float(p.get("savant_bb_pct"), 0) or 0) * 100, 1),
+            "Statcast Zone%": None if p.get("zone_pct") is None else round((safe_float(p.get("zone_pct"), 0) or 0) * 100, 1),
+            "Statcast Barrel%": None if p.get("barrel_pct") is None else round((safe_float(p.get("barrel_pct"), 0) or 0) * 100, 1),
+            "Statcast HardHit%": None if p.get("hard_hit_pct") is None else round((safe_float(p.get("hard_hit_pct"), 0) or 0) * 100, 1),
+            "Statcast xwOBA": p.get("xwoba"),
+            "First Strike%": None if p.get("first_strike_pct") is None else round((safe_float(p.get("first_strike_pct"), 0) or 0) * 100, 1),
+            "Pitch-Type Factor": p.get("pitch_type_factor"),
+            "Pitch-Type Matchup Available": p.get("pitch_type_matchup_available"),
+            "Batter Whiff Pressure": p.get("batter_whiff_pressure"),
+            "Run Damage Risk": p.get("run_damage_risk_level"),
+            "Run Damage Score": p.get("run_damage_score"),
+            "Run Damage BF Factor": p.get("run_damage_bf_factor"),
+            "K Context Score": p.get("k_context_score"),
+            "K Context Label": p.get("k_context_label"),
             "Lineup": p.get("lineup_status"),
             "Projection Source": p.get("projection_source"),
             "Lineup Note": p.get("lineup_note"),
@@ -29747,12 +29763,155 @@ def _okr_mi_projection_nudge(row, rec, hand):
 
         raw = float(bf) * ((float(verified_k) - float(current_k)) / 100.0)
 
-        # Balanced K Environment layer:
-        # 30% of raw K-opportunity delta, capped at +/-0.30 Ks.
-        # Current conservative build was 12% / +/-0.20.
-        # OG/Warrior shadow is 35% / +/-0.30.
-        weighted = raw * 0.30
-        capped = max(-0.30, min(0.30, weighted))
+        # Selective K Environment layer:
+        # Base blend is 32.5% of raw K-opportunity delta. Extra room is only
+        # granted when pitcher skill, opponent K environment, and BF support agree.
+        pitcher_k = _okr_num(row.get('Pitcher K%'), None)
+        if pitcher_k is not None and abs(pitcher_k) <= 1:
+            pitcher_k *= 100.0
+        k9 = _okr_num(row.get('K/9'), None)
+        whiff = _okr_num(row.get('Whiff%'), None)
+        if whiff is None:
+            whiff = _okr_num(row.get('WHIFF'), None)
+        if whiff is not None and abs(whiff) <= 1:
+            whiff *= 100.0
+        chase = _okr_num(row.get('Statcast Chase%'), None)
+        if chase is not None and abs(chase) <= 1:
+            chase *= 100.0
+        zone_contact = _okr_num(row.get('Statcast Zone Contact%'), None)
+        if zone_contact is not None and abs(zone_contact) <= 1:
+            zone_contact *= 100.0
+        batter_whiff = _okr_num(row.get('Batter Whiff Pressure'), None)
+        if batter_whiff is not None and abs(batter_whiff) <= 1:
+            batter_whiff *= 100.0
+        pitch_factor = _okr_num(row.get('Pitch-Type Factor'), None)
+        bb_pct = _okr_num(row.get('Statcast BB%'), None)
+        if bb_pct is None:
+            bb_pct = _okr_num(row.get('BB%'), None)
+        if bb_pct is not None and abs(bb_pct) <= 1:
+            bb_pct *= 100.0
+        bb9 = _okr_num(row.get('BB/9'), None)
+        zone_pct = _okr_num(row.get('Statcast Zone%'), None)
+        if zone_pct is None:
+            zone_pct = _okr_num(row.get('Zone%'), None)
+        if zone_pct is not None and abs(zone_pct) <= 1:
+            zone_pct *= 100.0
+        first_strike = _okr_num(row.get('First Strike%'), None)
+        if first_strike is not None and abs(first_strike) <= 1:
+            first_strike *= 100.0
+        barrel_pct = _okr_num(row.get('Statcast Barrel%'), None)
+        if barrel_pct is None:
+            barrel_pct = _okr_num(row.get('Barrel%'), None)
+        if barrel_pct is not None and abs(barrel_pct) <= 1:
+            barrel_pct *= 100.0
+        hard_hit = _okr_num(row.get('Statcast HardHit%'), None)
+        if hard_hit is None:
+            hard_hit = _okr_num(row.get('HardHit%'), None)
+        if hard_hit is not None and abs(hard_hit) <= 1:
+            hard_hit *= 100.0
+        xwoba = _okr_num(row.get('Statcast xwOBA'), None)
+        foul_rate = _okr_num(row.get('Foul%'), None)
+        if foul_rate is None:
+            foul_rate = _okr_num(row.get('Foul Rate%'), None)
+        if foul_rate is None:
+            foul_rate = _okr_num(row.get('Foul Workload%'), None)
+        if foul_rate is not None and abs(foul_rate) <= 1:
+            foul_rate *= 100.0
+        heart_zone = _okr_num(row.get('Heart Zone%'), None)
+        if heart_zone is None:
+            heart_zone = _okr_num(row.get('Heart%'), None)
+        if heart_zone is not None and abs(heart_zone) <= 1:
+            heart_zone *= 100.0
+        putaway = _okr_num(row.get('Putaway%'), None)
+        if putaway is None:
+            putaway = _okr_num(row.get('PutAway%'), None)
+        if putaway is not None and abs(putaway) <= 1:
+            putaway *= 100.0
+        run_damage_text = str(row.get('Run Damage Risk') or row.get('K Damage Risk Label') or '').upper()
+        run_damage_score = _okr_num(row.get('Run Damage Score'), None)
+        run_damage_bf_factor = _okr_num(row.get('Run Damage BF Factor'), None)
+
+        risk_text = ' '.join(str(row.get(c, '')) for c in (
+            'BF Gate', 'Skill', 'Line-Aware Smart Decision', 'Decision',
+            'Matchup Intel Label', 'K Grade', 'Baseball IQ', 'Run Damage Risk'
+        )).upper()
+        high_k_arm = (
+            (pitcher_k is not None and pitcher_k >= 24.5) or
+            (k9 is not None and k9 >= 8.8) or
+            (whiff is not None and whiff >= 24.5)
+        )
+        low_k_arm = (
+            (pitcher_k is not None and pitcher_k <= 20.5) or
+            (k9 is not None and k9 <= 7.2) or
+            (whiff is not None and whiff <= 20.5)
+        )
+        k_env_support = float(verified_k) >= 22.5 or float(current_k) >= 22.5
+        workload_support = float(bf) >= 21.0
+        caution = any(x in risk_text for x in ('LOW_BF', 'ROLE_LIMIT', 'PITCH_LIMIT', 'RECENT_SKILL_CAUTION'))
+        walk_risk = (
+            (chase is not None and chase <= 27.0 and (bb_pct is not None and bb_pct >= 9.5)) or
+            (zone_pct is not None and zone_pct <= 41.0 and (bb_pct is not None and bb_pct >= 8.5)) or
+            (bb9 is not None and bb9 >= 3.8)
+        )
+        foul_workload_risk = (
+            foul_rate is not None and foul_rate >= 29.0 and not (workload_support and first_strike is not None and first_strike >= 62.0)
+        )
+        damage_risk = (
+            any(x in run_damage_text for x in ('HIGH', 'EXTREME')) or
+            (run_damage_score is not None and run_damage_score >= 7.0) or
+            (run_damage_bf_factor is not None and run_damage_bf_factor <= 0.94) or
+            (xwoba is not None and xwoba >= 0.345) or
+            (barrel_pct is not None and barrel_pct >= 9.5) or
+            (hard_hit is not None and hard_hit >= 43.0) or
+            (heart_zone is not None and heart_zone >= 31.0)
+        )
+        putaway_support = putaway is not None and putaway >= 22.0
+        called_strike_support = (
+            (first_strike is not None and first_strike >= 63.0) or
+            (zone_pct is not None and zone_pct >= 48.0)
+        )
+        location_support = (
+            (heart_zone is not None and heart_zone <= 25.0 and whiff is not None and whiff >= 24.0) or
+            (zone_pct is not None and 43.0 <= zone_pct <= 51.0 and chase is not None and chase >= 30.0)
+        )
+        finish_problem = putaway is not None and putaway <= 17.0 and (whiff is None or whiff < 24.0)
+        conversion_plus = (
+            (chase is not None and chase >= 31.0) or
+            (batter_whiff is not None and batter_whiff >= 26.0) or
+            (pitch_factor is not None and pitch_factor >= 1.025) or
+            (whiff is not None and whiff >= 25.0) or
+            putaway_support or
+            called_strike_support or
+            location_support
+        )
+        contact_first = (
+            (zone_contact is not None and zone_contact >= 84.0) or
+            (batter_whiff is not None and batter_whiff <= 22.0) or
+            (pitch_factor is not None and pitch_factor <= 0.980) or
+            walk_risk or
+            foul_workload_risk or
+            damage_risk or
+            finish_problem
+        )
+
+        weighted = raw * 0.325
+        up_cap = 0.35
+        down_cap = 0.35
+        cap_note = 'base_cap'
+        if raw > 0 and (contact_first or caution):
+            up_cap = 0.20
+            cap_note = 'conversion_workload_over_guard'
+        elif raw > 0 and high_k_arm and k_env_support and workload_support and conversion_plus and not caution:
+            up_cap = 0.40
+            cap_note = 'selective_k_conversion_upside_cap'
+        elif raw < 0 and high_k_arm and conversion_plus and not low_k_arm:
+            down_cap = 0.20
+            cap_note = 'protected_high_k_conversion_under_tax'
+        elif raw < 0 and low_k_arm:
+            down_cap = 0.35
+            cap_note = 'weak_k_under_support'
+
+        capped = max(-down_cap, min(up_cap, weighted))
 
         if capped >= 0.18:
             label = 'MI_K_ENV_PLUS'
@@ -29768,7 +29927,14 @@ def _okr_mi_projection_nudge(row, rec, hand):
         reason = (
             f'official MLB team K blend {verified_k:.2f}% ({blend_note}) '
             f'vs {current_note} {current_k:.2f}%; {bf_note} {bf:.1f}; '
-            f'raw {raw:+.2f}K * 0.30 capped +/-0.30 = {capped:+.2f}K'
+            f'raw {raw:+.2f}K * 0.325 capped -{down_cap:.2f}/+{up_cap:.2f} '
+            f'({cap_note}; pitcherK {pitcher_k if pitcher_k is not None else "—"}; '
+            f'K9 {k9 if k9 is not None else "—"}; whiff {whiff if whiff is not None else "—"}; '
+            f'chase {chase if chase is not None else "—"}; zoneContact {zone_contact if zone_contact is not None else "—"}; '
+            f'batterWhiff {batter_whiff if batter_whiff is not None else "—"}; pitchFactor {pitch_factor if pitch_factor is not None else "—"}; '
+            f'bb% {bb_pct if bb_pct is not None else "—"}; foul {foul_rate if foul_rate is not None else "—"}; '
+            f'putaway {putaway if putaway is not None else "—"}; heart {heart_zone if heart_zone is not None else "—"}; '
+            f'damage {run_damage_text or "—"}; flags walk={walk_risk} foul={foul_workload_risk} damage={damage_risk} finish={finish_problem}) = {capped:+.2f}K'
         )
         return round(float(capped), 2), label, reason, verified_k
     except Exception as e:
@@ -30022,7 +30188,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Team K Read"] = ""
 
     # Matchup Intelligence Projection Nudge — original-anchor light weight only.
-    # Uses PA-shrunk L3/L5/L10/L15/L30 vs-hand K% plus season anchor; caps at +/-0.20 K.
+    # Uses PA-shrunk L3/L5/L10/L15/L30 vs-hand K% plus season anchor; selective cap protects unders.
     try:
         mi_pre, mi_adj, mi_final, mi_label, mi_reason, mi_verified, mi_blend_detail = [], [], [], [], [], [], []
         og_mi_adj, og_mi_final, og_mi_edge, og_mi_decision, og_mi_label, og_mi_reason = [], [], [], [], [], []
@@ -30057,7 +30223,7 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
         d["Recency Team K Blend Detail"] = mi_blend_detail
         d["Recency Team K Blend Method"] = "PA-shrunk L3/L5/L10/L15/L30/season vs hand; short windows are low weight and unsupported recent weight shrinks to season"
         d["Matchup Intelligence Final K Projection"] = mi_final
-        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_BALANCED_RECENCY_BLEND_WEIGHT_0_30_CAP_0_30_2026_07_27"
+        d["Matchup Intelligence Version"] = "MATCHUP_INTEL_K_CONVERSION_FOUL_WALK_DAMAGE_LOCATION_2026_07_28"
         d["OG Matchup Intel Shadow K Projection"] = og_mi_final
         d["OG Matchup Intel Shadow Nudge"] = og_mi_adj
         d["OG Matchup Intel Shadow Edge"] = og_mi_edge
@@ -39231,7 +39397,7 @@ def render_moneyline_edge_tab(board, dates=None):
 # 1ST INNING PITCH COUNT — ISOLATED MODEL + UNDERDOG TAB
 # Added 2026-07-23. Does not change K or Pitching Outs projection math.
 # ============================================================
-FIRST_INNING_PC_VERSION = "FI_PITCH_COUNT_V2_2026_07_23"
+FIRST_INNING_PC_VERSION = "FI_PITCH_COUNT_V2_FI_HISTORY_DIAGNOSTIC_2026_07_28"
 FI_SIMULATIONS = 10000
 
 
@@ -39261,12 +39427,91 @@ def _fi_pct(v, default):
     return x / 100.0 if x > 1 else x
 
 
+def _fi_norm_name(v):
+    try:
+        if "_tpl_norm_name" in globals():
+            return _tpl_norm_name(v)
+    except Exception:
+        pass
+    try:
+        return re.sub(r"[^a-z0-9]+", "", str(v or "").lower())
+    except Exception:
+        return str(v or "").strip().lower()
+
+
+def _fi_learning_csv_paths():
+    paths = []
+    try:
+        bases = [Path.cwd(), Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent]
+        for base in bases:
+            for rel in [
+                "learning_data/first_inning_pitch_count.csv",
+                "learning_data/first_inning_pitch_counts.csv",
+                "learning_data/fi_pitch_count.csv",
+                "learning_data/Pitch.csv",
+            ]:
+                p = base / rel
+                if p.exists() and str(p) not in [str(x) for x in paths]:
+                    paths.append(p)
+    except Exception:
+        pass
+    return paths
+
+
+def _fi_history_from_csv(pitcher_id=None, pitcher_name=None):
+    """Read true first-inning pitch-count actuals when a daily/history CSV provides them.
+
+    Full-game Pitch Count is intentionally not treated as first-inning history.
+    """
+    pid_s = str(pitcher_id) if pitcher_id is not None else ""
+    name_n = _fi_norm_name(pitcher_name)
+    value_cols = [
+        "first_inning_pitches_actual", "First Inning Pitches", "First Inning Pitch Count",
+        "1st Inning Pitch Count", "1st Inn Pitch Count", "1st Inning Pitches",
+        "FI Pitch Count", "FI Pitches", "FI_PC", "first_inning_pitch_count",
+    ]
+    pitcher_cols = ["pitcher", "Pitcher", "Player", "Name", "player_name"]
+    id_cols = ["pitcher_id", "Pitcher ID", "MLBAM ID", "player_id", "mlbam_id"]
+    date_cols = ["date", "Date", "game_date", "Game Date", "graded_at"]
+    vals = []
+    sources = set()
+    for path in _fi_learning_csv_paths():
+        try:
+            df = pd.read_csv(path)
+            if df is None or df.empty:
+                continue
+            val_col = next((c for c in value_cols if c in df.columns), None)
+            if not val_col:
+                continue
+            pcol = next((c for c in pitcher_cols if c in df.columns), None)
+            icol = next((c for c in id_cols if c in df.columns), None)
+            dcol = next((c for c in date_cols if c in df.columns), None)
+            work = df
+            if pid_s and icol:
+                work = work[work[icol].astype(str) == pid_s]
+            elif name_n and pcol:
+                work = work[work[pcol].map(_fi_norm_name) == name_n]
+            elif name_n:
+                continue
+            for _, rr in work.iterrows():
+                fp = _fi_num(rr.get(val_col), None)
+                if fp is None:
+                    continue
+                dt = str(rr.get(dcol) if dcol else "")
+                vals.append((dt, float(fp)))
+                sources.add(path.name)
+        except Exception:
+            continue
+    return vals, "+".join(sorted(sources)) if sources else ""
+
+
 def _fi_history_detail(pitcher_id=None, pitcher_name=None, line=None, results=None):
     """Recent/season first-inning pitch-count distribution from our graded result log."""
     results = load_json(RESULT_LOG, []) if results is None else (results or [])
     pid_s = str(pitcher_id) if pitcher_id is not None else ""
     name_s = str(pitcher_name or "").strip().lower()
     vals = []
+    sources = set()
     for r in results:
         try:
             rid = str(r.get("pitcher_id") or r.get("Pitcher ID") or "")
@@ -39281,8 +39526,13 @@ def _fi_history_detail(pitcher_id=None, pitcher_name=None, line=None, results=No
                 continue
             dt = str(r.get("date") or r.get("game_date") or r.get("graded_at") or "")
             vals.append((dt, float(fp)))
+            sources.add("RESULT_LOG")
         except Exception:
             continue
+    csv_vals, csv_source = _fi_history_from_csv(pitcher_id, pitcher_name)
+    if csv_vals:
+        vals.extend(csv_vals)
+        sources.add(csv_source or "CSV_FI_HISTORY")
     # Dates are ISO-like throughout this app; descending lexical sort is adequate here.
     vals = sorted(vals, key=lambda x: x[0], reverse=True)
     pitches = [x[1] for x in vals]
@@ -39299,6 +39549,8 @@ def _fi_history_detail(pitcher_id=None, pitcher_name=None, line=None, results=No
         "median": med(pitches),
         "sd": None if len(pitches) < 2 else round(float(np.std(pitches, ddof=1)), 2),
         "under_line_pct": exact_u, "over_line_pct": exact_o,
+        "source": "+".join(sorted([s for s in sources if s])) if sources else "SIM_ONLY_NO_FI_HISTORY",
+        "missing_reason": "" if pitches else "No true first-inning pitch-count actuals found. Full-game Pitch Count is support only, not FI history.",
     }
 
 
@@ -39428,6 +39680,8 @@ def _fi_simulate(p, line=None, n=FI_SIMULATIONS):
         "FI Samples": hs, "FI L5 Avg": hist.get("l5_avg"), "FI L10 Avg": hist.get("l10_avg"),
         "FI Season Avg": hist.get("season_avg"), "FI Median": hist.get("median"), "FI Hist SD": hist.get("sd"),
         "FI Under Line %": hist.get("under_line_pct"), "FI Over Line %": hist.get("over_line_pct"),
+        "FI History Source": hist.get("source"),
+        "FI Missing Reason": hist.get("missing_reason"),
         "History Weight": round(hist_w, 2),
     }
 
@@ -39488,6 +39742,12 @@ def build_first_inning_pitch_count_board(board):
                 decision = f"⚠️ {side}"
             else:
                 decision = f"PASS {side}" if side in ["OVER", "UNDER"] else "PASS"
+            fi_samples = int(prof.get("FI Samples") or 0)
+            if line is not None and fi_samples == 0 and side in ["OVER", "UNDER"]:
+                if decision.startswith("🔥"):
+                    decision = f"⚠️ {side} — SIM ONLY"
+                elif decision.startswith("⚠️") and abs_edge < 1.50:
+                    decision = f"PASS {side} — NO FI HISTORY"
             rows.append({
                 "Pitcher": name,
                 "Matchup": _fi_first(p, ["matchup", "Matchup"], ""),
@@ -39509,6 +39769,8 @@ def build_first_inning_pitch_count_board(board):
                 "FI Exact-Line O%": prof.get("FI Over Line %") if prof.get("FI Over Line %") is not None else "—",
                 "FI Exact-Line U%": prof.get("FI Under Line %") if prof.get("FI Under Line %") is not None else "—",
                 "FI Samples": prof.get("FI Samples"),
+                "FI History Source": prof.get("FI History Source"),
+                "FI Missing Reason": prof.get("FI Missing Reason"),
                 "Top4 K%": prof.get("Top4 K%"),
                 "Top4 Count": prof.get("Top4 Count"),
                 "Lineup Status": prof.get("Lineup Status"),
