@@ -45470,7 +45470,8 @@ def render_kproj_tab(board):
 
     st.subheader("K Player Cards")
     _kclean_render_player_cards(df, board=board, limit=None)
-    _kclean_render_app88_audit_helpers(df, board)
+    with st.expander("Projection Audits / Helpers", expanded=False):
+        _kclean_render_app88_audit_helpers(df, board)
 
     try:
         total = len(main)
@@ -45983,20 +45984,20 @@ def render_kproj_tab(board):
     try:
         df = build_kproj_table(board)
         if isinstance(df, pd.DataFrame) and not df.empty:
-            st.markdown('<div class="section-title-pro">K Slip Brain - OG Win Recovery Flags</div>', unsafe_allow_html=True)
-            st.caption("Decision support only. Does not change K projection, copy/paste slate, or official decision. Built to catch OG-style wins like Freeland U, Rasmussen O, and Reynaldo O.")
-            cols = [c for c in [
-                "Pitcher", "Matchup", "UD/Line", "K PROJ", "Decision",
-                "K Slip Brain Flag", "K Slip Brain Side", "K Slip Brain Score",
-                "K Slip Over Support", "K Slip Under Support", "K Slip Brain Reason",
-                "K Arsenal Signal", "K Match K/Hand Read", "K Opp Whiff Read",
-                "K Mix K/Dmg Grade", "K Top Pitch Read", "K Ceiling Read",
-                "K L3/L10 Form Read", "K Location/Foul Coverage",
-                "K Stuff+/Depth Read", "K FI/Ensemble Read",
-                "Pitcher K%", "Opponent K% vs Pitcher Hand", "APP100 Whiff%",
-                "APP100 Projected BF", "K Sim Current Side Prob %", "K Slip Brain Version"
-            ] if c in df.columns]
-            st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+            with st.expander("K Slip Brain / OG Win Recovery Flags", expanded=False):
+                st.caption("Decision support only. Does not change K projection, copy/paste slate, or official decision. Built to catch OG-style wins like Freeland U, Rasmussen O, and Reynaldo O.")
+                cols = [c for c in [
+                    "Pitcher", "Matchup", "UD/Line", "K PROJ", "Decision",
+                    "K Slip Brain Flag", "K Slip Brain Side", "K Slip Brain Score",
+                    "K Slip Over Support", "K Slip Under Support", "K Slip Brain Reason",
+                    "K Arsenal Signal", "K Match K/Hand Read", "K Opp Whiff Read",
+                    "K Mix K/Dmg Grade", "K Top Pitch Read", "K Ceiling Read",
+                    "K L3/L10 Form Read", "K Location/Foul Coverage",
+                    "K Stuff+/Depth Read", "K FI/Ensemble Read",
+                    "Pitcher K%", "Opponent K% vs Pitcher Hand", "APP100 Whiff%",
+                    "APP100 Projected BF", "K Sim Current Side Prob %", "K Slip Brain Version"
+                ] if c in df.columns]
+                st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
     except Exception as e:
         st.info(f"K Slip Brain unavailable: {e}")
 
