@@ -45316,7 +45316,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
         .kc-section{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.22);border-radius:12px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#f4ecff;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#ffd34e;font-size:11px}
         .kc-lineup,.kc-arsenal{width:100%;border-collapse:collapse;font-size:12px}.kc-lineup th,.kc-arsenal th{color:#a99fb8;text-align:left;font-size:10px;text-transform:uppercase;padding:6px;border-bottom:1px solid #2b233b}.kc-lineup td,.kc-arsenal td{padding:6px;border-bottom:1px solid #1f1a2b;white-space:nowrap}.kc-lineup td:nth-child(2),.kc-arsenal td:first-child{white-space:normal;font-weight:850}.kc-lineup .hi,.kc-arsenal .hi{color:#35f071}.kc-lineup .lo,.kc-arsenal .lo{color:#ffd34e}.kc-empty{color:#b8adc8;font-size:12px;line-height:1.4}
         .kc-arsenal-top{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:9px}.kc-arsenal-box{background:rgba(19,17,30,.88);border:1px solid rgba(255,213,74,.18);border-radius:10px;padding:8px;min-width:0;overflow:hidden}.kc-arsenal-box span{display:block;font-size:9px;color:#a99fb8;text-transform:uppercase;font-weight:900}.kc-arsenal-box b{display:block;font-size:16px;margin-top:3px;color:#f9f5ff;line-height:1.12;overflow-wrap:anywhere}.kc-arsenal-box small{font-size:11px;color:#d9c2ff}.kc-arsenal-box.gold b{color:#ffd34e}.kc-arsenal-box.purp b{color:#d06bff}.kc-bars{height:88px;display:flex;align-items:flex-end;gap:7px;border-bottom:1px solid rgba(255,255,255,.32);padding-top:5px}.kc-barcol{flex:1;min-width:18px;border-radius:7px 7px 2px 2px;display:flex;align-items:flex-start;justify-content:center;color:#fff;font-size:11px;font-weight:950;padding-top:4px}.kc-barcol.hit{background:linear-gradient(180deg,#36f06d,#107d32)}.kc-barcol.miss{background:linear-gradient(180deg,#ff5a75,#8b1d2e)}
-        .kc-note,.kc-data-note,.kc-data-gate,.kc-verdict,.kc-card-note,.kcard-note{display:none!important;font-size:12px;color:#cbd3e0;line-height:1.35}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
+        .kc-note,.kc-data-note,.kc-data-gate,.kc-verdict,.kc-card-note,.kcard-note{display:none!important;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;font-size:0!important;line-height:0!important}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
         @media(max-width:640px){.kcard-stack{grid-template-columns:1fr}.kc-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-arsenal-top{grid-template-columns:repeat(2,minmax(0,1fr))}.kc-proj{font-size:36px}.kc-lineup{font-size:11px}.kc-lineup th:nth-child(7),.kc-lineup td:nth-child(7){display:none}}
         </style>
         """
@@ -48445,6 +48445,283 @@ _EACL_PREV_BUILD_KPROJ_TABLE = build_kproj_table if "build_kproj_table" in globa
 def build_kproj_table(board):
     base = _EACL_PREV_BUILD_KPROJ_TABLE(board) if _EACL_PREV_BUILD_KPROJ_TABLE is not None else pd.DataFrame()
     return _eacl_apply(base)
+
+
+# ============================================================
+# MATCHUP INTELLIGENCE FINAL SYNC 38
+# Late projection/side sync. Older helper layers can still build
+# support columns, but this owns the final displayed K side.
+# ============================================================
+def _mifs_num(v, default=np.nan):
+    try:
+        if v is None:
+            return default
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            val = float(v)
+            return val if np.isfinite(val) else default
+        s = str(v).strip().replace("−", "-").replace("–", "-").replace("—", "-")
+        s = s.replace("%", "").replace("K", "").replace("k", "").replace(",", "")
+        if s in ("", "-", "None", "nan", "NaN"):
+            return default
+        try:
+            val = float(s)
+            return val if np.isfinite(val) else default
+        except Exception:
+            import re as _mifs_re
+            m = _mifs_re.search(r"-?\d+(?:\.\d+)?", s)
+            if m:
+                val = float(m.group(0))
+                return val if np.isfinite(val) else default
+    except Exception:
+        pass
+    return default
+
+
+def _mifs_pick(row, keys, default=np.nan):
+    try:
+        if row is None:
+            return default
+        if hasattr(row, "index"):
+            cmap = {str(c).strip().lower(): c for c in row.index}
+            for key in keys:
+                col = cmap.get(str(key).strip().lower())
+                if col is not None:
+                    val = row.get(col, default)
+                    if val is not None and str(val).strip() not in ("", "-", "—", "nan", "None"):
+                        return val
+        elif isinstance(row, dict):
+            cmap = {str(c).strip().lower(): c for c in row.keys()}
+            for key in keys:
+                col = cmap.get(str(key).strip().lower())
+                if col is not None:
+                    val = row.get(col, default)
+                    if val is not None and str(val).strip() not in ("", "-", "—", "nan", "None"):
+                        return val
+    except Exception:
+        pass
+    return default
+
+
+def _mifs_cols(df, candidates):
+    lower = {str(c).strip().lower(): c for c in getattr(df, "columns", [])}
+    out = []
+    for key in candidates:
+        col = lower.get(str(key).strip().lower())
+        if col is not None and col not in out:
+            out.append(col)
+    return out
+
+
+def _mifs_first_num(row, keys, default=np.nan):
+    for key in keys:
+        val = _mifs_num(_mifs_pick(row, [key], np.nan), np.nan)
+        if np.isfinite(val):
+            return val
+    return default
+
+
+def _mifs_text(row, keys, default=""):
+    val = _mifs_pick(row, keys, default)
+    if val is None:
+        return default
+    return str(val)
+
+
+def _mifs_apply(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        out = df.copy()
+        proj_keys = [
+            "K PROJ", "Final K", "Final K Projection", "PROJ K", "Projected K",
+            "Projection", "Matchup Intelligence Final K Projection",
+            "Line-Aware Smart Final K Projection", "APP97 Current K",
+            "APP100 Projected Strikeouts", "APP88 Final K",
+            "APP98 Loss Target Projection", "Official K PROJ",
+            "Official Projection", "Official K Projection", "Current Projection",
+            "Winning File K Projection", "Legacy Projection",
+        ]
+        proj_write_keys = [
+            "K PROJ", "Final K", "Final K Projection", "PROJ K", "Projected K",
+            "Projection", "Matchup Intelligence Final K Projection",
+            "Line-Aware Smart Final K Projection", "APP97 Current K",
+            "APP100 Projected Strikeouts", "APP88 Final K",
+            "Official K PROJ", "Official Projection", "Official K Projection",
+            "Current Projection",
+        ]
+        line_keys = ["Line", "UD/Line", "K Line", "Strikeout Line", "Line K", "Prop Line", "Book Line"]
+        side_keys = [
+            "Side", "Projection Side", "Model Side", "Pick Side", "Slip Side",
+            "APP97 Final Side", "APP88 Final Side", "APP98 Loss Target Side",
+            "Elite Ace Clear-Line Side", "K Side", "K Pick Side", "Final K Side",
+            "Official Side", "Official K Side", "Line-Aware Smart Side",
+            "Matchup Intelligence Side", "K Model Side", "Model K Side",
+            "Projected Side",
+        ]
+        decision_keys = [
+            "Decision", "Final Decision", "Model Lean", "Main Engine Action",
+            "Line-Aware Smart Decision", "APP98 Loss Target Decision",
+            "K Decision", "Official Decision", "Model Pick", "Pick",
+            "Elite Ace Clear-Line Decision", "K Pick", "K Model Pick",
+            "Selector", "Official Selector", "Final Pick", "Final K Pick",
+            "Slate Pick", "Play", "Action", "Projection Decision",
+            "Model Decision",
+        ]
+        edge_keys = ["Edge", "K Edge", "Model Edge", "Projection Edge", "Final Edge", "Matchup Intelligence Edge"]
+
+        if "K PROJ" not in out.columns:
+            out["K PROJ"] = np.nan
+        if "Side" not in out.columns:
+            out["Side"] = ""
+        if "Decision" not in out.columns:
+            out["Decision"] = ""
+        if "Edge" not in out.columns:
+            out["Edge"] = np.nan
+
+        proj_write_cols = _mifs_cols(out, proj_write_keys) or ["K PROJ"]
+        side_cols = _mifs_cols(out, side_keys) or ["Side"]
+        decision_cols = _mifs_cols(out, decision_keys) or ["Decision"]
+        edge_cols = _mifs_cols(out, edge_keys) or ["Edge"]
+
+        for idx, row in out.iterrows():
+            line = _mifs_first_num(row, line_keys)
+            proj = _mifs_first_num(row, proj_keys)
+            if not np.isfinite(line) or not np.isfinite(proj):
+                continue
+
+            pitch_k = _mifs_first_num(row, ["Pitcher K%", "Pitch K%", "APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Savant Custom K%", "Pitcher K% Used", "Official Savant K%", "K%"])
+            opp_k = _mifs_first_num(row, ["OPP K%", "Opp K%", "Opponent K% vs Pitcher Hand", "APP97 Opponent K Environment", "APP88 Batter Lineup K%", "Lineup K%"])
+            whiff = _mifs_first_num(row, ["Whiff%", "WHIFF", "Savant Custom Whiff%", "Official Savant Whiff%", "Pitcher Whiff%", "APP100 Whiff%"])
+            match_k = _mifs_first_num(row, ["Match K%", "Arsenal Match K%", "Pitch Mix Match K%", "APP100 Match K%", "Pitch Arsenal Match K%"])
+            opp_whiff = _mifs_first_num(row, ["Opp Whiff%", "Opponent Whiff%", "APP100 Opp Whiff%", "Arsenal Opp Whiff%"])
+            put = _mifs_first_num(row, ["PutAway%", "Putaway%", "Putaway Rate", "APP85 PutAway Rate", "PUT"])
+            bf = _mifs_first_num(row, ["BF", "Exp BF", "Projected BF", "APP97 Reconciled Expected BF"])
+            ip = _mifs_first_num(row, ["IP", "IP PROJ", "Projected IP", "IP Projection"])
+            ceiling = _mifs_first_num(row, ["Ceiling", "Ceiling K", "K Ceiling", "APP100 Ceiling", "K Ceiling Projection"])
+            quality = _mifs_first_num(row, ["APP100 Projection Quality Score", "Quality", "APP100 Projection Quality"])
+            bf_gate = _mifs_text(row, ["APP100 BF Coverage", "BF Gate", "BF GATE"], "").upper()
+            skill = _mifs_text(row, ["APP100 Recent Skill", "Skill", "Recent Skill"], "").upper()
+            gate = _mifs_text(row, ["Projection Data Gate", "Data Gate", "APP99 Right Wins Gate"], "").upper()
+            role = _mifs_text(row, ["Role", "Starter Role", "Pitcher Role", "APP100 Role"], "").upper()
+
+            support = 0
+            risk = 0
+            if np.isfinite(pitch_k):
+                if pitch_k >= 28:
+                    support += 2
+                elif pitch_k >= 25:
+                    support += 1
+                elif pitch_k < 18:
+                    risk += 2
+            if np.isfinite(opp_k):
+                if opp_k >= 24.5:
+                    support += 2
+                elif opp_k >= 22.5:
+                    support += 1
+                elif opp_k < 20:
+                    risk += 1
+            if np.isfinite(match_k):
+                if match_k >= 27:
+                    support += 2
+                elif match_k >= 23:
+                    support += 1
+            if np.isfinite(whiff):
+                if whiff >= 30:
+                    support += 1
+                elif whiff < 18:
+                    risk += 1
+            if np.isfinite(opp_whiff) and opp_whiff >= 28:
+                support += 1
+            if np.isfinite(put) and put >= 27:
+                support += 1
+            if np.isfinite(ceiling) and ceiling - line >= 2:
+                support += 1
+            if np.isfinite(quality) and quality >= 80:
+                support += 1
+            if "RECENT_SKILL_SUPPORT" in skill:
+                support += 1
+            if any(token in gate for token in ("SUCCESS", "GREEN", "PLAYABLE")):
+                support += 1
+
+            if (np.isfinite(bf) and bf < 18) or (np.isfinite(ip) and ip < 3.5):
+                risk += 4
+            elif (np.isfinite(bf) and bf < 21) or (np.isfinite(ip) and ip < 4.5):
+                risk += 2
+            if any(token in bf_gate for token in ("LOW_BF", "THIN_BF", "SHORT", "OPEN", "BULK")):
+                risk += 3
+            if any(token in role for token in ("OPEN", "BULK", "RELIEF", "TANDEM")):
+                risk += 3
+            if "RECENT_SKILL_CAUTION" in skill:
+                risk += 1
+            if "RED" in gate:
+                risk += 3
+
+            final = float(proj)
+            cap = 0.38
+            edge = final - float(line)
+            workload_ok = (not np.isfinite(bf) or bf >= 21) and (not np.isfinite(ip) or ip >= 4.5)
+            full_workload_ok = (not np.isfinite(bf) or bf >= 22) and (not np.isfinite(ip) or ip >= 4.8)
+
+            if risk < 5 and support >= 8 and edge < 0 and workload_ok:
+                target = float(line) + (0.12 if support >= 10 and full_workload_ok else 0.03)
+                final += min(cap, max(0.0, target - final))
+            elif risk <= 3 and support >= 6 and -0.70 <= edge < 0 and workload_ok:
+                target = float(line) + 0.01
+                final += min(0.30, max(0.0, target - final))
+            elif risk <= 2 and support >= 9 and edge >= 0 and full_workload_ok:
+                final += min(0.18, cap / 2.0)
+
+            edge = final - float(line)
+            if 0 < edge <= 0.10 and risk >= 3:
+                final = float(line) - 0.02
+            elif 0 < edge <= 0.25 and risk >= 5:
+                final = float(line) - 0.05
+
+            final = round(float(final), 2)
+            edge = round(final - float(line), 2)
+            side = "OVER" if edge > 0 else "UNDER" if edge < 0 else "PASS"
+            abs_edge = abs(edge)
+            if side == "PASS":
+                decision = "PASS"
+            elif abs_edge >= 0.75 and support >= 6 and risk <= 3:
+                decision = f"🔥 {side}"
+            elif abs_edge >= 0.30 and risk <= 4:
+                decision = side
+            else:
+                decision = f"⚠️ {side}"
+
+            for col in proj_write_cols:
+                if col in out.columns:
+                    out.at[idx, col] = final
+            for col in edge_cols:
+                if col in out.columns:
+                    out.at[idx, col] = edge
+            for col in side_cols:
+                if col in out.columns:
+                    out.at[idx, col] = side
+            for col in decision_cols:
+                if col in out.columns:
+                    out.at[idx, col] = decision
+
+            out.at[idx, "Matchup Intelligence Base K"] = round(float(proj), 2)
+            out.at[idx, "Matchup Intelligence Final K Projection"] = final
+            out.at[idx, "Matchup Intelligence Edge"] = edge
+            out.at[idx, "Matchup Intelligence Side"] = side
+            out.at[idx, "Matchup Intelligence Decision"] = decision
+            out.at[idx, "Matchup Intelligence Support Score"] = support
+            out.at[idx, "Matchup Intelligence Risk Score"] = risk
+            out.at[idx, "Matchup Intelligence Cap"] = cap
+        return out
+    except Exception:
+        return df
+
+
+_MIFS_PREV_BUILD_KPROJ_TABLE = build_kproj_table if "build_kproj_table" in globals() else None
+
+
+def build_kproj_table(board):
+    base = _MIFS_PREV_BUILD_KPROJ_TABLE(board) if _MIFS_PREV_BUILD_KPROJ_TABLE is not None else pd.DataFrame()
+    return _mifs_apply(base)
 
 
 def _lta_snapshot_rows(board=None):
