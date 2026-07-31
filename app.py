@@ -25,7 +25,7 @@ from math import exp, factorial
 from datetime import datetime, timedelta
 from pathlib import Path
 
-APP_VERSION = "ONE WAY PICKZ v12.1 + MASTER PO VALIDATED HYBRID V1 2026-07-30"
+APP_VERSION = "ONE WAY PICKZ MASTER PO + NATIVE PO PLAYER CARDS + IP NEEDED 2026-07-31"
 FULL_APP_UPDATE_MARKER = "FULL_APP_CANONICAL_K_PIPELINE_2026_07_30"
 # =========================
 # STABLE PROJECTION SEEDING
@@ -47604,168 +47604,413 @@ def _po_card_chip(label, value, tone=""):
     return f"<div class='poc-chip {tone}'><span>{html.escape(str(label))}</span><b>{_po_card_safe(value)}</b></div>"
 
 
-def _po_render_player_cards(df, board=None, limit=None):
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return
+
+def _po_outs_to_baseball_ip(outs):
+    """Convert an integer number of recorded outs to baseball IP notation.
+
+    Examples:
+      15 outs -> 5.0
+      16 outs -> 5.1
+      17 outs -> 5.2
+      18 outs -> 6.0
+    """
     try:
-        import streamlit.components.v1 as components
-        show = df.copy()
-        if limit:
-            show = show.head(int(limit))
-        cards = []
-        for _, rr in show.iterrows():
+        n = int(round(float(outs)))
+        n = max(0, n)
+        return f"{n // 3}.{n % 3}"
+    except Exception:
+        return "—"
+
+
+def _po_line_win_requirements(line):
+    """Return exact OVER/UNDER win thresholds for a pitching-outs prop line.
+
+    Handles standard half-out lines and also whole-number lines where landing
+    exactly on the line is a push.
+    """
+    try:
+        x = float(line)
+        if not math.isfinite(x):
+            raise ValueError("non-finite line")
+
+        is_whole = abs(x - round(x)) < 1e-9
+
+        if is_whole:
+            push_outs = int(round(x))
+            over_outs = push_outs + 1
+            under_outs = max(0, push_outs - 1)
+            push_text = f"{push_outs} outs = {_po_outs_to_baseball_ip(push_outs)} IP is a push"
+        else:
+            over_outs = int(math.floor(x)) + 1
+            under_outs = int(math.floor(x))
+            push_text = ""
+
+        return {
+            "line": x,
+            "over_outs": over_outs,
+            "under_outs": under_outs,
+            "over_ip": _po_outs_to_baseball_ip(over_outs),
+            "under_ip": _po_outs_to_baseball_ip(under_outs),
+            "over_text": f"OVER needs {over_outs} outs = {_po_outs_to_baseball_ip(over_outs)} IP or more",
+            "under_text": f"UNDER wins at {under_outs} outs = {_po_outs_to_baseball_ip(under_outs)} IP or less",
+            "push_text": push_text,
+        }
+    except Exception:
+        return {
+            "line": None,
+            "over_outs": None,
+            "under_outs": None,
+            "over_ip": "—",
+            "under_ip": "—",
+            "over_text": "OVER threshold unavailable",
+            "under_text": "UNDER threshold unavailable",
+            "push_text": "",
+        }
+
+
+def _po_render_player_cards(df, board=None, limit=None):
+    """Render Pitching Outs player cards directly in Streamlit HTML.
+
+    UI-only renderer. It does not modify projections, lines, workload math,
+    calibration, selector logic, grading, learning, or K projections.
+
+    Native st.markdown is intentionally used instead of a components iframe so
+    the cards reliably appear inside the Alt/Beta Pitching Outs tab on desktop
+    and mobile.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return 0
+
+    show = df.copy()
+    if limit:
+        show = show.head(int(limit))
+
+    cards = []
+    for _, rr in show.iterrows():
+        try:
             row = rr.to_dict()
             pitcher = str(_po_cal_txt(row, ["Pitcher"], "Pitcher"))
             matchup = str(_po_cal_txt(row, ["Matchup"], ""))
+
             away, home = _po_card_matchup_teams(matchup)
             logo_team = away or home
+            opp = home if logo_team == away else away
+
             if board and "_kcard_board_lookup" in globals() and "_kcard_pitcher_team" in globals() and "_kcard_opp_team" in globals():
                 try:
                     lookup = _kcard_board_lookup(board)
                     key = _tpl_norm_name(pitcher) if "_tpl_norm_name" in globals() else pitcher.lower().strip()
                     p = lookup.get(key, {})
                     logo_team = _kcard_pitcher_team(row, p) or logo_team
-                    opp = _kcard_opp_team(row, p) or (home if logo_team == away else away)
+                    opp = _kcard_opp_team(row, p) or opp
                 except Exception:
-                    opp = home if logo_team == away else away
-            else:
-                opp = home if logo_team == away else away
+                    pass
+
             logo_url = _po_card_team_logo(logo_team)
-            logo_html = f"<img class='poc-logo' src='{html.escape(logo_url)}' />" if logo_url else f"<div class='poc-logo poc-fallback'>{html.escape((logo_team or 'MLB')[:3])}</div>"
-            side = str(_po_cal_txt(row, ["PO Active Lean", "Beta Lean"], "TRACK")).upper()
-            tier = str(_po_cal_txt(row, ["PO Official Tier"], side or "TRACK"))
-            tier_cls = "good" if "OFFICIAL" in tier or "PLAYABLE" in tier else "warn" if "LEAN" in tier else "risk" if "TRACK" in tier or "PASS" in tier else ""
+            if logo_url:
+                logo_html = f"<img class='po-native-logo' src='{html.escape(logo_url)}'/>"
+            else:
+                logo_html = f"<div class='po-native-logo po-native-logo-fallback'>{html.escape((logo_team or 'MLB')[:3])}</div>"
+
+            raw_side = str(_po_cal_txt(row, ["PO Active Lean", "Beta Lean"], "TRACK")).upper()
+            side = "OVER" if "OVER" in raw_side else "UNDER" if "UNDER" in raw_side else "PASS" if "PASS" in raw_side else "TRACK"
+            side_cls = side.lower()
+
+            tier = str(_po_cal_txt(row, ["PO Official Tier"], raw_side or "TRACK"))
             prob = _po_card_num(row, ["PO Active Hit %", "Beta Hit %"], 1)
             proj = _po_card_num(row, ["PO Active Projection", "Beta Projection"], 1)
-            legacy_proj = _po_card_num(row, ["PO Legacy Projection", "PO Legacy Outs", "Beta Projection"], 1)
+            line_value = _po_cal_num(_po_cal_txt(row, ["UD Line"], ""), np.nan)
             line = _po_card_num(row, ["UD Line"], 1)
             edge = _po_card_num(row, ["PO Active Edge", "Beta Edge"], 2)
-            legacy_edge = _po_card_num(row, ["PO Legacy Edge", "Beta Edge"], 2)
-            legacy_prob = _po_card_num(row, ["Beta Hit %"], 1)
-            ip = _po_card_num(row, ["PO Active IP", "Beta IP"], 2)
             bf = _po_card_num(row, ["Beta BF"], 1)
-            pre = _po_card_num(row, ["Pre-PO Calibration Projection"], 1)
-            v2_proj = _po_card_num(row, ["PO Workload V2 Projection", "PO Calibrated Projection"], 1)
-            v2_ip = _po_card_num(row, ["PO Workload V2 IP"], 2)
-            v2_edge = _po_card_num(row, ["PO Workload V2 Edge", "PO Calibrated Edge"], 2)
-            v2_lean = _po_cal_txt(row, ["PO Workload V2 Lean", "PO Calibrated Lean"], "V2")
-            v2_prob = _po_card_num(row, ["PO Workload V2 Hit %", "PO Calibrated Hit %"], 1)
-            adj = _po_card_num(row, ["PO Workload V2 Adj Outs", "PO Calibration Adj Outs"], 2)
-            notes = _po_card_safe(_po_cal_txt(row, ["PO Workload V2 Notes", "PO Calibration Notes", "Decision Note"], "No PO notes"))
-            do_not = _po_card_safe(_po_cal_txt(row, ["PO Do Not Bet Reason"], ""))
+            ip = _po_card_num(row, ["PO Active IP", "Beta IP"], 2)
+
+            win_req = _po_line_win_requirements(line_value)
+            if side == "OVER":
+                threshold_title = "IP NEEDED TO CLEAR"
+                threshold_big = f'{win_req["over_ip"]} IP+'
+                threshold_text = win_req["over_text"]
+            elif side == "UNDER":
+                threshold_title = "MAX IP TO STAY UNDER"
+                threshold_big = f'{win_req["under_ip"]} IP OR LESS'
+                threshold_text = win_req["under_text"]
+            else:
+                threshold_title = "IP NEEDED TO WIN"
+                threshold_big = "—"
+                threshold_text = f'{win_req["over_text"]} · {win_req["under_text"]}'
+
+            true_prob = _po_card_num(
+                row,
+                ["PO Sim True Prob %", "PO Sim Current Side Prob %", "PO Active Hit %", "Beta Hit %"],
+                1
+            )
+
+            # Core workload / selector fields from the old PO cards.
+            items = [
+                ("LINE", line),
+                ("PROJ OUTS", proj),
+                ("EDGE", edge),
+                ("HIT %", prob),
+                ("BF", bf),
+                ("IP", ip),
+                ("PRE-CAL", _po_card_num(row, ["Pre-PO Calibration Projection"], 1)),
+                ("ADJ", _po_card_num(row, ["PO Workload V2 Adj Outs", "PO Calibration Adj Outs"], 2)),
+                ("HOOK", _po_card_num(row, ["Recent Hook Rate"], 0)),
+                ("DEEP", _po_card_num(row, ["Deep Start Rate"], 0)),
+                ("P/IP", _po_card_num(row, ["Pitch Efficiency P/IP"], 1)),
+                ("P/BF", _po_card_num(row, ["Pitch Efficiency P/BF", "PO Fill P/BF"], 2)),
+                ("L3 PC", _po_card_num(row, ["Pitch Count Avg L3", "PO Fill Pitch Count L3"], 1)),
+                ("L5 PC", _po_card_num(row, ["Pitch Count Avg L5", "PO Fill Pitch Count L5"], 1)),
+                ("L10 PC", _po_card_num(row, ["Pitch Count Avg L10", "PO Fill Pitch Count L10"], 1)),
+                ("LAST PC", _po_card_num(row, ["Last Start Pitch Count", "PO Fill Last Pitch Count"], 0)),
+                ("MAX PC", _po_card_num(row, ["Max Pitch Count L10", "PO Fill Max Pitch Count L10"], 0)),
+                ("SEASON PC", _po_card_num(row, ["Season Avg Pitch Count", "PO Fill Season Pitch Count Avg"], 1)),
+                ("DAMAGE", _po_cal_txt(row, ["Damage Risk Label"], "—")),
+                ("SAMPLE", _po_card_num(row, ["PO Fill Sample"], 0)),
+                ("WORKLOAD", _po_card_num(row, ["PO Fill Workload Score"], 0)),
+                ("STUFF+", _po_card_num(row, ["Stuff+", "Stuff Plus", "botStf", "PitchingBot Stuff"], 0)),
+                ("HEART", _po_card_num(row, ["Heart Zone%", "Heart%", "Meatball%"], 1)),
+                ("FOUL", _po_card_num(row, ["Foul%", "Foul Ball%", "PO Foul Workload %", "Foul/PA"], 1)),
+                ("FOUL PIT", _po_card_num(row, ["PO Foul Pitches"], 0)),
+                ("TOT PIT", _po_card_num(row, ["PO Foul Total Pitches"], 0)),
+                ("EXT", _po_card_num(row, ["PO Foul Release Extension", "Release Extension"], 2)),
+                ("DC IP", _po_card_num(row, ["Depth Chart IP", "FanGraphs DC IP", "Projected Season IP"], 0)),
+            ]
+            metric_html = "".join(
+                f"<div class='po-native-metric'><span>{html.escape(str(k))}</span><b>{html.escape(str(v))}</b></div>"
+                for k, v in items
+            )
+
+            signal_fields = [
+                "PO BF Signal", "PO Leash/Hook Signal", "PO Pitch Efficiency Signal",
+                "PO Damage Signal", "PO Role/Sample Signal", "PO Pitch Count Signal",
+                "PO Role/Pitch Limit Signal", "PO Bullpen Leash Signal", "PO Foul Workload Signal"
+            ]
+            signals = []
+            for key in signal_fields:
+                val = str(_po_cal_txt(row, [key], "")).strip()
+                if val and val not in {"—", "NONE", "None"}:
+                    signals.append(f"<span>{html.escape(val)}</span>")
+            signal_html = "".join(signals) or "<span>NO EXTRA FLAGS</span>"
+
+            calibration = _po_card_safe(_po_cal_txt(
+                row,
+                ["PO Workload V2 Notes", "PO Calibration Notes", "Decision Note"],
+                "No extra calibration notes"
+            ))
             support = _po_card_safe(_po_cal_txt(row, ["PO Support Signals"], ""))
-            metrics = "".join([
-                _po_card_chip("Line", line),
-                _po_card_chip("Active Outs", proj, "hot" if side == "OVER" else "cool" if side == "UNDER" else ""),
-                _po_card_chip("Legacy Outs", legacy_proj),
-                _po_card_chip("Active Edge", edge),
-                _po_card_chip("Active Hit %", prob),
-                _po_card_chip("Legacy Edge", legacy_edge),
-                _po_card_chip("Legacy Hit %", legacy_prob),
-                _po_card_chip("V2 Outs", v2_proj),
-                _po_card_chip("V2 IP", v2_ip),
-                _po_card_chip("V2 Edge", v2_edge),
-                _po_card_chip("V2 Lean", v2_lean),
-                _po_card_chip("V2 Hit %", v2_prob),
-                _po_card_chip("BF", bf),
-                _po_card_chip("IP", ip),
-                _po_card_chip("Pre-Cal", pre),
-                _po_card_chip("V2 Adj", adj),
-                _po_card_chip("Hook", _po_card_num(row, ["Recent Hook Rate"], 0)),
-                _po_card_chip("Deep", _po_card_num(row, ["Deep Start Rate"], 0)),
-                _po_card_chip("P/IP", _po_card_num(row, ["Pitch Efficiency P/IP"], 1)),
-                _po_card_chip("P/BF", _po_card_num(row, ["Pitch Efficiency P/BF", "PO Fill P/BF"], 2)),
-                _po_card_chip("L3 PC", _po_card_num(row, ["Pitch Count Avg L3", "PO Fill Pitch Count L3"], 1)),
-                _po_card_chip("L5 PC", _po_card_num(row, ["Pitch Count Avg L5", "PO Fill Pitch Count L5"], 1)),
-                _po_card_chip("L10 PC", _po_card_num(row, ["Pitch Count Avg L10", "PO Fill Pitch Count L10"], 1)),
-                _po_card_chip("Last PC", _po_card_num(row, ["Last Start Pitch Count", "PO Fill Last Pitch Count"], 0)),
-                _po_card_chip("Max PC", _po_card_num(row, ["Max Pitch Count L10", "PO Fill Max Pitch Count L10"], 0)),
-                _po_card_chip("Season PC", _po_card_num(row, ["Season Avg Pitch Count", "PO Fill Season Pitch Count Avg"], 1)),
-                _po_card_chip("Damage", _po_cal_txt(row, ["Damage Risk Label"], "—")),
-                _po_card_chip("Sample", _po_card_num(row, ["PO Fill Sample"], 0)),
-                _po_card_chip("Workload", _po_card_num(row, ["PO Fill Workload Score"], 0)),
-                _po_card_chip("Stuff+", _po_card_num(row, ["Stuff+", "Stuff Plus", "botStf", "PitchingBot Stuff"], 0)),
-                _po_card_chip("Heart", _po_card_num(row, ["Heart Zone%", "Heart%", "Meatball%"], 1)),
-                _po_card_chip("Foul", _po_card_num(row, ["Foul%", "Foul Ball%", "PO Foul Workload %", "Foul/PA"], 1)),
-                _po_card_chip("Foul Pit", _po_card_num(row, ["PO Foul Pitches"], 0)),
-                _po_card_chip("Tot Pit", _po_card_num(row, ["PO Foul Total Pitches"], 0)),
-                _po_card_chip("Ext", _po_card_num(row, ["PO Foul Release Extension", "Release Extension"], 2)),
-                _po_card_chip("DC IP", _po_card_num(row, ["Depth Chart IP", "FanGraphs DC IP", "Projected Season IP"], 0)),
-            ])
-            signals = "".join([
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO BF Signal'], 'BF'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Leash/Hook Signal'], 'LEASH'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Pitch Efficiency Signal'], 'EFF'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Damage Signal'], 'DAMAGE'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Role/Sample Signal'], 'ROLE'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Pitch Count Signal'], 'PC'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Role/Pitch Limit Signal'], 'LIMIT'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Bullpen Leash Signal'], 'BULLPEN'))}</span>",
-                f"<span>{_po_card_safe(_po_cal_txt(row, ['PO Foul Workload Signal'], 'FOUL'))}</span>",
-            ])
+            do_not = _po_card_safe(_po_cal_txt(row, ["PO Do Not Bet Reason"], ""))
+
             cards.append(f"""
-              <article class="poc-card">
-                <div class="poc-head">
-                  <div class="poc-id">{logo_html}<div><h3>{html.escape(pitcher)}</h3><p>{html.escape(matchup)} · {html.escape(logo_team or '')} vs {html.escape(opp or '')}</p></div></div>
-                  <div class="poc-tier {tier_cls}">{html.escape(tier)}</div>
+            <article class="po-native-card {side_cls}">
+              <div class="po-native-head">
+                <div class="po-native-id">
+                  {logo_html}
+                  <div>
+                    <h3>{html.escape(pitcher)}</h3>
+                    <p>{html.escape(matchup)}</p>
+                  </div>
                 </div>
-                <div class="poc-hero">
-                  <div><span>Active PO Outs</span><strong>{proj}</strong><small>{html.escape(side)} {line} · edge {edge}</small></div>
-                  <div><span>Legacy Locked Outs</span><strong>{legacy_proj}</strong><small>V2 {html.escape(str(v2_lean))} · {v2_proj} outs</small></div>
+                <div class="po-native-tier">{html.escape(tier)}</div>
+              </div>
+
+              <div class="po-native-top">
+                <div class="po-native-hero">
+                  <span>PROJ OUTS</span>
+                  <strong>{proj}</strong>
+                  <small>{side} {line} · edge {edge}</small>
                 </div>
-                <div class="poc-grid">{metrics}</div>
-                <div class="poc-signals">{signals}</div>
-                <div class="poc-note"><b>Workload V2 Active PO Selector</b><br>{notes}</div>
-                <div class="poc-note muted"><b>Selector</b><br>{support or 'No extra support signals'}{('<br>' + do_not) if do_not else ''}</div>
-              </article>
+                <div class="po-native-prob">
+                  <span>TRUE PROB</span>
+                  <strong>{true_prob}</strong>
+                  <small>display support</small>
+                </div>
+              </div>
+
+              <div class="po-native-threshold {side_cls}">
+                <span>{threshold_title}</span>
+                <strong>{html.escape(threshold_big)}</strong>
+                <small>{html.escape(threshold_text)}</small>
+              </div>
+
+              <div class="po-native-two-thresholds">
+                <div><span>OVER CLEARS</span><b>{win_req["over_ip"]} IP+</b></div>
+                <div><span>UNDER WINS</span><b>{win_req["under_ip"]} IP OR LESS</b></div>
+              </div>
+
+              <div class="po-native-grid">{metric_html}</div>
+              <div class="po-native-signals">{signal_html}</div>
+
+              <div class="po-native-note">
+                <b>Calibration</b>
+                <p>{calibration}</p>
+              </div>
+
+              <div class="po-native-note">
+                <b>Selector</b>
+                <p>{support or 'No extra support signals'}{('<br>' + do_not) if do_not else ''}</p>
+              </div>
+            </article>
             """)
-        if not cards:
-            return
-        html_doc = f"""
-        <style>
-          body{{margin:0;background:transparent;color:#eef4ff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}}
-          .poc-wrap{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;padding:2px 0 12px;}}
-          .poc-card{{background:linear-gradient(180deg,#0d1421,#080b12);border:1px solid rgba(88,132,204,.34);border-radius:18px;padding:16px;box-shadow:0 14px 40px rgba(0,0,0,.28);}}
-          .poc-head{{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px;}}
-          .poc-id{{display:flex;gap:10px;align-items:center;min-width:0;}}
-          .poc-logo{{width:42px;height:42px;object-fit:contain;border-radius:999px;background:#111827;border:1px solid rgba(255,255,255,.10);padding:4px;flex:0 0 auto;}}
-          .poc-fallback{{display:flex;align-items:center;justify-content:center;font-weight:900;color:#fff;box-sizing:border-box;}}
-          h3{{margin:0;font-size:1.18rem;line-height:1.05;font-weight:900;}}
-          p{{margin:4px 0 0;color:#9ba8bb;font-size:.78rem;}}
-          .poc-tier{{border:1px solid #64748b;border-radius:999px;padding:5px 9px;font-size:.72rem;font-weight:900;white-space:nowrap;color:#dbeafe;}}
-          .poc-tier.good{{border-color:#16a34a;color:#86efac;}} .poc-tier.warn{{border-color:#d97706;color:#fde68a;}} .poc-tier.risk{{border-color:#dc2626;color:#fecaca;}}
-          .poc-hero{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;}}
-          .poc-hero>div{{background:#101827;border:1px solid rgba(148,163,184,.18);border-radius:14px;padding:12px;}}
-          .poc-hero span,.poc-chip span{{display:block;color:#8390a3;font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.04em;}}
-          .poc-hero strong{{display:block;font-size:2.25rem;line-height:1;color:#38bdf8;margin:4px 0;}}
-          .poc-hero small{{color:#aeb8c8;font-size:.78rem;}}
-          .poc-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}}
-          .poc-chip{{background:#0b111d;border:1px solid rgba(148,163,184,.14);border-radius:12px;padding:9px;min-height:48px;}}
-          .poc-chip b{{display:block;font-size:1.02rem;margin-top:3px;color:#f8fafc;}} .poc-chip.hot b{{color:#22c55e;}} .poc-chip.cool b{{color:#60a5fa;}}
-          .poc-signals{{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0;}}
-          .poc-signals span{{border:1px solid rgba(56,189,248,.26);background:rgba(14,165,233,.10);border-radius:999px;padding:5px 8px;font-size:.68rem;color:#bae6fd;font-weight:800;}}
-          .poc-note{{border-top:1px solid rgba(148,163,184,.16);padding-top:9px;margin-top:8px;color:#cbd5e1;font-size:.78rem;line-height:1.35;}}
-          .poc-note b{{color:#f8fafc;}} .poc-note.muted{{color:#94a3b8;}}
-          @media(max-width:560px){{.poc-wrap{{grid-template-columns:1fr;}}.poc-grid{{grid-template-columns:repeat(2,1fr);}}.poc-hero strong{{font-size:2rem;}}}}
-        </style>
-        <div class="poc-wrap">{''.join(cards)}</div>
-        """
-        components.html(html_doc, height=max(1000, min(42000, 760 * max(1, len(cards))) + 320), scrolling=True)
-    except Exception as e:
-        st.info(f"Pitching Outs cards unavailable: {e}")
+        except Exception as row_error:
+            # One malformed pitcher should never suppress every PO card.
+            cards.append(f"""
+            <article class="po-native-card track">
+              <div class="po-native-head"><div><h3>Pitching Outs row</h3>
+              <p>Card data unavailable for one pitcher.</p></div></div>
+              <div class="po-native-note"><p>{html.escape(str(row_error)[:180])}</p></div>
+            </article>
+            """)
+
+    if not cards:
+        st.warning("Pitching Outs rows were found, but no player cards could be built.")
+        return 0
+
+    css = r"""
+    <style>
+    .po-native-wrap{
+      display:grid;
+      grid-template-columns:repeat(2,minmax(0,1fr));
+      gap:16px;
+      margin:8px 0 18px 0;
+    }
+    .po-native-card{
+      background:linear-gradient(145deg,#0b1321,#08101d 72%,#060c16);
+      border:1px solid #26354a;
+      border-radius:18px;
+      padding:16px;
+      color:#eef5ff;
+      box-shadow:0 12px 30px rgba(0,0,0,.25);
+      overflow:hidden;
+    }
+    .po-native-card.over{border-top:3px solid #28d7ff}
+    .po-native-card.under{border-top:3px solid #ffd452}
+    .po-native-card.pass,.po-native-card.track{border-top:3px solid #ff5d66}
+
+    .po-native-head{
+      display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:12px;
+    }
+    .po-native-id{display:flex;align-items:center;gap:10px;min-width:0}
+    .po-native-logo{
+      width:42px;height:42px;object-fit:contain;border-radius:50%;
+      background:#111a29;border:1px solid #2d3c52;padding:4px;flex:0 0 auto;
+    }
+    .po-native-logo-fallback{
+      display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;
+    }
+    .po-native-head h3{margin:0;color:#f5f8ff;font-size:18px;line-height:1.05;font-weight:900}
+    .po-native-head p{margin:4px 0 0;color:#9eacc0;font-size:11px}
+    .po-native-tier{
+      border:1px solid #ff5964;border-radius:999px;padding:5px 9px;
+      color:#ffb2b8;font-size:10px;font-weight:900;white-space:nowrap;
+    }
+
+    .po-native-top{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
+    .po-native-hero,.po-native-prob{
+      background:#0d1726;border:1px solid #223149;border-radius:14px;padding:13px;
+    }
+    .po-native-hero span,.po-native-prob span,.po-native-threshold span,
+    .po-native-two-thresholds span,.po-native-metric span{
+      display:block;color:#8fa0b8;font-size:9px;font-weight:900;letter-spacing:.08em;
+    }
+    .po-native-hero strong,.po-native-prob strong{
+      display:block;color:#42cfff;font-size:30px;line-height:1;margin:7px 0;font-weight:950;
+    }
+    .po-native-prob strong{font-size:27px}
+    .po-native-hero small,.po-native-prob small{color:#9ba8b8;font-size:11px}
+
+    .po-native-threshold{
+      background:#0d1726;border:1px solid #263852;border-radius:14px;padding:12px;margin-bottom:9px;
+    }
+    .po-native-threshold strong{display:block;font-size:22px;margin:5px 0;font-weight:950}
+    .po-native-threshold.over strong{color:#40e5ff}
+    .po-native-threshold.under strong{color:#ffe271}
+    .po-native-threshold.pass strong,.po-native-threshold.track strong{color:#ff8790}
+    .po-native-threshold small{color:#c2cad5;font-size:10px}
+
+    .po-native-two-thresholds{
+      display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;
+    }
+    .po-native-two-thresholds>div{
+      background:#0b1422;border:1px solid #1e3047;border-radius:11px;padding:9px;
+    }
+    .po-native-two-thresholds b{display:block;color:#eaf3ff;font-size:12px;margin-top:4px}
+
+    .po-native-grid{
+      display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;
+    }
+    .po-native-metric{
+      background:#0b1422;border:1px solid #1d2d43;border-radius:11px;padding:9px;min-height:57px;
+    }
+    .po-native-metric b{
+      display:block;color:#edf4ff;font-size:14px;margin-top:5px;line-height:1.05;word-break:break-word;
+    }
+
+    .po-native-signals{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+    .po-native-signals span{
+      border:1px solid #07546a;background:#062536;color:#99e9ff;
+      border-radius:999px;padding:5px 8px;font-size:9px;font-weight:850;
+    }
+    .po-native-note{border-top:1px solid #1d2a3c;padding-top:9px;margin-top:8px}
+    .po-native-note b{font-size:11px;color:#f3f6fa}
+    .po-native-note p{margin:4px 0 0;color:#aeb8c6;font-size:10px;line-height:1.35}
+
+    @media(max-width:900px){
+      .po-native-wrap{grid-template-columns:1fr}
+    }
+    @media(max-width:520px){
+      .po-native-grid{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+      .po-native-card{padding:12px}
+      .po-native-metric{padding:7px;min-height:52px}
+      .po-native-hero strong,.po-native-prob strong{font-size:26px}
+    }
+    </style>
+    """
+
+    st.markdown(css + f"<div class='po-native-wrap'>{''.join(cards)}</div>", unsafe_allow_html=True)
+    return len(cards)
 
 
 _PO_CAL_PREV_RENDER_PO = globals().get('_impl_render_beta_pitching_outs_tab_05', globals().get('_impl_render_beta_pitching_outs_tab_04', globals().get('_impl_render_beta_pitching_outs_tab_03', globals().get('_impl_render_beta_pitching_outs_tab_02', globals().get('_impl_render_beta_pitching_outs_tab_01', None)))))
 
 
 def _impl_render_beta_pitching_outs_tab_06(board):
-    if _PO_CAL_PREV_RENDER_PO is not None:
-        _PO_CAL_PREV_RENDER_PO(board)
+    """Primary Pitching Outs UI: cards first, diagnostics preserved below."""
     try:
         df = _beta_projection_rows(board, "OUTS")
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            st.markdown('<div class="section-title-pro">Pitching Outs BF / Leash Calibration</div>', unsafe_allow_html=True)
-            st.caption("Pitching Outs only. K stays untouched. Legacy PO math stays locked as reference; Workload V2 is now the active PO selector using BF, pitch-count capacity, hard restrictions, capped soft risk, starter floor, and saved PO grade history.")
+    except Exception as e:
+        st.info(f"Pitching Outs board unavailable: {e}")
+        df = pd.DataFrame()
+
+    st.markdown('<div class="section-title-pro">🎯 Pitching Outs</div>', unsafe_allow_html=True)
+    st.caption("K-style player cards first. Active Workload V2 projection, line, edge, hit rate, workload, leash and risk signals. Projection math is unchanged.")
+
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Pitchers", int(len(df)))
+        try:
+            found = int((df["Line Status"].astype(str).str.upper() == "FOUND").sum()) if "Line Status" in df.columns else int(pd.to_numeric(df.get("UD Line"), errors="coerce").notna().sum())
+        except Exception:
+            found = 0
+        c2.metric("UD Outs Lines", found)
+        try:
+            official = int(df["PO Official Tier"].astype(str).str.upper().str.contains("OFFICIAL|PLAYABLE", regex=True).sum()) if "PO Official Tier" in df.columns else 0
+        except Exception:
+            official = 0
+        c3.metric("Playable / Official", official)
+        try:
+            edge_series = pd.to_numeric(df["PO Active Edge"] if "PO Active Edge" in df.columns else df.get("Beta Edge"), errors="coerce")
+            avg_edge = edge_series.abs().mean()
+            c4.metric("Avg |Edge|", "—" if pd.isna(avg_edge) else f"{avg_edge:.2f}")
+        except Exception:
+            c4.metric("Avg |Edge|", "—")
+
+        st.markdown('<div class="section-title-pro" style="margin-top:12px;">Pitching Outs Player Cards</div>', unsafe_allow_html=True)
+        _po_card_count = _po_render_player_cards(df, board=board)
+        if not _po_card_count:
+            st.warning("Pitching Outs player cards did not render. The detailed PO table is still available below.")
+
+        with st.expander("Pitching Outs — Workload V2 / BF / Leash table", expanded=False):
             cols = [c for c in [
                 "Pitcher", "Matchup", "UD Line",
                 "PO Active Model", "PO Active Projection", "PO Active IP", "PO Active Lean", "PO Active Edge", "PO Active Hit %",
@@ -47773,32 +48018,25 @@ def _impl_render_beta_pitching_outs_tab_06(board):
                 "Pre-PO Calibration Projection", "Beta Projection", "Beta Lean", "Beta Edge", "Beta Hit %",
                 "PO Workload V2 Projection", "PO Workload V2 IP", "PO Workload V2 Edge", "PO Workload V2 Lean", "PO Workload V2 Hit %",
                 "PO Workload V2 Hard Restriction", "PO Workload V2 Soft Risk Score", "PO Workload V2 Notes",
-                "PO Calibration Adj Outs", "Beta Lean", "Beta Edge", "Beta Hit %",
                 "PO BF Signal", "PO Leash/Hook Signal", "PO Pitch Efficiency Signal",
                 "PO Damage Signal", "PO Role/Sample Signal", "PO Confidence Signal",
-                "Beta BF", "Recent Hook Rate", "Deep Start Rate", "Pitch Efficiency P/IP",
-                "Pitch Efficiency P/BF", "Pitch Count Avg L3", "Pitch Count Avg L5",
-                "Pitch Count Avg L10", "Season Avg Pitch Count", "Last Start Pitch Count",
-                "Max Pitch Count L10", "Pitch Count Trend", "PO Pitch Count Signal",
-                "PO Efficiency Signal", "PO Leash Signal", "PO Role/Pitch Limit Signal",
-                "PO Bullpen Leash Signal",
-                "PO Foul Workload %", "PO Foul Pitches", "PO Foul Total Pitches",
-                "PO Foul Workload Signal", "PO Foul Plate X", "PO Foul Plate Z",
-                "PO Foul Velocity", "PO Foul Spin", "PO Foul Release Extension",
-                "Damage Risk Label", "IP Confidence", "PO History Sample", "PO History Avg Error",
-                "PO History Loss Pattern", "PO Fill Sample", "PO Fill Last Start IP",
-                "PO Fill Last Start BF", "PO Fill Days Since Last Start",
-                "PO Fill Workload Score", "PO Fill Source",
-                "PO Stuff+ Need", "PO Foul Need", "PO Legacy Projection Locked", "PO Workload V2 Version",
-                "PO Calibration Notes", "PO Calibration Version",
-                "PO Data Fill Version"
+                "Beta BF", "Recent Hook Rate", "Deep Start Rate", "Pitch Efficiency P/IP", "Pitch Efficiency P/BF",
+                "Pitch Count Avg L3", "Pitch Count Avg L5", "Pitch Count Avg L10", "Season Avg Pitch Count",
+                "Last Start Pitch Count", "Max Pitch Count L10", "Pitch Count Trend",
+                "PO Pitch Count Signal", "PO Efficiency Signal", "PO Leash Signal",
+                "PO Role/Pitch Limit Signal", "PO Bullpen Leash Signal",
+                "PO Foul Workload %", "PO Foul Workload Signal", "Damage Risk Label",
+                "IP Confidence", "PO History Sample", "PO History Avg Error", "PO History Loss Pattern",
+                "PO Legacy Projection Locked", "PO Workload V2 Version", "PO Calibration Version"
             ] if c in df.columns]
             st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
-            st.markdown('<div class="section-title-pro">Pitching Outs Player Cards</div>', unsafe_allow_html=True)
-            st.caption("Card view for slip building. Shows active Workload V2 PO decision plus locked legacy PO reference. K decisions and K copy/paste slate are untouched.")
-            _po_render_player_cards(df, board=board)
-    except Exception as e:
-        st.info(f"Pitching Outs BF/leash calibration unavailable: {e}")
+    else:
+        st.info("No Pitching Outs rows yet. Refresh the board first.")
+
+    # All previous PO tools remain available, but no longer bury the cards.
+    if _PO_CAL_PREV_RENDER_PO is not None:
+        with st.expander("Advanced Pitching Outs tools — Save/Grade, Loss Lab, Selector, Monte Carlo, Role Guardrails", expanded=False):
+            _PO_CAL_PREV_RENDER_PO(board)
 
 
 ADVANCED_DAILY_FEED_VERSION = "ADVANCED_DAILY_FEEDS_SUPPORT_ONLY_2026_07_26"
