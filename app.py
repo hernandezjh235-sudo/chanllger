@@ -12515,100 +12515,353 @@ def parse_manual_slate_text_to_dataframe(raw_text):
             continue
     return pd.DataFrame(rows)
 
-def grade_finished_games():
-    picks = load_json(PICK_LOG, [])
-    results = load_json(RESULT_LOG, [])
-    result_ids = set([_grade_result_key(r) for r in results])
-    graded = 0
-    for p in picks:
-        if p.get("graded"):
-            continue
-        if not p.get("game_pk") or not p.get("pitcher_id"):
-            continue
-        if not is_game_final(p["game_pk"]):
-            continue
-        workload = get_actual_pitcher_workload(p["game_pk"], p["pitcher_id"])
-        actual = workload.get("actual") if workload else get_actual_pitcher_ks(p["game_pk"], p["pitcher_id"])
-        if actual is None:
-            continue
-        p["actual"] = actual
-        if workload:
-            for _wk, _wv in workload.items():
-                if _wv is not None:
-                    p[_wk] = _wv
-        p["graded"] = True
-        p["graded_at"] = now_iso()
-        # Projection Drift Tracker grading fields.
-        p["final_projection"] = p.get("final_projection", p.get("projection"))
-        p["final_line"] = p.get("final_line", p.get("line"))
-        p["projection_drift"] = None if safe_float(p.get("opening_projection")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("final_projection")) - safe_float(p.get("opening_projection")), 2)
-        p["final_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("final_projection")), 2)
-        p["opening_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("opening_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("opening_projection")), 2)
-        p["projection_drift_label"] = projection_drift_label(p.get("opening_projection"), p.get("final_projection"), p.get("actual"))
-        line = safe_float(p.get("line"))
-        side = p.get("pick_side")
-        if line is not None and side in ["OVER", "UNDER"]:
-            win = (actual > line) if side == "OVER" else (actual < line)
-            p["win"] = bool(win)
-            p["graded_result"] = "WIN" if win else "LOSS"
-        else:
-            p["win"] = None
-            p["graded_result"] = "NO LINE"
-        p["new_learning_scale"] = round(update_learning(p["pitcher_id"], p.get("projection"), actual), 3)
-        update_deep_context_learning_after_grade(p)
-        try:
-            _miss_info = update_k_miss_reason_learning(p)
-            p.update(_miss_info)
-        except Exception as _e:
-            p["miss_reason"] = p.get("miss_reason") or "UNCLASSIFIED"
-            p["miss_reason_detail"] = str(_e)[:120]
-        try:
-            _volume_info = update_volume_miss_learning_after_grade(p)
-            p.update(_volume_info)
-        except Exception as _e:
-            p["volume_miss_label"] = p.get("volume_miss_label") or "UNCLASSIFIED"
-            p["volume_learning_detail"] = str(_e)[:120]
-        try:
-            _mgr_info = update_manager_pull_learning_after_grade(p)
-            p.update(_mgr_info)
-        except Exception as _e:
-            p["manager_pull_learning_error"] = str(_e)[:120]
-        grade_key = _grade_result_key(p)
-        if grade_key not in result_ids:
-            results.append(dict(p))
-            result_ids.add(grade_key)
-        graded += 1
-    save_json(PICK_LOG, picks[-10000:])
-    save_json(RESULT_LOG, results[-10000:])
+# =========================
+# GRADING SAVE / SPEED FIX — ISOLATED FROM PROJECTION MATH
+# =========================
+GRADING_SAVE_SPEED_FIX_VERSION = "GRADING_SAVE_SPEED_FIX_2026_08_01"
+
+def _grading_verified_save_json(path, data):
+    """Atomically save grading logs and verify the file can be read back.
+
+    Used only by the grading workflow. It does not touch projection inputs or math.
+    """
+    status = {"ok": False, "path": str(path), "rows": _safe_json_len(data), "message": ""}
+    tmp_path = str(path) + ".grading_tmp"
     try:
-        build_k_v72_learning_profiles(results=results, save=True)
-        sync_graded_history_csv_from_result_log()
+        old = load_json(path, None) if os.path.exists(path) else None
+        old_n = _safe_json_len(old)
+        new_n = _safe_json_len(data)
+        # Grading should never shrink a list log. Abort instead of risking data loss.
+        if isinstance(old, list) and isinstance(data, list) and old_n is not None and new_n is not None and new_n < old_n:
+            status["message"] = f"Blocked grading log shrink ({old_n} -> {new_n})."
+            return status
+        parent = os.path.dirname(str(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if old is not None:
+            try:
+                with open(str(path) + ".grading.bak", "w", encoding="utf-8") as fb:
+                    json.dump(old, fb, indent=2)
+            except Exception:
+                pass
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
+        check = load_json(path, None)
+        check_n = _safe_json_len(check)
+        if isinstance(data, list):
+            status["ok"] = isinstance(check, list) and check_n == len(data)
+        elif isinstance(data, dict):
+            status["ok"] = isinstance(check, dict)
+        else:
+            status["ok"] = check is not None
+        status["message"] = "Saved and verified." if status["ok"] else "Write completed but verification failed."
+        status["verified_rows"] = check_n
+        return status
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        # Preserve the old fallback, then verify it instead of silently assuming success.
+        try:
+            save_json(path, data)
+            check = load_json(path, None)
+            check_n = _safe_json_len(check)
+            expected_n = _safe_json_len(data)
+            status["ok"] = check_n == expected_n if expected_n is not None else check is not None
+            status["verified_rows"] = check_n
+            status["message"] = "Fallback save verified." if status["ok"] else f"Save failed: {str(e)[:160]}"
+        except Exception as e2:
+            status["message"] = f"Save failed: {str(e2)[:160]}"
+        return status
+
+def _grading_feed_is_final(feed):
+    try:
+        status = ((feed or {}).get("gameData") or {}).get("status") or {}
+        abstract = str(status.get("abstractGameState") or "").upper()
+        detailed = str(status.get("detailedState") or "").upper()
+        coded = str(status.get("codedGameState") or "").upper()
+        return abstract == "FINAL" or "FINAL" in detailed or detailed in {"GAME OVER", "COMPLETED EARLY"} or coded in {"F", "O"}
+    except Exception:
+        return False
+
+def _grading_first_inning_from_feed(feed, pitcher_id):
+    try:
+        plays = (((feed.get("liveData") or {}).get("plays") or {}).get("allPlays") or [])
+        pitcher_id_s = str(pitcher_id)
+        pitches = batters_faced = ks = walks = hits = runs = events_seen = 0
+        for play in plays:
+            about = play.get("about") or {}
+            if int(about.get("inning") or 0) != 1:
+                continue
+            matchup = play.get("matchup") or {}
+            if str((matchup.get("pitcher") or {}).get("id")) != pitcher_id_s:
+                continue
+            batters_faced += 1
+            events_seen += 1
+            for ev in (play.get("playEvents") or []):
+                details = ev.get("details") or {}
+                if ev.get("isPitch") or details.get("isPitch"):
+                    pitches += 1
+            result = play.get("result") or {}
+            event_type = str(result.get("eventType") or result.get("event") or "").lower()
+            if "strikeout" in event_type:
+                ks += 1
+            if event_type in ["walk", "intent_walk", "hit_by_pitch"] or "walk" in event_type:
+                walks += 1
+            if event_type in ["single", "double", "triple", "home_run"]:
+                hits += 1
+            runs += int(max(0, safe_float(result.get("rbi"), 0) or 0))
+        if events_seen <= 0 and pitches <= 0:
+            return {}
+        return {
+            "first_inning_pitches_actual": int(pitches),
+            "first_inning_bf_actual": int(batters_faced),
+            "first_inning_k_actual": int(ks),
+            "first_inning_bb_actual": int(walks),
+            "first_inning_hits_actual": int(hits),
+            "first_inning_runs_actual": int(runs),
+            "first_inning_tracked_at": now_iso(),
+        }
+    except Exception:
+        return {}
+
+def _grading_workload_from_feed(feed, pitcher_id):
+    """Read all pitcher actuals from one live-feed response for a game."""
+    try:
+        box = ((feed.get("liveData") or {}).get("boxscore") or {})
+        for side in ["home", "away"]:
+            team_node = (box.get("teams") or {}).get(side, {}) or {}
+            team_info = team_node.get("team", {}) or {}
+            team_abbrev = team_info.get("abbreviation") or team_info.get("teamCode") or team_info.get("fileCode") or team_info.get("name")
+            for p in (team_node.get("players") or {}).values():
+                if str((p.get("person") or {}).get("id")) != str(pitcher_id):
+                    continue
+                pitching = ((p.get("stats") or {}).get("pitching") or {})
+                out = {
+                    "actual": safe_float(pitching.get("strikeOuts")),
+                    "actual_bf": safe_float(pitching.get("battersFaced")),
+                    "actual_pitches": safe_float(pitching.get("numberOfPitches", pitching.get("pitchesThrown", pitching.get("pitchCount")))),
+                    "actual_ip": baseball_ip_to_float(pitching.get("inningsPitched")),
+                    "actual_er": safe_float(pitching.get("earnedRuns")),
+                    "actual_hits": safe_float(pitching.get("hits")),
+                    "actual_bb": safe_float(pitching.get("baseOnBalls")),
+                    "actual_hr": safe_float(pitching.get("homeRuns")),
+                    "actual_team": team_abbrev,
+                    "actual_team_id": team_info.get("id"),
+                    "actual_team_side": side,
+                }
+                out.update(_grading_first_inning_from_feed(feed, pitcher_id))
+                return out
     except Exception:
         pass
-    return graded
+    return {}
+
+def _grading_normalize_diag(value, label):
+    """Prevent a grader returning None from appearing as a confusing None/null tab result."""
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {"graded": 0, "status": "NO_RESULT", "message": f"{label} grader returned no diagnostic result."}
+    return {"graded": 0, "status": "UNEXPECTED_RESULT", "message": str(value)[:240]}
+
+def _grading_diag_table(diag):
+    rows = []
+    for label in ["K", "Pitching Outs", "First Inning Pitch Count", "Moneyline"]:
+        d = _grading_normalize_diag((diag or {}).get(label), label)
+        rows.append({
+            "Market": label,
+            "Graded": int(safe_float(d.get("graded"), 0) or 0),
+            "Wins": "—" if d.get("wins") is None else d.get("wins"),
+            "Losses": "—" if d.get("losses") is None else d.get("losses"),
+            "Status": d.get("status") or ("OK" if int(safe_float(d.get("graded"), 0) or 0) > 0 else "NO NEW ROWS"),
+            "Message": d.get("message") or d.get("reason") or "Completed",
+        })
+    return pd.DataFrame(rows)
+
+def grade_finished_games():
+    """Grade K snapshots with one MLB live-feed request per unique game.
+
+    Projection fields are read-only. This function only adds actuals/results and
+    persists grading/learning logs.
+    """
+    started = datetime.now()
+    picks = load_json(PICK_LOG, [])
+    results = load_json(RESULT_LOG, [])
+    if not isinstance(picks, list):
+        picks = []
+    if not isinstance(results, list):
+        results = []
+    result_ids = set(_grade_result_key(r) for r in results if isinstance(r, dict))
+    graded = 0
+    new_results = 0
+    pending_nonfinal = 0
+    missing_actual = 0
+    api_failures = 0
+    unique_games_checked = 0
+    final_games = 0
+    graded_rows = []
+
+    groups = {}
+    for idx, p in enumerate(picks):
+        if not isinstance(p, dict) or p.get("graded"):
+            continue
+        game_pk = p.get("game_pk")
+        pitcher_id = p.get("pitcher_id")
+        if not game_pk or not pitcher_id:
+            continue
+        groups.setdefault(str(game_pk), []).append((idx, p))
+
+    for game_pk, group in groups.items():
+        unique_games_checked += 1
+        feed = safe_get_json(f"{MLB_LIVE}/game/{game_pk}/feed/live", timeout=18)
+        if not isinstance(feed, dict):
+            api_failures += 1
+            # Safe fallback to the original endpoints if the combined feed is unavailable.
+            if not is_game_final(game_pk):
+                pending_nonfinal += len(group)
+                continue
+            is_final = True
+        else:
+            is_final = _grading_feed_is_final(feed)
+        if not is_final:
+            pending_nonfinal += len(group)
+            continue
+        final_games += 1
+
+        for idx, p in group:
+            workload = _grading_workload_from_feed(feed, p.get("pitcher_id")) if isinstance(feed, dict) else get_actual_pitcher_workload(game_pk, p.get("pitcher_id"))
+            actual = workload.get("actual") if workload else None
+            if actual is None and not isinstance(feed, dict):
+                actual = get_actual_pitcher_ks(game_pk, p.get("pitcher_id"))
+            if actual is None:
+                missing_actual += 1
+                continue
+
+            p["actual"] = actual
+            for _wk, _wv in (workload or {}).items():
+                if _wv is not None:
+                    p[_wk] = _wv
+            p["graded"] = True
+            p["graded_at"] = now_iso()
+            p["grading_version"] = GRADING_SAVE_SPEED_FIX_VERSION
+            p["final_projection"] = p.get("final_projection", p.get("projection"))
+            p["final_line"] = p.get("final_line", p.get("line"))
+            p["projection_drift"] = None if safe_float(p.get("opening_projection")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("final_projection")) - safe_float(p.get("opening_projection")), 2)
+            p["final_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("final_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("final_projection")), 2)
+            p["opening_projection_error"] = None if safe_float(p.get("actual")) is None or safe_float(p.get("opening_projection")) is None else round(safe_float(p.get("actual")) - safe_float(p.get("opening_projection")), 2)
+            p["projection_drift_label"] = projection_drift_label(p.get("opening_projection"), p.get("final_projection"), p.get("actual"))
+            line = safe_float(p.get("line"))
+            side = str(p.get("pick_side") or "").upper()
+            if line is not None and side in ["OVER", "UNDER"]:
+                win = (actual > line) if side == "OVER" else (actual < line)
+                p["win"] = bool(win)
+                p["graded_result"] = "WIN" if win else "LOSS"
+            else:
+                p["win"] = None
+                p["graded_result"] = "NO LINE"
+
+            # Keep manager learning fast: use the known actual team bucket during grading.
+            # This avoids separate coach API calls and does not affect any projection.
+            if not p.get("manager_pull_learning_key") and p.get("actual_team"):
+                p["manager_pull_learning_key"] = f"TEAM:{p.get('actual_team')}"
+
+            p["new_learning_scale"] = round(update_learning(p["pitcher_id"], p.get("projection"), actual), 3)
+            update_deep_context_learning_after_grade(p)
+            try:
+                p.update(update_k_miss_reason_learning(p))
+            except Exception as e:
+                p["miss_reason"] = p.get("miss_reason") or "UNCLASSIFIED"
+                p["miss_reason_detail"] = str(e)[:120]
+            try:
+                p.update(update_volume_miss_learning_after_grade(p))
+            except Exception as e:
+                p["volume_miss_label"] = p.get("volume_miss_label") or "UNCLASSIFIED"
+                p["volume_learning_detail"] = str(e)[:120]
+            try:
+                p.update(update_manager_pull_learning_after_grade(p))
+            except Exception as e:
+                p["manager_pull_learning_error"] = str(e)[:120]
+
+            grade_key = _grade_result_key(p)
+            if grade_key not in result_ids:
+                results.append(dict(p))
+                result_ids.add(grade_key)
+                new_results += 1
+            picks[idx] = p
+            graded_rows.append(p)
+            graded += 1
+
+    # Save RESULT_LOG first. If that fails, do not mark PICK_LOG rows graded.
+    result_save = _grading_verified_save_json(RESULT_LOG, results[-10000:])
+    pick_save = {"ok": False, "path": PICK_LOG, "message": "Skipped because result log save failed."}
+    if result_save.get("ok"):
+        pick_save = _grading_verified_save_json(PICK_LOG, picks[-10000:])
+
+    persisted = graded if result_save.get("ok") and pick_save.get("ok") else 0
+    if persisted:
+        try:
+            build_k_v72_learning_profiles(results=results, save=True)
+            sync_graded_history_csv_from_result_log()
+        except Exception:
+            pass
+
+    core_diag = {
+        "graded": persisted,
+        "graded_in_memory": graded,
+        "new_results_added": new_results,
+        "unique_games_checked": unique_games_checked,
+        "final_games": final_games,
+        "pending_nonfinal": pending_nonfinal,
+        "missing_actual": missing_actual,
+        "api_failures": api_failures,
+        "result_log_save": result_save,
+        "pick_log_save": pick_save,
+        "elapsed_seconds": round((datetime.now() - started).total_seconds(), 2),
+        "version": GRADING_SAVE_SPEED_FIX_VERSION,
+    }
+    try:
+        st.session_state["grading_last_core_diag"] = core_diag
+    except Exception:
+        pass
+    return persisted
+
 
 
 def grade_finished_games_with_diagnostics():
-    """
-    Same grading flow as grade_finished_games(), but returns useful counts
-    so the UI does not just show 0 with no explanation.
-    """
+    """Run K grading and return explicit fetch/save diagnostics."""
     before_picks = load_json(PICK_LOG, [])
     before_results = load_json(RESULT_LOG, [])
-
+    if not isinstance(before_picks, list):
+        before_picks = []
+    if not isinstance(before_results, list):
+        before_results = []
     total_saved = len(before_picks)
-    already_graded = sum(1 for p in before_picks if p.get("graded"))
-    missing_ids = sum(1 for p in before_picks if not p.get("game_pk") or not p.get("pitcher_id"))
-    ungraded = [p for p in before_picks if not p.get("graded")]
+    already_graded = sum(1 for p in before_picks if isinstance(p, dict) and p.get("graded"))
+    missing_ids = sum(1 for p in before_picks if isinstance(p, dict) and (not p.get("game_pk") or not p.get("pitcher_id")))
+    ungraded = [p for p in before_picks if isinstance(p, dict) and not p.get("graded")]
 
     graded = grade_finished_games()
-
     after_results = load_json(RESULT_LOG, [])
+    if not isinstance(after_results, list):
+        after_results = []
     try:
         st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(after_results))
     except Exception:
         pass
-    return {
+    core = {}
+    try:
+        core = dict(st.session_state.get("grading_last_core_diag") or {})
+    except Exception:
+        core = {}
+    out = {
         "graded": graded,
         "saved_snapshots": total_saved,
         "ungraded_before": len(ungraded),
@@ -12619,7 +12872,11 @@ def grade_finished_games_with_diagnostics():
         "pick_log_path": PICK_LOG,
         "result_log_path": RESULT_LOG,
         "learning_lab_rows": len(after_results),
+        "version": GRADING_SAVE_SPEED_FIX_VERSION,
     }
+    out.update(core)
+    return out
+
 
 
 # =========================
@@ -51854,9 +52111,10 @@ def build_projection_health_audit(board=None):
 
 
 def grade_all_markets_with_diagnostics(board=None):
-    """One after-games action that grades K, Pitching Outs, FI pitch count, and ML."""
+    """One after-games action that grades all saved markets without rebuilding projection audits."""
+    started = datetime.now()
     diag = {
-        "version": UNIFIED_ALL_MARKETS_GRADING_VERSION,
+        "version": UNIFIED_ALL_MARKETS_GRADING_VERSION + " + " + GRADING_SAVE_SPEED_FIX_VERSION,
         "K": {},
         "Pitching Outs": {},
         "First Inning Pitch Count": {},
@@ -51864,90 +52122,122 @@ def grade_all_markets_with_diagnostics(board=None):
         "Learning Refresh": {},
     }
 
+    market_started = datetime.now()
     try:
-        diag["K"] = grade_finished_games_with_diagnostics()
+        diag["K"] = _grading_normalize_diag(grade_finished_games_with_diagnostics(), "K")
     except Exception as e:
-        diag["K"] = {"graded": 0, "message": f"K grade failed: {e}"}
+        diag["K"] = {"graded": 0, "status": "ERROR", "message": f"K grade failed: {e}"}
+    diag["K"]["elapsed_seconds"] = round((datetime.now() - market_started).total_seconds(), 2)
 
+    market_started = datetime.now()
     try:
         po_df = _beta_projection_rows(board, "OUTS") if "_beta_projection_rows" in globals() else pd.DataFrame()
         po_actuals = _unified_actuals_from_k_result_log()
         if "grade_pitching_outs_loss_lab" in globals() and isinstance(po_actuals, pd.DataFrame) and not po_actuals.empty:
-            diag["Pitching Outs"] = grade_pitching_outs_loss_lab(po_df, po_actuals)
+            value = grade_pitching_outs_loss_lab(po_df, po_actuals)
         else:
-            diag["Pitching Outs"] = _beta_grade_saved_board(po_df, "OUTS") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "Pitching Outs grader unavailable."}
+            value = _beta_grade_saved_board(po_df, "OUTS") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "Pitching Outs grader unavailable."}
+        diag["Pitching Outs"] = _grading_normalize_diag(value, "Pitching Outs")
     except Exception as e:
-        diag["Pitching Outs"] = {"graded": 0, "message": f"Pitching Outs grade failed: {e}"}
+        diag["Pitching Outs"] = {"graded": 0, "status": "ERROR", "message": f"Pitching Outs grade failed: {e}"}
+    diag["Pitching Outs"]["elapsed_seconds"] = round((datetime.now() - market_started).total_seconds(), 2)
 
+    market_started = datetime.now()
     try:
         fi_df = build_first_inning_pitch_count_board(board) if "build_first_inning_pitch_count_board" in globals() else pd.DataFrame()
-        diag["First Inning Pitch Count"] = _beta_grade_saved_board(fi_df, "FI_PITCHES") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "FI grader unavailable."}
+        value = _beta_grade_saved_board(fi_df, "FI_PITCHES") if "_beta_grade_saved_board" in globals() else {"graded": 0, "message": "FI grader unavailable."}
+        diag["First Inning Pitch Count"] = _grading_normalize_diag(value, "First Inning Pitch Count")
     except Exception as e:
-        diag["First Inning Pitch Count"] = {"graded": 0, "message": f"FI pitch count grade failed: {e}"}
+        diag["First Inning Pitch Count"] = {"graded": 0, "status": "ERROR", "message": f"FI pitch count grade failed: {e}"}
+    diag["First Inning Pitch Count"]["elapsed_seconds"] = round((datetime.now() - market_started).total_seconds(), 2)
 
+    market_started = datetime.now()
     try:
-        diag["Moneyline"] = _ow_grade_moneyline_saved() if "_ow_grade_moneyline_saved" in globals() else {"graded": 0, "reason": "moneyline_grader_unavailable"}
+        value = _ow_grade_moneyline_saved() if "_ow_grade_moneyline_saved" in globals() else {"graded": 0, "reason": "moneyline_grader_unavailable"}
+        diag["Moneyline"] = _grading_normalize_diag(value, "Moneyline")
     except Exception as e:
-        diag["Moneyline"] = {"graded": 0, "message": f"Moneyline grade failed: {e}"}
+        diag["Moneyline"] = {"graded": 0, "status": "ERROR", "message": f"Moneyline grade failed: {e}"}
+    diag["Moneyline"]["elapsed_seconds"] = round((datetime.now() - market_started).total_seconds(), 2)
 
     try:
         results = load_json(RESULT_LOG, [])
+        if not isinstance(results, list):
+            results = []
         if "build_k_v72_learning_profiles" in globals():
             build_k_v72_learning_profiles(results=results, save=True)
         if "sync_graded_history_csv_from_result_log" in globals():
-            sync_graded_history_csv_from_result_log()
+            csv_ok = bool(sync_graded_history_csv_from_result_log())
+        else:
+            csv_ok = False
         if "rebuild_manager_pull_learning_from_results_v11_21" in globals():
             rebuild_manager_pull_learning_from_results_v11_21(results=results, merge_existing=True)
         try:
             st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(results))
         except Exception:
             pass
-        diag["Learning Refresh"] = {"status": "OK", "result_log_rows": len(results)}
+        diag["Learning Refresh"] = {"status": "OK", "result_log_rows": len(results), "graded_history_csv_saved": csv_ok}
     except Exception as e:
         diag["Learning Refresh"] = {"status": "ERROR", "message": str(e)[:160]}
 
+    # Projection Health is intentionally not rebuilt inside the save action.
+    # The separate button in the tab runs it on demand, preventing a successful
+    # grading save from appearing frozen while projection boards rebuild.
+    diag["Projection Health"] = []
+    diag["Projection Health Status"] = "DEFERRED_TO_ON_DEMAND_BUTTON"
+    diag["elapsed_seconds"] = round((datetime.now() - started).total_seconds(), 2)
     try:
-        diag["Projection Health"] = build_projection_health_audit(board).to_dict("records")
-    except Exception as e:
-        diag["Projection Health"] = [{"Area": "Projection Health", "Status": "ERROR", "Holding Back": str(e)[:140], "Best Fix": "Open board diagnostics."}]
+        st.session_state["last_all_markets_grading_diag"] = diag
+    except Exception:
+        pass
     return diag
+
 
 
 with tab5:
     st.markdown('<div class="section-title-pro">After Games — Grade + Learn</div>', unsafe_allow_html=True)
+    st.caption("Grading is isolated from projection math. MLB actuals are fetched once per unique game and grading logs are verified after save.")
     if st.button("✅ AFTER GAMES — Grade ALL Markets + Update Learning", use_container_width=True):
-        diag = grade_all_markets_with_diagnostics(board)
-        k_graded = int((diag.get("K") or {}).get("graded", 0) or 0)
-        po_graded = int((diag.get("Pitching Outs") or {}).get("graded", 0) or 0)
-        fi_graded = int((diag.get("First Inning Pitch Count") or {}).get("graded", 0) or 0)
-        ml_graded = int((diag.get("Moneyline") or {}).get("graded", 0) or 0)
+        with st.spinner("Grading saved official boards and verifying the result files..."):
+            diag = grade_all_markets_with_diagnostics(board)
+        st.session_state["last_all_markets_grading_diag"] = diag
+
+    diag = st.session_state.get("last_all_markets_grading_diag")
+    if isinstance(diag, dict):
+        k_graded = int((_grading_normalize_diag(diag.get("K"), "K").get("graded", 0)) or 0)
+        po_graded = int((_grading_normalize_diag(diag.get("Pitching Outs"), "Pitching Outs").get("graded", 0)) or 0)
+        fi_graded = int((_grading_normalize_diag(diag.get("First Inning Pitch Count"), "First Inning Pitch Count").get("graded", 0)) or 0)
+        ml_graded = int((_grading_normalize_diag(diag.get("Moneyline"), "Moneyline").get("graded", 0)) or 0)
         graded = k_graded + po_graded + fi_graded + ml_graded
-
-        if graded > 0:
-            st.success(f"✅ After-game grading complete: K {k_graded} | PO {po_graded} | FI {fi_graded} | ML {ml_graded}. Learning refreshed.")
+        kdiag = _grading_normalize_diag(diag.get("K"), "K")
+        result_ok = bool((kdiag.get("result_log_save") or {}).get("ok", True))
+        pick_ok = bool((kdiag.get("pick_log_save") or {}).get("ok", True))
+        if graded > 0 and result_ok and pick_ok:
+            st.success(f"✅ Grading saved: K {k_graded} | PO {po_graded} | FI {fi_graded} | ML {ml_graded}.")
+        elif not result_ok or not pick_ok:
+            st.error("❌ Grading found results but could not verify both K grading log saves. Open Details below.")
         else:
-            st.warning("⚠️ After-game grading ran, but graded 0 rows. Check saved boards, finals, or actual IP/result availability.")
-
-        st.write({
-            "K": diag.get("K"),
-            "Pitching Outs": diag.get("Pitching Outs"),
-            "First Inning Pitch Count": diag.get("First Inning Pitch Count"),
-            "Moneyline": diag.get("Moneyline"),
-            "Learning Refresh": diag.get("Learning Refresh"),
-            "Version": diag.get("version"),
-        })
-        if diag.get("Projection Health"):
-            st.markdown('<div class="section-title-pro">Projection Health — What Is Holding It Back</div>', unsafe_allow_html=True)
-            st.dataframe(pd.DataFrame(diag.get("Projection Health")), use_container_width=True, hide_index=True)
-        st.caption(f"K PICK_LOG: {(diag.get('K') or {}).get('pick_log_path', PICK_LOG)}")
-        st.caption(f"K RESULT_LOG: {(diag.get('K') or {}).get('result_log_path', RESULT_LOG)}")
+            st.warning("⚠️ No new rows were graded. The table below explains whether games were pending, snapshots were already graded, or IDs/results were missing.")
+        st.dataframe(_grading_diag_table(diag), use_container_width=True, hide_index=True)
+        st.caption(f"Total grading time: {safe_float(diag.get('elapsed_seconds'), 0):.2f}s | K unique games checked: {kdiag.get('unique_games_checked', '—')}")
+        with st.expander("Grading save/fetch details", expanded=False):
+            st.json(diag)
+        st.caption(f"K PICK_LOG: {kdiag.get('pick_log_path', PICK_LOG)}")
+        st.caption(f"K RESULT_LOG: {kdiag.get('result_log_path', RESULT_LOG)}")
 
     with st.expander("Projection Health Audit — current slate", expanded=False):
-        st.caption("Audit only. This does not change copy/paste slate output; it shows what data is still limiting K, PO, and ML confidence.")
-        try:
-            st.dataframe(build_projection_health_audit(board), use_container_width=True, hide_index=True)
-        except Exception as _health_e:
-            st.warning(f"Projection health audit failed: {_health_e}")
+        st.caption("Run only when needed. It is separated from grading so a successful save does not look frozen while projection diagnostics rebuild.")
+        if st.button("Run Projection Health Audit", key="run_projection_health_after_grading"):
+            with st.spinner("Building projection health audit..."):
+                try:
+                    st.session_state["grading_projection_health"] = build_projection_health_audit(board)
+                    st.session_state.pop("grading_projection_health_error", None)
+                except Exception as _health_e:
+                    st.session_state["grading_projection_health_error"] = str(_health_e)
+        if st.session_state.get("grading_projection_health_error"):
+            st.warning(f"Projection health audit failed: {st.session_state.get('grading_projection_health_error')}")
+        health_df = st.session_state.get("grading_projection_health")
+        if isinstance(health_df, pd.DataFrame) and not health_df.empty:
+            st.dataframe(health_df, use_container_width=True, hide_index=True)
 
     st.markdown('<div class="section-title-pro">Manual Actual Results Import — Secure Fallback</div>', unsafe_allow_html=True)
     st.caption("Use this if automatic MLB grading returns 0 or if you want to verify outcomes manually. Save the official snapshot before games, then after games paste/upload actual results and grade.")
