@@ -42758,8 +42758,10 @@ DATA_PACK_FILE_MAP = {
     "confirmed_lineups_daily_template.csv": "confirmed_lineups_daily.csv",
     "savant_pitcher_stats.csv": "savant_pitcher_stats.csv",
     "savant_pitcher_stats_template.csv": "savant_pitcher_stats.csv",
+    "savant_pitcher_stats.last_good.csv": "savant_pitcher_stats.last_good.csv",
     "pitch_mix_matchups.csv": "pitch_mix_matchups.csv",
     "pitch_mix_matchups_template.csv": "pitch_mix_matchups.csv",
+    "pitch_mix_matchups.last_good.csv": "pitch_mix_matchups.last_good.csv",
     "savant_pitch_level_heatmap_foul.csv": "savant_pitch_level_heatmap_foul.csv",
     "savant_pitch_level_heatmap_foul_template.csv": "savant_pitch_level_heatmap_foul.csv",
     "foul_workload_savant.csv": "foul_workload_savant.csv",
@@ -42769,9 +42771,26 @@ DATA_PACK_FILE_MAP = {
     "Batter_template.csv": "Batter.csv",
     "batter_profiles.csv": "Batter.csv",
     "batter_profiles (1).csv": "Batter.csv",
+    "savant_batter_profiles.csv": "savant_batter_profiles.csv",
+    "savant_batter_profiles.last_good.csv": "savant_batter_profiles.last_good.csv",
+    "savant_batter_platoon_2026.csv": "savant_batter_platoon_2026.csv",
+    "savant_batter_platoon_2026.last_good.csv": "savant_batter_platoon_2026.last_good.csv",
+    "savant_refresh_manifest.json": "savant_refresh_manifest.json",
+    "savant_aux_refresh_manifest.json": "savant_aux_refresh_manifest.json",
     "graded_history.csv": "graded_history.csv",
     "graded_history_template.csv": "graded_history.csv",
 }
+
+
+def _data_pack_resolve_target_name(original_name):
+    """Resolve canonical data-pack names, including browser duplicate suffixes like (1)/(4)/(7)."""
+    name = str(original_name or "").split("/")[-1].strip()
+    target = DATA_PACK_FILE_MAP.get(name)
+    if target:
+        return target
+    # Keep exact-name behavior first, then safely normalize only a trailing browser duplicate suffix.
+    normalized = re.sub(r"\s*\(\d+\)(?=\.(?:csv|json)$)", "", name, flags=re.IGNORECASE)
+    return DATA_PACK_FILE_MAP.get(normalized)
 
 
 def _hadb_num(value, default=np.nan):
@@ -42855,11 +42874,56 @@ def _data_pack_install(uploaded_files):
         return status
     for up in uploaded_files:
         original_name = str(getattr(up, "name", "") or "").split("/")[-1]
-        target_name = DATA_PACK_FILE_MAP.get(original_name)
+        target_name = _data_pack_resolve_target_name(original_name)
         if not target_name:
             status.append({"File": original_name, "Saved As": "", "Rows": 0, "Status": "SKIPPED", "Note": "not one of the starter data-pack files"})
             continue
+
+        # The Savant refresh manifests are JSON, not CSV. Accept/save them without
+        # changing any PO projection math.
+        if str(target_name).lower().endswith(".json"):
+            try:
+                raw = up.getvalue() if hasattr(up, "getvalue") else up.read()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or not payload:
+                    raise ValueError("manifest must contain a non-empty JSON object")
+            except Exception as e:
+                status.append({"File": original_name, "Saved As": target_name, "Rows": 0, "Status": "ERROR", "Note": str(e)[:140]})
+                continue
+
+            saved = []
+            for d in _data_pack_target_dirs():
+                try:
+                    d.mkdir(parents=True, exist_ok=True)
+                    out_path = d / target_name
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, indent=2)
+                    saved.append(str(out_path))
+                except Exception:
+                    continue
+
+            row_count = payload.get("row_count", 0)
+            if not row_count and isinstance(payload.get("datasets"), dict):
+                row_count = sum(
+                    int((v or {}).get("row_count", 0) or 0)
+                    for v in payload.get("datasets", {}).values()
+                    if isinstance(v, dict)
+                )
+            status.append({
+                "File": original_name,
+                "Saved As": target_name,
+                "Rows": int(row_count or 0),
+                "Status": "INSTALLED" if saved else "NOT_SAVED",
+                "Note": "; ".join(saved[:3]) if saved else "no writable learning_data target",
+            })
+            continue
+
         try:
+            # UploadedFile may have been inspected above in a prior rerun; rewind when possible.
+            if hasattr(up, "seek"):
+                up.seek(0)
             df = pd.read_csv(up)
         except Exception as e:
             status.append({"File": original_name, "Saved As": target_name, "Rows": 0, "Status": "ERROR", "Note": str(e)[:140]})
@@ -42888,16 +42952,16 @@ def _data_pack_install(uploaded_files):
 
 def render_data_pack_installer_panel():
     st.markdown('<div class="section-title-pro">Starter Data Pack Installer</div>', unsafe_allow_html=True)
-    st.caption("Upload the filled CSVs here. Header-only templates are rejected so they cannot hurt projections. Installed files are support-first unless the app finds clean matching rows.")
-    with st.expander("Upload filled starter CSVs", expanded=False):
-        st.write("Accepted: Pitch.csv, Batter.csv, confirmed_lineups_daily.csv, savant_pitcher_stats.csv, pitch_mix_matchups.csv, savant_pitch_level_heatmap_foul.csv, foul_workload_savant.csv, graded_history.csv. Template filenames are accepted only after they contain real rows.")
+    st.caption("Upload the filled CSV/JSON data files here. Header-only templates are rejected so they cannot hurt projections. This installer change does not alter PO projection math.")
+    with st.expander("Upload filled starter CSV/JSON files", expanded=False):
+        st.write("Accepted: the existing PO starter files plus savant_batter_profiles.csv, savant_batter_platoon_2026.csv, current/LAST_GOOD Savant cache CSVs, both Savant refresh manifest JSON files, and graded_history.csv. Browser duplicate suffixes like (1), (4), and (7) are accepted and saved under canonical names.")
         ups = st.file_uploader(
-            "Upload filled data-pack CSVs",
-            type=["csv"],
+            "Upload filled data-pack CSV/JSON files",
+            type=["csv", "json"],
             accept_multiple_files=True,
             key="starter_data_pack_uploads",
         )
-        if st.button("Install uploaded CSVs", key="starter_data_pack_install_btn"):
+        if st.button("Install uploaded data files", key="starter_data_pack_install_btn"):
             result = _data_pack_install(ups)
             if result:
                 st.dataframe(pd.DataFrame(result), use_container_width=True, hide_index=True)
