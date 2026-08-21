@@ -52398,13 +52398,16 @@ def _kclean_copy_paste_slate(df, include_thin=False):
 
 def _kclean_card_decision(row):
     proj, line = _kclean_final_proj_line(row)
-    side = _kclean_side_label(row)
+    authoritative = str(_kclean_pick(row, ["UB Final Decision", "Final Authoritative Decision"], "") or "").upper()
+    side = authoritative if authoritative in {"OVER", "UNDER", "PASS"} else _kclean_side_label(row)
     edge = round(float(proj - line), 2) if np.isfinite(proj) and np.isfinite(line) else _kclean_final_edge(row, np.nan)
     probability_key = "P(OVER Today's Line)" if side == "OVER" else "P(UNDER Today's Line)"
-    prob = _kclean_num(_kclean_pick(row, [probability_key, "Final Decision Confidence %", "K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
+    prob = _kclean_num(_kclean_pick(row, ["UB Final Probability %", probability_key, "Final Decision Confidence %", "K Sim Current Side Prob %", "K Sim True Prob %", "Sim Side %"], ""), np.nan)
     if np.isfinite(prob) and prob <= 1:
         prob *= 100.0
-    if side not in {"OVER", "UNDER"}:
+    if side == "PASS":
+        tier = "PASS"
+    elif side not in {"OVER", "UNDER"}:
         tier = "NO LINE"
     elif np.isfinite(prob) and prob >= 70.0:
         tier = "HIGH"
@@ -52414,7 +52417,7 @@ def _kclean_card_decision(row):
         tier = "LEAN"
     else:
         tier = "CAUTION"
-    return side if side in {"OVER", "UNDER"} else "NO LINE", edge, prob, tier
+    return side if side in {"OVER", "UNDER", "PASS"} else "NO LINE", edge, prob, tier
 
 
 def _kcard_split_matchup(matchup):
@@ -53075,7 +53078,13 @@ def _v2610_refresh_savant_worker(platoon_service, aux_service, player_ids):
 
 
 def _v269_start_savant_refresh_if_needed(board=None):
-    """Launch one non-blocking data refresh; cards immediately use LAST_GOOD."""
+    """Use LAST_GOOD immediately, then refresh current Savant on a timed cadence.
+
+    V1.12 removes the old once-per-session latch. A healthy installed cache is a
+    startup/fallback source, not a permanent freeze. When the real Savant helper
+    modules are deployed, this launches one controlled online refresh at most once
+    per configured interval. Failed refreshes never replace LAST_GOOD.
+    """
     try:
         service = _v269_savant_service()
         aux_service = _v2610_savant_aux_service()
@@ -53086,22 +53095,70 @@ def _v269_start_savant_refresh_if_needed(board=None):
         cached_ids = set(cached.get("mlbam_id", pd.Series(dtype=str)).astype(str)) if not cached.empty else set()
         unresolved = [player_id for player_id in player_ids if player_id not in cached_ids]
         all_aux_current = bool(aux_health) and all(item.get("status") == "CURRENT" for item in aux_health.values())
-        if st.session_state.get("v269_savant_refresh_started"):
-            return {**health, "aux_status": "CURRENT" if all_aux_current else "REFRESH_PENDING", "targeted_missing": len(unresolved)}
-        if health.get("status") == "CURRENT" and all_aux_current and not unresolved:
-            return {**health, "aux_status": "CURRENT", "targeted_missing": 0}
-        st.session_state["v269_savant_refresh_started"] = True
+
+        now_ts = datetime.now().timestamp()
+        interval_minutes = float(globals().get("UB_CONFIG", {}).get("v112_savant_refresh_minutes", 30))
+        interval_seconds = max(300.0, interval_minutes * 60.0)
+        last_started = float(st.session_state.get("v269_savant_refresh_started_at", 0.0) or 0.0)
+        worker_alive = bool(st.session_state.get("v269_savant_refresh_inflight", False))
+
+        # Determine freshness from manifest timestamp where possible. Even CURRENT
+        # data refreshes again after the cadence, so an installed seed never freezes.
+        last_success = health.get("last_success_at")
+        success_age_seconds = None
+        if last_success:
+            try:
+                stamp = datetime.fromisoformat(str(last_success).replace("Z", "+00:00"))
+                now_dt = datetime.now(stamp.tzinfo) if stamp.tzinfo else datetime.now()
+                success_age_seconds = max(0.0, (now_dt - stamp).total_seconds())
+            except Exception:
+                success_age_seconds = None
+
+        due_by_time = success_age_seconds is None or success_age_seconds >= interval_seconds
+        due = bool(
+            unresolved
+            or health.get("status") not in {"CURRENT"}
+            or not all_aux_current
+            or due_by_time
+        )
+
+        if worker_alive and (now_ts - last_started) < max(120.0, interval_seconds):
+            return {**health, "aux_status": "REFRESH_PENDING", "targeted_missing": len(unresolved), "refresh_due": due}
+        if not due:
+            return {**health, "aux_status": "CURRENT", "targeted_missing": 0, "refresh_due": False}
+        if (now_ts - last_started) < interval_seconds and not unresolved and health.get("status") == "CURRENT":
+            return {**health, "aux_status": "CURRENT" if all_aux_current else "REFRESH_PENDING", "targeted_missing": len(unresolved), "refresh_due": True}
+
+        st.session_state["v269_savant_refresh_started_at"] = now_ts
+        st.session_state["v269_savant_refresh_inflight"] = True
         import threading
-        threading.Thread(
-            target=_v2610_refresh_savant_worker,
-            args=(service, aux_service, player_ids),
-            daemon=True,
-        ).start()
+
+        def _worker():
+            try:
+                _v2610_refresh_savant_worker(service, aux_service, player_ids)
+                try:
+                    _v269_load_savant_platoon.clear()
+                except Exception:
+                    pass
+                # New Savant data is a projection input. Clear Beta runtime cache so
+                # the next rerun cannot reuse a stale pre-refresh Challenger board.
+                try:
+                    if "UB_RUNTIME_CACHE" in globals():
+                        UB_RUNTIME_CACHE.clear()
+                except Exception:
+                    pass
+            finally:
+                # Streamlit session_state writes from worker threads are not always
+                # safe/available. The timestamp still rate-limits future launches.
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
         return {
             **health,
             "background_refresh": "STARTED",
             "aux_status": "CURRENT" if all_aux_current else "REFRESH_PENDING",
             "targeted_missing": len(unresolved),
+            "refresh_due": True,
         }
     except Exception as exc:
         return {"status": "FAILED", "error": str(exc)[:180]}
@@ -53610,8 +53667,8 @@ def _kclean_render_player_cards(df, board=None, limit=None):
         .kc-prow{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.kc-label{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#929db0;font-weight:900}
         .kc-proj{font-size:42px;line-height:.95;color:#ff2f73;font-weight:950;text-shadow:0 0 18px rgba(255,47,115,.2)}.kc-side{text-align:right;font-size:22px;font-weight:950}.kc-side.over{color:#31f063}.kc-side.under{color:#ffd84a}.kc-side.track{color:#b8b2c4}
         .kc-edge{font-size:12px;color:#e9e0ff;margin-top:6px}.kc-bar{height:5px;background:#231f31;border-radius:999px;overflow:hidden;margin-top:10px}.kc-fill{height:100%;background:linear-gradient(90deg,#2fa7ff,#9b39ff,#ffd43b)}
-        .kc-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:10px 0}.kc-stat{background:rgba(12,14,25,.84);border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:8px;min-width:0;min-height:58px;overflow:hidden}.kc-stat b{display:block;font-size:14px;white-space:normal;overflow-wrap:anywhere;word-break:break-word;line-height:1.12}.kc-stat span{display:block;font-size:9px;color:#a99fb8;font-weight:900;text-transform:uppercase;margin-bottom:4px;line-height:1.1}
-        .kc-section{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.22);border-radius:12px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#f4ecff;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#ffd34e;font-size:11px}
+        .kc-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:10px 0}.kc-stat{background:rgba(12,14,25,.84);border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:9px;min-width:0;min-height:68px;height:auto;overflow:visible}.kc-stat b{display:block;font-size:14px;white-space:normal;overflow-wrap:anywhere;word-break:normal;line-height:1.18}.kc-stat b small{display:block;font-size:10px;color:#c9bdd8;font-weight:750;line-height:1.28;margin-top:3px}.kc-stat span{display:block;font-size:9px;color:#a99fb8;font-weight:900;text-transform:uppercase;margin-bottom:4px;line-height:1.1}
+        .kc-final{background:linear-gradient(135deg,rgba(104,34,147,.28),rgba(13,17,31,.96));border:1px solid rgba(255,211,74,.38);border-radius:12px;padding:10px 11px;margin-top:10px}.kc-final-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.kc-final-title{font-size:10px;color:#a99fb8;font-weight:950;letter-spacing:.08em;text-transform:uppercase}.kc-final-pick{font-size:18px;font-weight:950}.kc-final-pick.over{color:#31f063}.kc-final-pick.under{color:#ffd84a}.kc-final-pick.pass{color:#ff8a8a}.kc-final-meta{font-size:10px;color:#cfc5dc;margin-top:5px;line-height:1.3}.kc-section{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.22);border-radius:12px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#f4ecff;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#ffd34e;font-size:11px}
         .kc-lineup,.kc-arsenal{width:100%;border-collapse:collapse;font-size:12px}.kc-lineup th,.kc-arsenal th{color:#a99fb8;text-align:left;font-size:10px;text-transform:uppercase;padding:6px;border-bottom:1px solid #2b233b}.kc-lineup td,.kc-arsenal td{padding:6px;border-bottom:1px solid #1f1a2b;white-space:nowrap}.kc-lineup td:nth-child(2),.kc-arsenal td:first-child{white-space:normal;font-weight:850}.kc-lineup .hi,.kc-arsenal .hi{color:#35f071}.kc-lineup .lo,.kc-arsenal .lo{color:#ffd34e}.kc-empty{color:#b8adc8;font-size:12px;line-height:1.4}
         .kc-arsenal-top{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:9px}.kc-arsenal-box{background:rgba(19,17,30,.88);border:1px solid rgba(255,213,74,.18);border-radius:10px;padding:8px;min-width:0;overflow:hidden}.kc-arsenal-box span{display:block;font-size:9px;color:#a99fb8;text-transform:uppercase;font-weight:900}.kc-arsenal-box b{display:block;font-size:16px;margin-top:3px;color:#f9f5ff;line-height:1.12;overflow-wrap:anywhere}.kc-arsenal-box small{font-size:11px;color:#d9c2ff}.kc-arsenal-box.gold b{color:#ffd34e}.kc-arsenal-box.purp b{color:#d06bff}.kc-bars{height:88px;display:flex;align-items:flex-end;gap:7px;border-bottom:1px solid rgba(255,255,255,.32);padding-top:5px}.kc-barcol{flex:1;min-width:18px;border-radius:7px 7px 2px 2px;display:flex;align-items:flex-start;justify-content:center;color:#fff;font-size:11px;font-weight:950;padding-top:4px}.kc-barcol.hit{background:linear-gradient(180deg,#36f06d,#107d32)}.kc-barcol.miss{background:linear-gradient(180deg,#ff5a75,#8b1d2e)}
         .kc-note,.kc-data-note,.kc-data-gate,.kc-verdict,.kc-card-note,.kcard-note{display:none!important;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;font-size:0!important;line-height:0!important}.good{color:#42e878}.warn{color:#ffc247}.bad{color:#ff6b6b}
@@ -53753,6 +53810,23 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 ),
                 1,
             )
+            # V1.12 mobile-safe OPP K% stack: never clip L10/L5/Savant/order.
+            _savant_simple = _kclean_fmt(savant_shadow.get("simple_savant_lineup_k_pct"), 1)
+            _savant_order = _kclean_fmt(savant_shadow.get("order_weighted_savant_k_pct"), 1)
+            _opp_lines = []
+            if opp_k != "—": _opp_lines.append(f"Exposure {opp_k}%")
+            if opp_l10 != "—": _opp_lines.append(f"L10 {opp_l10}%")
+            if opp_l5 != "—": _opp_lines.append(f"L5 {opp_l5}%")
+            if _savant_simple != "—": _opp_lines.append(f"Savant {_savant_simple}%")
+            if _savant_order != "—": _opp_lines.append(f"Order {_savant_order}%")
+            opp_k_context = "<br><small>" + "<br>".join(_opp_lines) + "</small>" if _opp_lines else "—"
+            try:
+                _sav_health = _v269_savant_service().health()
+                _sav_status = str(_sav_health.get("status") or "UNKNOWN").upper()
+                _sav_source = "LAST GOOD" if str(_sav_health.get("fallback_status") or "").upper() == "LAST_GOOD" else "LIVE/CACHE"
+            except Exception:
+                _sav_status, _sav_source = "UNKNOWN", "CACHE"
+            savant_compact_status = f"SAVANT {savant_shadow.get('matched',0)}/9 · {_sav_status} · {_sav_source}"
             order_conf_card = _kclean_fmt((lineup_rows[0].get("Expected Order Confidence Overall") if lineup_rows else None), 0)
             high_bats = sum(1 for r in lineup_rows if _kclean_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan) >= 25)
             low_bats = sum(1 for r in lineup_rows if _kclean_num(r.get("Used K%") if r.get("Used K%") is not None else r.get("K% Used"), np.nan) <= 16)
@@ -53847,13 +53921,24 @@ def _kclean_render_player_cards(df, board=None, limit=None):
                 _brain_verdict = html.escape(str(row.get("Sports Brain Verdict") or "MIXED"))
                 _brain_support = html.escape(str(row.get("Brain Main Support") or "No strong independent support.")[:700])
                 _brain_risk = html.escape(str(row.get("Brain Main Risk") or "No major structural risk detected.")[:700])
+                _final_pick_raw = str(row.get("UB Final Decision") or row.get("Undefeated Beta Side") or "PASS").upper()
+                _final_pick = html.escape(_final_pick_raw)
+                _final_prob = _kclean_fmt(row.get("UB Final Probability %") if row.get("UB Final Probability %") is not None else row.get("UB Calibrated Clear Probability %"), 0)
+                _final_support = html.escape(str(row.get("UB Final Support State") or _ub_play))
+                _final_reason = html.escape(str(row.get("UB Final Decision Reason") or row.get("Undefeated Beta Decision Reason") or "")[:500])
+                _kp25 = _kclean_fmt(row.get("UB K P25"), 1)
+                _kp40 = _kclean_fmt(row.get("UB K P40"), 1)
+                _kp50 = _kclean_fmt(row.get("UB K P50"), 1)
+                _kp60 = _kclean_fmt(row.get("UB K P60"), 1)
+                _kp75 = _kclean_fmt(row.get("UB K P75"), 1)
+                _pover = _kclean_fmt(row.get("UB P(Over Line) %"), 0)
+                _punder = _kclean_fmt(row.get("UB P(Under Line) %"), 0)
+                _final_class = "over" if _final_pick_raw == "OVER" else "under" if _final_pick_raw == "UNDER" else "pass"
+                _final_line_text = f"{_final_pick} {line} Ks" if _final_pick_raw in {"OVER","UNDER"} else "PASS"
                 ub_summary_html = f"""
-                <div class="kc-section">
-                  <div class="kc-section-title"><span>🏆 Undefeated Beta + Sports Brain</span><span class="kc-chip">{_best_tier} tier · {_best_score}/100</span></div>
-                  <div class="kc-auditgrid">
-                    <div><span>Beta read</span><b>{html.escape(str(row.get("Undefeated Beta Side") or "PASS"))} · {_ub_play}</b></div>
-                    <div><span>Brain</span><b>{_brain_verdict} · {_brain_score}/100</b></div>
-                  </div>
+                <div class="kc-final">
+                  <div class="kc-final-top"><div><div class="kc-final-title">Final decision</div><div class="kc-final-pick {_final_class}">{_final_line_text}</div></div><span class="kc-chip">{_final_prob}% · {_final_support}</span></div>
+                  <div class="kc-final-meta">Brain {_brain_score}/100 · {_brain_verdict}<br>{_final_reason}<br>K dist P25/P40/P50/P60/P75: {_kp25} / {_kp40} / {_kp50} / {_kp60} / {_kp75} · O {_pover}% / U {_punder}%</div>
                 </div>
                 """
                 ub_details_html = f"""
@@ -53917,7 +54002,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
             <div class="kcard">
               <div class="kc-top">
                 {logo_html}
-                <div><div class="kc-name">{pitcher}</div><div class="kc-sub">{team or '—'} vs {opp or '—'} · {matchup} · {hand}<br>{source}</div></div>
+                <div><div class="kc-name">{pitcher}</div><div class="kc-sub">{team or '—'} vs {opp or '—'} · {matchup} · {hand}</div></div>
                 <div class="kc-badge">{html.escape(tier)} {prob_txt}</div>
               </div>
               <div class="kc-main">
@@ -53951,7 +54036,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
               <details class="kc-details">
                 <summary>Batter-by-Batter</summary><div class="kc-detail-body">
                 <div class="kc-section-title"><span>Batter-by-batter K matchup</span><span class="kc-chip">{lineup_display} · exposure K {avg_lineup_k} · BF {_kclean_fmt(_card_expected_bf, 1)} · order {order_conf_card}% · high-K {high_bats} · low-K {low_bats}</span></div>
-                <div class="kc-mini-note">{savant_shadow_note}</div>
+                <div class="kc-mini-note">{html.escape(savant_compact_status)} · raw simple {_savant_simple}% · raw order {_savant_order}%</div>
                 {lineup_table}
                 </div>
               </details>
@@ -62184,8 +62269,8 @@ if render_batter_fs_tab is None:
 # Shadow challenger layered on the protected Merge V2.6.10 canonical control.
 # This block never mutates the Merge control table/board in place.
 # =============================================================================
-UNDEFEATED_BETA_VERSION = "UNDEFEATED_BETA_V1_11_FALSE_UNDER_GUARD_2026_08_19"
-SPORTS_ANALYSIS_BRAIN_VERSION = "SPORTS_ANALYSIS_BRAIN_V1_11_FALSE_UNDER_GUARD_2026_08_19"
+UNDEFEATED_BETA_VERSION = "CHALLENGER_V1_12_LOSS_ONLY_UI_SAVANT_2026_08_20"
+SPORTS_ANALYSIS_BRAIN_VERSION = "SPORTS_ANALYSIS_BRAIN_V1_12_FINAL_DECISION_SYNC_2026_08_20"
 UNDEFEATED_BETA_MODE = "ACTIVE_CHALLENGER_V1_11_FALSE_UNDER_GUARD_PRESERVE_WINS"
 UB_BASELINE_CONTROL_VERSION = "MERGE_V2_6_10_PROTECTED_CONTROL"
 UB_DATA_DIR = os.path.join(STORAGE_DIR, "learning_data")
@@ -62383,6 +62468,33 @@ UB_CONFIG = {
     "persistent_direction_min_history": 4,
     "persistent_direction_same_side_share": 0.80,
 }
+
+# ---------------------------------------------------------------------------
+# V1.12 LOSS-ONLY REPAIR / DECISION-SYNC CONFIG
+# ---------------------------------------------------------------------------
+# These are decision-layer safeguards. Biological K remains logged untouched.
+# The goal is to preserve proven control wins when Challenger only barely crosses
+# a line, while still allowing large, well-supported role/workload corrections.
+UB_CONFIG.update({
+    "v112_thin_cross_edge_k": 0.18,
+    "v112_control_under_margin_k": 0.30,
+    "v112_structural_role_edge_k": 0.55,
+    "v112_structural_role_delta_k": 1.25,
+    "v112_control_restore_buffer_k": 0.06,
+    "v112_control_preserve_prob_cap": 0.62,
+    "v112_low35_watch_score": 3,
+    "v112_low35_veto_score": 5,
+    "v112_low35_min_over_tail": 0.24,
+    "v112_low35_cross_buffer_k": 0.06,
+    "v112_low35_max_move_k": 0.82,
+    "v112_low35_prob_cap": 0.62,
+    "v112_final_min_side_prob": 0.50,
+    "v112_final_support_prob": 0.52,
+    "v112_final_brain_support": 52.0,
+    "v112_final_hard_data_floor": 40.0,
+    "v112_final_pass_prob": 0.57,
+    "v112_savant_refresh_minutes": 30,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -66297,6 +66409,350 @@ def _ub_build_row(row, p):
     return out
 
 
+# ---------------------------------------------------------------------------
+# V1.12 LOSS-ONLY REPAIR: thin-cross preserve + 3.5 tail + final-decision sync
+# ---------------------------------------------------------------------------
+_ub_build_row_v111_active = _ub_build_row
+
+
+def _ub_v112_structural_role_exception(out):
+    """Allow a large, well-supported role/workload correction to beat control.
+
+    This is the Seymour-type *structure*, not a player rule. The exception requires
+    a decisive edge/delta plus starter authority; a tiny line crossing never qualifies.
+    """
+    out = out or {}
+    line = _ub_num(out.get("Line"), None)
+    proj = _ub_num(out.get("Undefeated Beta Projection"), None)
+    merge = _ub_num(out.get("Merge Control Projection"), None)
+    if None in (line, proj, merge):
+        return False
+    edge = abs(float(proj) - float(line))
+    delta = abs(float(proj) - float(merge))
+    role = str(out.get("UB Role") or "").upper()
+    starter_auth = bool(out.get("UB Recent Starter Authority")) or role in {"FULL_STARTER", "NORMAL_STARTER", "BULK"}
+    return bool(
+        edge >= float(UB_CONFIG["v112_structural_role_edge_k"])
+        and delta >= float(UB_CONFIG["v112_structural_role_delta_k"])
+        and starter_auth
+    )
+
+
+def _ub_v112_control_preserve_profile(out):
+    """Preserve a strong Merge UNDER when Challenger only barely crosses OVER."""
+    out = out or {}
+    line = _ub_num(out.get("Line"), None)
+    proj = _ub_num(out.get("Undefeated Beta Projection"), None)
+    merge = _ub_num(out.get("Merge Control Projection"), None)
+    side = str(out.get("Undefeated Beta Side") or "").upper()
+    merge_side = str(out.get("Merge Control Side") or "").upper()
+    if None in (line, proj, merge) or side != "OVER" or merge_side != "UNDER":
+        return {"active": False, "reason": "NOT_APPLICABLE"}
+    edge = float(proj) - float(line)
+    control_margin = float(line) - float(merge)
+    structural = _ub_v112_structural_role_exception(out)
+    active = bool(
+        not structural
+        and 0.0 < edge <= float(UB_CONFIG["v112_thin_cross_edge_k"])
+        and control_margin >= float(UB_CONFIG["v112_control_under_margin_k"])
+    )
+    return {
+        "active": active,
+        "edge": edge,
+        "control_margin": control_margin,
+        "structural_exception": structural,
+        "reason": f"thin cross +{edge:.2f} K; Merge UNDER cushion {control_margin:.2f} K; structural exception={structural}",
+    }
+
+
+def _ub_v112_low35_profile(out, p=None):
+    """Dedicated 3.5-line 4+ K tail audit.
+
+    The mean alone cannot certify a 3.5 UNDER: four strikeouts beat it. This combines
+    exact-line tail probability with existing historical breakout, workload, ceiling,
+    pitcher-skill and recent-threshold evidence. No player names/outcomes are encoded.
+    """
+    out = out or {}; p = p or {}
+    line = _ub_num(out.get("Line"), None)
+    proj = _ub_num(out.get("Undefeated Beta Projection"), None)
+    side = str(out.get("Undefeated Beta Side") or "").upper()
+    if line is None or proj is None or abs(float(line) - 3.5) > 1e-9 or side != "UNDER":
+        return {"status": "NOT_APPLICABLE", "score": 0, "p4plus": None, "reasons": []}
+
+    hist = p.get("k_history_context_v256") if isinstance(p.get("k_history_context_v256"), dict) else {}
+    hist_std = _ub_num(hist.get("k_standard_deviation"), None)
+    p4plus = _ub_v110_probability_for_projection(float(proj), 3.5, "OVER", hist_std)
+    l5 = float(_ub_num(out.get("UB Low-Line L5 Over %"), 0.0) or 0.0) / 100.0
+    l10 = float(_ub_num(out.get("UB Low-Line L10 Over %"), 0.0) or 0.0) / 100.0
+    skill = float(_ub_num(out.get("UB Skill K/BF"), LEAGUE_AVG_K) or LEAGUE_AVG_K)
+    matchup = float(_ub_num(out.get("UB Matchup K/BF"), LEAGUE_AVG_K) or LEAGUE_AVG_K)
+    bf50 = float(_ub_num(out.get("UB BF P50"), 0.0) or 0.0)
+    under_ceiling = str(out.get("UB Under Ceiling Status") or "CLEAR").upper()
+    workload_escape = float(_ub_num(out.get("UB Workload Escape Score"), 0.0) or 0.0)
+    hist_breakout = bool(out.get("UB Hist 3.5 Breakout Under Risk"))
+    recent_avg = max(float(_ub_num(out.get("UB Low-Line L5 Avg K"), 0.0) or 0.0), float(_ub_num(out.get("UB Low-Line L10 Avg K"), 0.0) or 0.0))
+
+    score = 0; reasons = []
+    if hist_breakout:
+        score += 2; reasons.append("HIST_3_5_BREAKOUT_RISK")
+    if p4plus >= 0.30:
+        score += 1; reasons.append(f"P4PLUS_{p4plus:.0%}")
+    if max(l5, l10) >= 0.50:
+        score += 1; reasons.append("RECENT_4PLUS_RATE")
+    if recent_avg >= 3.5:
+        score += 1; reasons.append("RECENT_K_CENTER_AT_LINE")
+    if under_ceiling in {"WATCH", "VETO"}:
+        score += 1; reasons.append("UNDER_CEILING_RISK")
+    if workload_escape >= 55:
+        score += 1; reasons.append("WORKLOAD_ESCAPE")
+    if skill >= 0.20:
+        score += 1; reasons.append("PITCHER_SKILL_FLOOR")
+    if matchup >= 0.20:
+        score += 1; reasons.append("MATCHUP_K_FLOOR")
+    if bf50 >= 19.0:
+        score += 1; reasons.append("ENOUGH_BF_FOR_4K")
+
+    anchors = [skill * bf50, matchup * bf50]
+    if recent_avg > 0:
+        anchors.append(recent_avg)
+    anchor = float(np.median([x for x in anchors if np.isfinite(x)])) if anchors else float(proj)
+    veto = bool(score >= int(UB_CONFIG["v112_low35_veto_score"]) and p4plus >= float(UB_CONFIG["v112_low35_min_over_tail"]))
+    watch = bool(score >= int(UB_CONFIG["v112_low35_watch_score"]))
+    status = "VETO_UNDER" if veto else "WATCH_UNDER" if watch else "CLEAR_UNDER"
+    return {"status": status, "score": score, "p4plus": p4plus, "anchor": anchor, "reasons": reasons}
+
+
+def _ub_v112_recompute_side_probability(out, p=None):
+    out = out or {}; p = p or {}
+    line = _ub_num(out.get("Line"), None)
+    proj = _ub_num(out.get("Undefeated Beta Projection"), None)
+    if line is None or proj is None:
+        return out
+    side = "OVER" if float(proj) > float(line) else "UNDER" if float(proj) < float(line) else "UNDER"
+    hist = p.get("k_history_context_v256") if isinstance(p.get("k_history_context_v256"), dict) else {}
+    hist_std = _ub_num(hist.get("k_standard_deviation"), None)
+    prob = _ub_v110_probability_for_projection(float(proj), float(line), side, hist_std)
+    out["Undefeated Beta Side"] = side
+    out["Undefeated Beta Edge"] = round(float(proj) - float(line), 2)
+    out["UB Calibrated Clear Probability %"] = round(float(clamp(prob, 0.01, 0.99)) * 100.0, 1)
+    out["UB Side Math Check"] = True
+    out["UB Edge Math Check"] = True
+    return out
+
+
+def _ub_v112_k_distribution_profile(out, p=None):
+    """Decision-layer K distribution around the final Challenger center.
+
+    This does not alter biological K. It exposes sportsbook-threshold probabilities
+    and K quantiles so thin lines are judged by the distribution, not only the mean.
+    """
+    out = out or {}; p = p or {}
+    line = _ub_num(out.get("Line"), None)
+    proj = _ub_num(out.get("Undefeated Beta Projection"), None)
+    if line is None or proj is None:
+        return out
+    hist = p.get("k_history_context_v256") if isinstance(p.get("k_history_context_v256"), dict) else {}
+    hist_std = _ub_num(hist.get("k_standard_deviation"), None)
+    dist = _v265_exact_line_distribution(float(proj), float(line), history_std=hist_std)
+    sigma = float(_ub_num(dist.get("sigma"), max(1.05, math.sqrt(max(0.35, float(proj))))) or 1.05)
+    # Standard-normal quantiles for 25/40/50/60/75%.
+    z = {25:-0.67448975, 40:-0.25334710, 50:0.0, 60:0.25334710, 75:0.67448975}
+    for q, zv in z.items():
+        out[f"UB K P{q}"] = round(max(0.0, float(proj) + zv * sigma), 2)
+    po = _ub_num(dist.get("over_probability"), None)
+    pu = _ub_num(dist.get("under_probability"), None)
+    out["UB P(Over Line) %"] = None if po is None else round(float(po) * 100.0, 1)
+    out["UB P(Under Line) %"] = None if pu is None else round(float(pu) * 100.0, 1)
+    required = int(math.floor(float(line)) + 1)
+    ladder = dist.get("ladder") if isinstance(dist.get("ladder"), dict) else {}
+    req_prob = _ub_num(ladder.get(f"P({required}+ K)"), po)
+    out["UB Required Over K"] = required
+    out["UB P(Required+ K) %"] = None if req_prob is None else round(float(req_prob) * 100.0, 1)
+    out["UB Distribution Sigma"] = round(sigma, 3)
+    out["UB Distribution Status"] = str(dist.get("status") or "READY")
+    return out
+
+
+def _ub_v112_final_decision(out, p=None, row=None):
+    """Create one authoritative OVER / UNDER / PASS used by UI/export/grading."""
+    out = out or {}; p = p or {}; row = row or {}
+    side = str(out.get("Undefeated Beta Side") or "").upper()
+    line = _ub_num(out.get("Line"), None)
+    prob = float(_ub_num(out.get("UB Calibrated Clear Probability %"), 50.0) or 50.0)
+    edge = abs(float(_ub_num(out.get("Undefeated Beta Edge"), 0.0) or 0.0))
+    data_q = float(_ub_num(out.get("UB Data Quality"), 60.0) or 60.0)
+    brain_score = float(_ub_num(out.get("Sports Brain Score"), 50.0) or 50.0)
+    workload_conf = str(out.get("UB Workload Confidence") or "UNKNOWN").upper()
+    role = str(out.get("UB Role") or "UNKNOWN").upper()
+    hard = []
+
+    if line is None or side not in {"OVER", "UNDER"}:
+        hard.append("NO_VALID_LINE_OR_SIDE")
+    if data_q < float(UB_CONFIG["v112_final_hard_data_floor"]):
+        hard.append("DATA_QUALITY_TOO_LOW")
+    if prob < float(UB_CONFIG["v112_final_min_side_prob"]) * 100.0:
+        hard.append("SIDE_CONFIDENCE_MISMATCH")
+    if role in {"UNKNOWN", "ROLE_UNCERTAIN"} and workload_conf == "LOW" and prob < 60.0:
+        hard.append("ROLE_WORKLOAD_UNRESOLVED")
+    if str(out.get("UB Model Disagreement Status") or "") == "STRONG_DISAGREEMENT" and prob < float(UB_CONFIG["v112_final_pass_prob"]) * 100.0:
+        hard.append("STRONG_MODEL_DISAGREEMENT")
+    if side == "OVER" and str(out.get("UB OVER Floor Survival") or "") == "VETO" and edge < 0.60 and prob < 62.0:
+        hard.append("OVER_WORKLOAD_FLOOR_VETO")
+    p75k = _ub_num(out.get("UB Under Ceiling P75 K"), None)
+    if side == "UNDER" and str(out.get("UB Under Ceiling Status") or "") == "VETO" and p75k is not None and line is not None and float(p75k) > float(line) and prob < 62.0:
+        hard.append("DEEP_START_UNDER_RISK")
+    # Brain score is a strength score, not an automatic PASS switch. Only a weak
+    # brain + weak probability pair can create a genuine support PASS.
+    if brain_score < 46.0 and prob < 54.0:
+        hard.append("INSUFFICIENT_INDEPENDENT_SUPPORT")
+
+    final = "PASS" if hard else side
+    support = "PASS" if final == "PASS" else "SUPPORTED" if (prob >= 55.0 and brain_score >= 55.0) else "LEAN_SUPPORTED"
+    coherence = bool(final == "PASS" or (side == final and prob >= 50.0))
+    reason = "; ".join(hard) if hard else f"{side} supported by final projection/probability; Brain strength {brain_score:.0f}/100"
+
+    out["UB Final Decision"] = final
+    out["UB Final Side"] = final if final in {"OVER", "UNDER"} else side
+    out["UB Final Probability %"] = round(prob, 1)
+    out["UB Final Support State"] = support
+    out["UB Final Decision Reason"] = reason
+    out["UB Side Confidence Coherence"] = coherence
+    out["UB Side Confidence Mismatch"] = bool(not coherence)
+    out["Sports Brain Direction"] = side if side in {"OVER", "UNDER"} else "PASS"
+    out["Sports Brain Decision"] = final
+
+    old_play = str(out.get("Undefeated Beta Playability") or "TRACK")
+    if final == "PASS":
+        out["Undefeated Beta Playability"] = "PASS"
+        out["Undefeated Beta Decision State"] = "PASS"
+        out["Best Play Tier"] = "PASS"
+        out["Sports Brain Side"] = "PASS"
+        out["Sports Brain Verdict"] = "PASS"
+    else:
+        # A previous PASS caused only by ranking/tier mechanics must not hide an
+        # otherwise coherent side. Promote display state to TRACK/LEAN, not a bet.
+        if old_play == "PASS":
+            out["Undefeated Beta Playability"] = "LEAN" if (prob >= 55.0 and brain_score >= 55.0) else "TRACK"
+        out["Undefeated Beta Decision State"] = f"{out.get('Undefeated Beta Playability')}_{final}"
+        out["Sports Brain Side"] = final
+        out["Sports Brain Verdict"] = "SUPPORTED" if brain_score >= 55.0 else "MIXED SUPPORT"
+        if str(out.get("Best Play Tier") or "PASS") == "PASS" and brain_score >= 55.0 and prob >= 55.0:
+            out["Best Play Tier"] = "B"
+    return out
+
+
+def _ub_build_row(row, p):
+    """V1.12 final wrapper. Keeps V1.11 biology and targets loss patterns only."""
+    out = _ub_build_row_v111_active(row, p)
+    if not out:
+        return out
+    line = _ub_num(out.get("Line"), None)
+    if line is None:
+        out["UB Final Decision"] = "PASS"
+        out["UB Final Decision Reason"] = "NO_VALID_LINE"
+        out["Undefeated Beta Version"] = UNDEFEATED_BETA_VERSION
+        return out
+
+    before = float(_ub_num(out.get("Undefeated Beta Projection"), 0.0) or 0.0)
+    reasons = []
+
+    # 1) Preserve proven control UNDERs when the Challenger crossing is tiny.
+    preserve = _ub_v112_control_preserve_profile(out)
+    if preserve.get("active"):
+        merge = float(_ub_num(out.get("Merge Control Projection"), before) or before)
+        restore = min(float(line) - float(UB_CONFIG["v112_control_restore_buffer_k"]), (0.70 * before + 0.30 * merge))
+        if restore < float(line):
+            out["Undefeated Beta Projection"] = round(float(restore), 2)
+            reasons.append("V1.12_THIN_LINE_CROSS_CONTROL_UNDER_PRESERVED")
+
+    _ub_v112_recompute_side_probability(out, p)
+
+    # 2) Dedicated 3.5 UNDER tail engine. This is evaluated after preserve so a
+    # genuinely dangerous 4+ K tail can still override a control UNDER.
+    low35 = _ub_v112_low35_profile(out, p)
+    out["UB 3.5 Tail Status"] = low35.get("status")
+    out["UB 3.5 Tail Score"] = low35.get("score")
+    out["UB 3.5 P(4+ K) %"] = None if low35.get("p4plus") is None else round(float(low35.get("p4plus")) * 100.0, 1)
+    out["UB 3.5 Tail Reasons"] = "; ".join(low35.get("reasons") or []) or "NONE"
+    if low35.get("status") == "VETO_UNDER":
+        current = float(_ub_num(out.get("Undefeated Beta Projection"), before) or before)
+        anchor = float(_ub_num(low35.get("anchor"), current) or current)
+        target = max(current, min(anchor, float(line) + 0.18))
+        target = max(target, float(line) + float(UB_CONFIG["v112_low35_cross_buffer_k"]))
+        move = min(float(UB_CONFIG["v112_low35_max_move_k"]), max(0.0, target - current))
+        if move > 0.01:
+            out["Undefeated Beta Projection"] = round(current + move, 2)
+            reasons.append("V1.12_3_5_FOUR_PLUS_TAIL_RESCUE")
+            _ub_v112_recompute_side_probability(out, p)
+            # Tail rescue is evidence-driven but still line-aware, so cap staking confidence.
+            out["UB Calibrated Clear Probability %"] = min(float(_ub_num(out.get("UB Calibrated Clear Probability %"), 50.0) or 50.0), float(UB_CONFIG["v112_low35_prob_cap"]) * 100.0)
+
+    # Record decision-only movement separately from biological projection.
+    final_proj = float(_ub_num(out.get("Undefeated Beta Projection"), before) or before)
+    if reasons:
+        prior = [x for x in str(out.get("UB Decision Resolver Reasons") or "NONE").split("; ") if x and x != "NONE"]
+        out["UB Decision Resolver Reasons"] = "; ".join(dict.fromkeys(prior + reasons))
+        out["UB Decision Resolver Applied"] = True
+        out["UB Final Resolver Uses Sportsbook Line"] = True
+        out["UB No Sportsbook Leakage"] = False
+        out["UB V1.12 Resolver Adjustment K"] = round(final_proj - before, 3)
+        bio = float(_ub_num(out.get("UB Biological Projection"), final_proj) or final_proj)
+        out["UB Decision Resolver Adjustment K"] = round(final_proj - bio, 3)
+        caps = [x for x in str(out.get("UB Confidence Cap Reason") or "NONE").split("; ") if x and x != "NONE"]
+        if "V1.12_THIN_LINE_CROSS_CONTROL_UNDER_PRESERVED" in reasons:
+            caps.append("V1.12_CONTROL_WIN_PRESERVE")
+            out["UB Calibrated Clear Probability %"] = min(float(out.get("UB Calibrated Clear Probability %") or 50.0), float(UB_CONFIG["v112_control_preserve_prob_cap"]) * 100.0)
+        if "V1.12_3_5_FOUR_PLUS_TAIL_RESCUE" in reasons:
+            caps.append("V1.12_3_5_TAIL_RESCUE")
+        out["UB Confidence Cap Reason"] = "; ".join(dict.fromkeys(caps)) or "NONE"
+    else:
+        out["UB V1.12 Resolver Adjustment K"] = 0.0
+
+    out["UB V1.12 Control Preserve Active"] = bool(preserve.get("active"))
+    out["UB V1.12 Control Preserve Reason"] = preserve.get("reason")
+    out["UB V1.12 Structural Role Exception"] = bool(preserve.get("structural_exception"))
+
+    # Rebuild Sports Brain from the final V1.12 side, then create one authoritative
+    # final decision used everywhere else.
+    try:
+        out.update(_brain_profile(p or {}, row or {}, out))
+    except Exception:
+        pass
+    out = _ub_v112_k_distribution_profile(out, p=p)
+    out = _ub_v112_final_decision(out, p=p, row=row)
+    out["Undefeated Beta Version"] = UNDEFEATED_BETA_VERSION
+    out["Sports Brain Version"] = SPORTS_ANALYSIS_BRAIN_VERSION
+    out["UB Pregame Feature Persistence"] = "COMPLETE_V1_12_LOSS_ONLY_UI_SAVANT"
+    return out
+
+
+def _ub_v112_self_test_report():
+    cases = []
+    def add(name, ok, detail=""):
+        cases.append({"test": name, "pass": bool(ok), "detail": detail})
+
+    # Thin 4.5 cross with meaningful Merge UNDER cushion -> preserve.
+    a = {"Line":4.5,"Undefeated Beta Projection":4.60,"Undefeated Beta Side":"OVER","Merge Control Projection":3.88,"Merge Control Side":"UNDER","UB Role":"FULL_STARTER","UB Recent Starter Authority":True}
+    ap = _ub_v112_control_preserve_profile(a)
+    add("thin 4.5 OVER crossing preserves control UNDER", ap.get("active") is True, str(ap))
+
+    # Large role correction stays free.
+    b = {"Line":5.5,"Undefeated Beta Projection":7.44,"Undefeated Beta Side":"OVER","Merge Control Projection":2.76,"Merge Control Side":"UNDER","UB Role":"FULL_STARTER","UB Recent Starter Authority":True}
+    bp = _ub_v112_control_preserve_profile(b)
+    add("large structural role correction not blocked", bp.get("active") is False and bp.get("structural_exception") is True, str(bp))
+
+    # 3.5 dangerous tail profile can veto the UNDER without player hard-coding.
+    c = {"Line":3.5,"Undefeated Beta Projection":2.90,"Undefeated Beta Side":"UNDER","UB Hist 3.5 Breakout Under Risk":True,"UB Low-Line L5 Over %":60,"UB Low-Line L10 Over %":60,"UB Low-Line L5 Avg K":4.0,"UB BF P50":21.0,"UB Skill K/BF":0.22,"UB Matchup K/BF":0.21,"UB Under Ceiling Status":"WATCH","UB Workload Escape Score":60}
+    cp = _ub_v112_low35_profile(c,{})
+    add("3.5 four-plus tail veto detected", cp.get("status") == "VETO_UNDER", str(cp))
+
+    # High-line UNDER is not touched by low-3.5 engine.
+    d = dict(c); d["Line"] = 6.5
+    dp = _ub_v112_low35_profile(d,{})
+    add("high-line UNDER not touched by 3.5 engine", dp.get("status") == "NOT_APPLICABLE", str(dp))
+    return pd.DataFrame(cases)
+
+
 def _ub_v111_self_test_report():
     """Synthetic regression checks; no real pitcher/team/outcome names are encoded."""
     cases = []
@@ -66436,7 +66892,21 @@ def _ub_beta_signal_signature(board):
             str(p.get("probable_role") or p.get("pitcher_role") or p.get("role") or ""),
             tuple(game_sig), tuple(summary_sig),
         ))
-    return tuple(rows)
+    # V1.12: include the active/last-good Savant file timestamps in the cache key.
+    # A successful online refresh therefore invalidates stale Challenger rows.
+    savant_sig = []
+    try:
+        root = Path(__file__).resolve().parent / "learning_data"
+        for name in (
+            f"savant_batter_platoon_{datetime.now().year}.csv",
+            f"savant_batter_platoon_{datetime.now().year}.last_good.csv",
+            "savant_batter_profiles.csv", "savant_pitcher_stats.csv", "pitch_mix_matchups.csv",
+        ):
+            path = root / name
+            savant_sig.append((name, round(path.stat().st_mtime, 3), path.stat().st_size) if path.exists() else (name, 0.0, 0))
+    except Exception:
+        savant_sig = []
+    return tuple(rows) + (("__SAVANT_FINGERPRINT__", tuple(savant_sig)),)
 
 
 
@@ -66515,10 +66985,12 @@ def _ub_apply_beta_to_k_frame(base_df, beta_df):
             continue
         proj = ub.get("Undefeated Beta Projection")
         line = ub.get("Line")
-        side = ub.get("Undefeated Beta Side")
+        raw_side = ub.get("Undefeated Beta Side")
+        final_decision = str(ub.get("UB Final Decision") or raw_side or "PASS").upper()
+        side = final_decision if final_decision in {"OVER", "UNDER"} else raw_side
         play = ub.get("Undefeated Beta Playability")
-        prob = ub.get("UB Calibrated Clear Probability %")
-        state = f"PLAY_{side}" if play == "OFFICIAL_PLAY" else f"TRACK_{side}" if play in {"LEAN", "TRACK"} else f"PASS_{side}" if side in {"OVER", "UNDER"} else "NO_LINE"
+        prob = ub.get("UB Final Probability %") if ub.get("UB Final Probability %") is not None else ub.get("UB Calibrated Clear Probability %")
+        state = f"PLAY_{side}" if final_decision in {"OVER", "UNDER"} and play == "OFFICIAL_PLAY" else f"TRACK_{side}" if final_decision in {"OVER", "UNDER"} else "PASS"
         for col in ["Canonical Final K Projection", "K PROJ", "Official K PROJ", "Final K Projection"]:
             _ub_overlay_set(idx, col, proj)
         _ub_overlay_set(idx, "Canonical Line", line)
@@ -66538,7 +67010,7 @@ def _ub_apply_beta_to_k_frame(base_df, beta_df):
         _ub_overlay_set(idx, "IP Floor", final_ip)
         _ub_overlay_set(idx, "IP PROJ", final_ip)
         _ub_overlay_set(idx, "Projected IP", final_ip)
-        _ub_overlay_set(idx, "Winning File K Source", "UNDEFEATED BETA · K UPSIDE INTEGRATED")
+        _ub_overlay_set(idx, "Winning File K Source", "CHALLENGER V1.12")
         for key, value in ub.items():
             _ub_overlay_set(idx, key, value)
     return out
@@ -66565,10 +67037,10 @@ def build_undefeated_beta_copy_paste(beta_df, best_only=False):
     for matchup, group in d.groupby("Matchup", sort=False):
         lines.append(str(matchup))
         for _, row in group.sort_values("Best Play Score", ascending=False).iterrows():
-            side = row.get("Undefeated Beta Side")
+            side = row.get("UB Final Decision") or row.get("Undefeated Beta Side")
             line = row.get("Line")
             proj = row.get("Undefeated Beta Projection")
-            prob = row.get("UB Calibrated Clear Probability %")
+            prob = row.get("UB Final Probability %") if row.get("UB Final Probability %") is not None else row.get("UB Calibrated Clear Probability %")
             tier = row.get("Best Play Tier")
             play = row.get("Undefeated Beta Playability")
             lines.append(f"• {row.get('Pitcher')} — {side} {line} — {proj:.2f} K — {prob:.0f}% — {tier} TIER — {play}")
@@ -66728,7 +67200,7 @@ def grade_saved_undefeated_beta():
         if not actual or actual.get("Actual K") is None:
             continue
         line = _ub_num(row.get("Line"), None)
-        beta_side = str(row.get("Undefeated Beta Side") or "").upper()
+        beta_side = str(row.get("UB Final Decision") or row.get("Undefeated Beta Side") or "").upper()
         merge_side = str(row.get("Merge Control Side") or "").upper()
         beta_result = _ub_grade_side(beta_side, line, actual.get("Actual K"))
         merge_result = _ub_grade_side(merge_side, line, actual.get("Actual K"))
@@ -66743,13 +67215,24 @@ def grade_saved_undefeated_beta():
         projected_kbf = _ub_num(row.get("UB Matchup K/BF"), None)
         bf_error = None if actual_bf is None or expected_bf is None else actual_bf - expected_bf
         kbf_error = None if actual_kbf is None or projected_kbf is None else actual_kbf - projected_kbf
-        if bf_error is not None and abs(bf_error) >= 3.5 and kbf_error is not None and abs(kbf_error) >= 0.035:
+        edge_abs = abs(_ub_num(row.get("Undefeated Beta Edge"), 0.0) or 0.0)
+        low35_loss = bool(beta_result == "LOSS" and beta_side == "UNDER" and line is not None and abs(float(line) - 3.5) < 1e-9)
+        bad_control_flip = bool(beta_result == "LOSS" and merge_result == "WIN" and beta_side in {"OVER","UNDER"} and merge_side in {"OVER","UNDER"} and beta_side != merge_side)
+        if bad_control_flip:
+            miss_class = "BAD_CONTROL_FLIP"
+        elif low35_loss:
+            miss_class = "LOW_3_5_TAIL_MISS"
+        elif bf_error is not None and abs(bf_error) >= 3.5 and kbf_error is not None and abs(kbf_error) >= 0.035:
             miss_class = "BOTH_WORKLOAD_AND_K_CONVERSION"
-        elif bf_error is not None and abs(bf_error) >= 3.5:
-            miss_class = "WORKLOAD_MISS"
-        elif kbf_error is not None and abs(kbf_error) >= 0.035:
-            miss_class = "K_CONVERSION_MISS"
-        elif abs(_ub_num(row.get("Undefeated Beta Edge"), 0.0)) < 0.25:
+        elif bf_error is not None and bf_error <= -3.5:
+            miss_class = "WORKLOAD_TOO_HIGH"
+        elif bf_error is not None and bf_error >= 3.5:
+            miss_class = "WORKLOAD_TOO_LOW"
+        elif kbf_error is not None and kbf_error <= -0.035:
+            miss_class = "K_RATE_TOO_HIGH"
+        elif kbf_error is not None and kbf_error >= 0.035:
+            miss_class = "K_RATE_TOO_LOW"
+        elif edge_abs < 0.25:
             miss_class = "THIN_EDGE_OR_VARIANCE"
         else:
             miss_class = "NORMAL_VARIANCE_OR_UNCLASSIFIED"
@@ -67037,7 +67520,7 @@ def render_sports_analysis_brain_tab(board):
     show = show.sort_values("Best Play Score", ascending=False)
     cols = [c for c in [
         "Undefeated Beta Rank", "Pitcher", "Matchup", "Line", "Merge Control Projection", "Merge Control Side", "PO Projection", "PO Line", "PO Same Line", "PO Side Same-Line",
-        "Undefeated Beta Projection", "Undefeated Beta Side", "Undefeated Beta Playability", "UB Calibrated Clear Probability %", "Sports Brain Side", "Sports Brain Score", "Best Play Score", "Best Play Tier",
+        "Undefeated Beta Projection", "Undefeated Beta Side", "UB Final Decision", "UB Final Probability %", "UB Final Support State", "UB Side Confidence Coherence", "UB K P25", "UB K P40", "UB K P50", "UB K P60", "UB K P75", "UB P(Over Line) %", "UB P(Under Line) %", "UB 3.5 Tail Status", "UB 3.5 P(4+ K) %", "Undefeated Beta Playability", "UB Calibrated Clear Probability %", "Sports Brain Side", "Sports Brain Direction", "Sports Brain Decision", "Sports Brain Score", "Best Play Score", "Best Play Tier",
         "UB Conversion Score", "UB Lineup Exposure K%", "UB Suppression Escape Score", "UB False Over Risk", "UB False Under Status", "UB False Under Score", "UB False Under Neutral P50 K", "UB False Under Consensus Anchor K", "UB V1.11 Control Preserve Watch", "UB Recent K Acceleration", "UB Pitch Trend Score", "UB Pitch Capacity BF", "UB Pitch Count Authority Score", "UB Workload Confidence", "UB Role", "UB Regime", "UB Lineup Stage", "UB Data Quality",
         "Brain Main Support", "Brain Main Risk", "Sports Brain Verdict"
     ] if c in show.columns]
