@@ -107338,7 +107338,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 
         .kc-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:10px 0}.kc-stat{background:rgba(12,14,25,.84);border:1px solid rgba(255,255,255,.09);border-radius:10px;padding:9px;min-width:0;min-height:68px;height:auto;overflow:visible}.kc-stat b{display:block;font-size:14px;white-space:normal;overflow-wrap:anywhere;word-break:normal;line-height:1.18}.kc-stat b small{display:block;font-size:10px;color:#c9bdd8;font-weight:750;line-height:1.28;margin-top:3px}.kc-stat span{display:block;font-size:9px;color:#a99fb8;font-weight:900;text-transform:uppercase;margin-bottom:4px;line-height:1.1}
 
-        .kc-final{background:linear-gradient(135deg,rgba(104,34,147,.28),rgba(13,17,31,.96));border:1px solid rgba(255,211,74,.38);border-radius:12px;padding:10px 11px;margin-top:10px}.kc-final-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.kc-final-title{font-size:10px;color:#a99fb8;font-weight:950;letter-spacing:.08em;text-transform:uppercase}.kc-final-pick{font-size:18px;font-weight:950}.kc-final-pick.over{color:#31f063}.kc-final-pick.under{color:#ffd84a}.kc-final-pick.pass{color:#ff8a8a}.kc-final-meta{font-size:10px;color:#cfc5dc;margin-top:5px;line-height:1.3}.kc-section{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.22);border-radius:12px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#f4ecff;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#ffd34e;font-size:11px}
+        .kc-final{background:linear-gradient(135deg,rgba(104,34,147,.28),rgba(13,17,31,.96));border:1px solid rgba(255,211,74,.38);border-radius:12px;padding:10px 11px;margin-top:10px}.kc-final-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.kc-final-title{font-size:10px;color:#a99fb8;font-weight:950;letter-spacing:.08em;text-transform:uppercase}.kc-final-pick{font-size:18px;font-weight:950}.kc-final-pick.over{color:#31f063}.kc-final-pick.under{color:#ffd84a}.kc-final-pick.pass{color:#ff8a8a}.kc-final-meta{font-size:10px;color:#cfc5dc;margin-top:5px;line-height:1.3}.kc-pass-warning{margin-top:7px;padding:7px 8px;border-radius:8px;border:1px solid rgba(255,193,64,.45);background:rgba(255,180,40,.08);color:#ffd778;font-size:10px;font-weight:800;line-height:1.35}.kc-section{background:rgba(10,12,22,.88);border:1px solid rgba(174,78,255,.22);border-radius:12px;padding:10px;margin-top:10px}.kc-section-title{font-size:12px;color:#f4ecff;font-weight:900;margin-bottom:8px;display:flex;justify-content:space-between;gap:10px}.kc-chip{color:#ffd34e;font-size:11px}
 
         .kc-lineup,.kc-arsenal{width:100%;border-collapse:collapse;font-size:12px}.kc-lineup th,.kc-arsenal th{color:#a99fb8;text-align:left;font-size:10px;text-transform:uppercase;padding:6px;border-bottom:1px solid #2b233b}.kc-lineup td,.kc-arsenal td{padding:6px;border-bottom:1px solid #1f1a2b;white-space:nowrap}.kc-lineup td:nth-child(2),.kc-arsenal td:first-child{white-space:normal;font-weight:850}.kc-lineup .hi,.kc-arsenal .hi{color:#35f071}.kc-lineup .lo,.kc-arsenal .lo{color:#ffd34e}.kc-empty{color:#b8adc8;font-size:12px;line-height:1.4}
 
@@ -107396,11 +107396,32 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 
             side, edge, prob, tier = _kclean_card_decision(row)
 
-            side_class = "over" if "OVER" in side else "under" if "UNDER" in side else "track"
+            # UI-ONLY CLARITY: always show the mathematical projection lean on the
+            # card, even when the authoritative play status is PASS.  This does
+            # NOT mutate Canonical Side, UB Final Decision, probability, grading,
+            # exports, or any projection/model math.
+            if np.isfinite(_kclean_num(proj_raw, np.nan)) and np.isfinite(_kclean_num(line_raw, np.nan)):
+                if float(proj_raw) > float(line_raw):
+                    display_lean_raw = "OVER"
+                elif float(proj_raw) < float(line_raw):
+                    display_lean_raw = "UNDER"
+                else:
+                    display_lean_raw = "PUSH"
+            else:
+                _fallback_lean = str(
+                    row.get("UB Final Side")
+                    or row.get("Undefeated Beta Side")
+                    or _kclean_side_label(row)
+                    or "NO LINE"
+                ).upper()
+                display_lean_raw = _fallback_lean if _fallback_lean in {"OVER", "UNDER", "PUSH"} else "NO LINE"
 
-            side_txt = html.escape(str(side or "TRACK"))
+            side_class = "over" if display_lean_raw == "OVER" else "under" if display_lean_raw == "UNDER" else "track"
+            side_txt = html.escape(display_lean_raw)
 
             prob_txt = "—" if not np.isfinite(prob) else f"{prob:.0f}%"
+            play_status_raw = str(side or "NO LINE").upper()
+            badge_label = f"⚠ PASS {prob_txt}" if play_status_raw == "PASS" else f"{tier} {prob_txt}"
 
             prob_width = 0 if not np.isfinite(prob) else max(0, min(100, prob))
 
@@ -107854,6 +107875,12 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 
                 _final_reason = html.escape(str(row.get("UB Final Decision Reason") or row.get("Undefeated Beta Decision Reason") or "")[:500])
 
+                # UI-ONLY: PASS is a playability/risk status, not an opposite side.
+                # Keep the mathematical direction visible so users can distinguish
+                # "OVER lean, PASS" from an UNDER recommendation.
+                _model_lean_raw = display_lean_raw if display_lean_raw in {"OVER", "UNDER"} else str(row.get("UB Final Side") or row.get("Undefeated Beta Side") or "").upper()
+                _model_lean = html.escape(_model_lean_raw if _model_lean_raw in {"OVER", "UNDER"} else "NO LINE")
+
                 _kp25 = _kclean_fmt(row.get("UB K P25"), 1)
 
                 _kp40 = _kclean_fmt(row.get("UB K P40"), 1)
@@ -107868,15 +107895,26 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 
                 _punder = _kclean_fmt(row.get("UB P(Under Line) %"), 0)
 
-                _final_class = "over" if _final_pick_raw == "OVER" else "under" if _final_pick_raw == "UNDER" else "pass"
-
-                _final_line_text = f"{_final_pick} {line} Ks" if _final_pick_raw in {"OVER","UNDER"} else "PASS"
+                if _final_pick_raw == "PASS" and _model_lean_raw in {"OVER", "UNDER"}:
+                    _final_class = "over" if _model_lean_raw == "OVER" else "under"
+                    _final_title_text = "Model lean"
+                    _final_line_text = f"{_model_lean} {line} Ks"
+                    _final_chip_text = f"⚠ PLAY STATUS: PASS · {_final_prob}%"
+                    _pass_warning_html = f'<div class="kc-pass-warning">⚠ Projection supports {_model_lean} {line}, but the risk/support gates did not qualify it as an official play. PASS is a warning, not the opposite side.</div>'
+                else:
+                    _final_class = "over" if _final_pick_raw == "OVER" else "under" if _final_pick_raw == "UNDER" else "pass"
+                    _final_title_text = "Final decision"
+                    _final_line_text = f"{_final_pick} {line} Ks" if _final_pick_raw in {"OVER","UNDER"} else "PASS"
+                    _final_chip_text = f"{_final_prob}% · {_final_support}"
+                    _pass_warning_html = ""
 
                 ub_summary_html = f"""
 
                 <div class="kc-final">
 
-                  <div class="kc-final-top"><div><div class="kc-final-title">Final decision</div><div class="kc-final-pick {_final_class}">{_final_line_text}</div></div><span class="kc-chip">{_final_prob}% · {_final_support}</span></div>
+                  <div class="kc-final-top"><div><div class="kc-final-title">{_final_title_text}</div><div class="kc-final-pick {_final_class}">{_final_line_text}</div></div><span class="kc-chip">{_final_chip_text}</span></div>
+
+                  {_pass_warning_html}
 
                   <div class="kc-final-meta">Brain {_brain_score}/100 · {_brain_verdict}<br>{_final_reason}<br>K dist P25/P40/P50/P60/P75: {_kp25} / {_kp40} / {_kp50} / {_kp60} / {_kp75} · O {_pover}% / U {_punder}%</div>
 
@@ -108008,7 +108046,7 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 
                 <div><div class="kc-name">{pitcher}</div><div class="kc-sub">{team or '—'} vs {opp or '—'} · {matchup} · {hand}</div></div>
 
-                <div class="kc-badge">{html.escape(tier)} {prob_txt}</div>
+                <div class="kc-badge">{html.escape(badge_label)}</div>
 
               </div>
 
@@ -135847,6 +135885,16 @@ def _ub_build_row(row, p):
 
 
 # ---------------------------------------------------------------------------
+# V1.14 UI CLARITY PATCH — DISPLAY ONLY
+# ---------------------------------------------------------------------------
+# K cards show the mathematical OVER/UNDER lean even when final playability is
+# PASS. PASS remains authoritative for playability/grading/exports.
+# NO K projection, probability, workload, side resolver, grading, learning,
+# Savant, refresh, or Moneyline math/gates are changed by this patch.
+# Moneyline remains on the existing full-slate renderer (all available games,
+# including small-edge LEAN/TRACK/PASS rows).
+
+# ---------------------------------------------------------------------------
 # CHALLENGER V1.14 — UNDEFEATED-UNDER PRESERVE + FINAL DECISION SYNC
 # ---------------------------------------------------------------------------
 # Forward-test purpose:
@@ -136126,6 +136174,501 @@ std_schedule_games = globals().get('_impl_std_schedule_games_02', globals().get(
 if std_schedule_games is None:
 
     raise RuntimeError("No implementation available for std_schedule_games")
+
+
+
+# =============================================================================
+# MONEYLINE PHASE 2.2 — SUPPORT OVERLAY / BALLPARK CONTEXT / K+CONTACT CROSS-CHECK
+# 2026-08-22
+#
+# Additive Moneyline-only layer. The proven Phase 2.1 baseball winner is preserved
+# by default. New information can strengthen/downgrade playability and expose a
+# support-adjusted probability, but it does not casually flip the canonical side.
+# K/Challenger projections themselves are never modified here.
+# =============================================================================
+ML_PHASE22_VERSION = "MONEYLINE_PHASE2_2_SUPPORT_OVERLAY_2026_08_22"
+ML_PHASE22_MAX_RUN_RESIDUAL = 0.14
+ML_PHASE22_MAX_PROB_DELTA = 1.50
+
+ML_PHASE22_BALLPARKS = {
+    "ARI": ("Chase Field", "Phoenix, AZ", "Retractable"),
+    "ATH": ("Sutter Health Park", "West Sacramento, CA", "Outdoor"),
+    "ATL": ("Truist Park", "Atlanta, GA", "Outdoor"),
+    "BAL": ("Oriole Park at Camden Yards", "Baltimore, MD", "Outdoor"),
+    "BOS": ("Fenway Park", "Boston, MA", "Outdoor"),
+    "CHC": ("Wrigley Field", "Chicago, IL", "Outdoor"),
+    "CWS": ("Rate Field", "Chicago, IL", "Outdoor"),
+    "CIN": ("Great American Ball Park", "Cincinnati, OH", "Outdoor"),
+    "CLE": ("Progressive Field", "Cleveland, OH", "Outdoor"),
+    "COL": ("Coors Field", "Denver, CO", "Outdoor"),
+    "DET": ("Comerica Park", "Detroit, MI", "Outdoor"),
+    "HOU": ("Daikin Park", "Houston, TX", "Retractable"),
+    "KC": ("Kauffman Stadium", "Kansas City, MO", "Outdoor"),
+    "LAA": ("Angel Stadium", "Anaheim, CA", "Outdoor"),
+    "LAD": ("Dodger Stadium", "Los Angeles, CA", "Outdoor"),
+    "MIA": ("loanDepot park", "Miami, FL", "Retractable"),
+    "MIL": ("American Family Field", "Milwaukee, WI", "Retractable"),
+    "MIN": ("Target Field", "Minneapolis, MN", "Outdoor"),
+    "NYM": ("Citi Field", "Queens, NY", "Outdoor"),
+    "NYY": ("Yankee Stadium", "Bronx, NY", "Outdoor"),
+    "PHI": ("Citizens Bank Park", "Philadelphia, PA", "Outdoor"),
+    "PIT": ("PNC Park", "Pittsburgh, PA", "Outdoor"),
+    "SD": ("Petco Park", "San Diego, CA", "Outdoor"),
+    "SF": ("Oracle Park", "San Francisco, CA", "Outdoor"),
+    "SEA": ("T-Mobile Park", "Seattle, WA", "Retractable"),
+    "STL": ("Busch Stadium", "St. Louis, MO", "Outdoor"),
+    "TB": ("Tropicana Field", "St. Petersburg, FL", "Roof/Indoor"),
+    "TEX": ("Globe Life Field", "Arlington, TX", "Retractable"),
+    "TOR": ("Rogers Centre", "Toronto, ON", "Retractable"),
+    "WSH": ("Nationals Park", "Washington, DC", "Outdoor"),
+}
+
+
+def _ml22_num(v, default=None):
+    try:
+        if v in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        x = float(str(v).replace("%", "").replace(",", "").strip())
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _ml22_first(row, keys, default=None):
+    row = row if isinstance(row, dict) else {}
+    for key in keys:
+        try:
+            v = row.get(key)
+            if v not in (None, "", "—", "-", "nan", "NaN"):
+                return v
+        except Exception:
+            continue
+    return default
+
+
+def _ml22_rate(v, default=None):
+    x = _ml22_num(v, default)
+    if x is None:
+        return None
+    if x > 1.5:
+        x /= 100.0
+    return float(x)
+
+
+def _ml22_clip(v, lo=-1.0, hi=1.0):
+    try:
+        return float(max(lo, min(hi, float(v))))
+    except Exception:
+        return 0.0
+
+
+def _ml22_matchup_index(board):
+    out = {}
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            a, h = ml_sides(p.get("matchup") or p.get("Matchup"))
+            a, h = ml_canonical_abbr(a), ml_canonical_abbr(h)
+            team = ml_canonical_abbr(p.get("team") or p.get("Team") or p.get("Pitcher Team"))
+        except Exception:
+            continue
+        if not a or not h or not team:
+            continue
+        out[(f"{a} @ {h}", team)] = p
+    return out
+
+
+def _ml22_pitcher_cross_profile(p):
+    """Independent support residuals only; does not alter the K model."""
+    p = p if isinstance(p, dict) else {}
+    pieces = []
+    reasons = []
+
+    skill = _ml22_rate(_ml22_first(p, ["UB Skill K/BF", "pitcher_k", "Pitcher K%", "K/BF", "Pitcher K/BF"]), None)
+    whiff = _ml22_rate(_ml22_first(p, ["UB Whiff% Used", "statcast_whiff", "Statcast Whiff%", "Whiff%", "Savant Custom Whiff%"]), None)
+    csw = _ml22_rate(_ml22_first(p, ["UB CSW% Used", "statcast_csw", "Statcast CSW%", "CSW%"]), None)
+    oppk = _ml22_rate(_ml22_first(p, ["UB Lineup Exposure K%", "lineup_k_pct", "opp_k", "Opp K%", "Opponent K%", "Lineup K%"]), None)
+
+    if skill is not None:
+        pieces.append(_ml22_clip((skill - 0.22) / 0.055)); reasons.append(f"K/BF {skill*100:.1f}%")
+    if whiff is not None:
+        pieces.append(_ml22_clip((whiff - 0.25) / 0.060)); reasons.append(f"Whiff {whiff*100:.1f}%")
+    if csw is not None:
+        pieces.append(_ml22_clip((csw - 0.28) / 0.055)); reasons.append(f"CSW {csw*100:.1f}%")
+    if oppk is not None:
+        pieces.append(_ml22_clip((oppk - 0.22) / 0.055)); reasons.append(f"opp K {oppk*100:.1f}%")
+
+    k_signal = float(np.mean(pieces)) if pieces else 0.0
+    k_quality = len(pieces)
+
+    contact_pieces = []
+    contact_reasons = []
+    hard = _ml22_rate(_ml22_first(p, ["hard_hit_pct", "Statcast HardHit%", "Official Savant HardHit%", "Savant Custom HardHit%", "HardHit% Allowed"]), None)
+    barrel = _ml22_rate(_ml22_first(p, ["barrel_pct", "Statcast Barrel%", "Official Savant Barrel%", "Savant Custom Barrel%", "Barrel% Allowed"]), None)
+    xwoba = _ml22_num(_ml22_first(p, ["xwoba", "Statcast xwOBA", "Official Savant xwOBA", "Savant Custom xwOBA"]), None)
+    ev = _ml22_num(_ml22_first(p, ["avg_exit_velocity", "Average Exit Velocity", "Official Savant Avg EV", "Savant Custom Avg EV", "EV Allowed"]), None)
+
+    if hard is not None:
+        contact_pieces.append(_ml22_clip((hard - 0.39) / 0.085)); contact_reasons.append(f"HH {hard*100:.1f}%")
+    if barrel is not None:
+        contact_pieces.append(_ml22_clip((barrel - 0.075) / 0.040)); contact_reasons.append(f"Barrel {barrel*100:.1f}%")
+    if xwoba is not None and 0.15 <= xwoba <= 0.60:
+        contact_pieces.append(_ml22_clip((xwoba - 0.320) / 0.070)); contact_reasons.append(f"xwOBA {xwoba:.3f}")
+    if ev is not None and 75 <= ev <= 100:
+        contact_pieces.append(_ml22_clip((ev - 89.0) / 4.0)); contact_reasons.append(f"EV {ev:.1f}")
+
+    damage_signal = float(np.mean(contact_pieces)) if contact_pieces else 0.0  # + = more hittable
+    contact_quality = len(contact_pieces)
+
+    # Residual is intentionally tiny because FIP/xERA/K-BB already contain some of this signal.
+    run_residual = _ml22_clip((-0.10 * k_signal) + (0.09 * damage_signal), -ML_PHASE22_MAX_RUN_RESIDUAL, ML_PHASE22_MAX_RUN_RESIDUAL)
+    return {
+        "k_signal": round(k_signal, 3), "k_quality": k_quality,
+        "damage_signal": round(damage_signal, 3), "contact_quality": contact_quality,
+        "run_residual": round(run_residual, 3),
+        "k_detail": ", ".join(reasons) if reasons else "no independent K cross-check",
+        "contact_detail": ", ".join(contact_reasons) if contact_reasons else "no contact-quality cross-check",
+    }
+
+
+def _ml22_weather_context(p, venue, roof_hint):
+    p = p if isinstance(p, dict) else {}
+    temp = _ml22_num(_ml22_first(p, ["weather_temp_f", "Temperature", "temp_f"]), None)
+    wind = _ml22_num(_ml22_first(p, ["weather_wind_mph", "Wind MPH", "wind_mph"]), None)
+    humidity = _ml22_num(_ml22_first(p, ["weather_humidity", "Humidity", "humidity"]), None)
+    precip = _ml22_num(_ml22_first(p, ["weather_precip_prob", "Precip %", "precip_prob"]), None)
+    note = str(_ml22_first(p, ["weather_note", "Weather Note"], "") or "")
+    indoor = "INDOOR" in str(roof_hint).upper() or "ROOF/INDOOR" in str(roof_hint).upper()
+    if indoor:
+        label = "Roof/indoor environment"
+    elif temp is None and wind is None:
+        label = "Weather unavailable"
+    else:
+        bits = []
+        if temp is not None: bits.append(f"{temp:.0f}°F")
+        if wind is not None: bits.append(f"wind {wind:.0f} mph")
+        if humidity is not None: bits.append(f"humidity {humidity:.0f}%")
+        if precip is not None and precip >= 20: bits.append(f"rain {precip:.0f}%")
+        label = " · ".join(bits)
+    return {"temp": temp, "wind": wind, "humidity": humidity, "precip": precip, "label": label, "note": note}
+
+
+def _ml22_park_meta(home, row):
+    home = ml_canonical_abbr(home) if "ml_canonical_abbr" in globals() else str(home or "").upper()
+    fallback = ML_PHASE22_BALLPARKS.get(home, ("Unknown venue", "", "Unknown"))
+    venue = str(row.get("Park") or "").strip()
+    if not venue or venue.lower() == "unknown venue":
+        venue = fallback[0]
+    return venue, fallback[1], fallback[2]
+
+
+def _ml22_tier_downgrade(tier, steps=1):
+    order = ["OFFICIAL ML", "PLAYABLE ML", "LEAN / TRACK ML", "MODEL ONLY / TRACK", "PASS ML"]
+    try:
+        idx = order.index(str(tier))
+    except Exception:
+        idx = len(order) - 1
+    return order[min(len(order)-1, idx + max(0, int(steps)))]
+
+
+def _ml22_tier_upgrade_track_only(tier):
+    # Never manufacture an OFFICIAL/PLAYABLE pick from this overlay.
+    if str(tier) == "PASS ML":
+        return "MODEL ONLY / TRACK"
+    return str(tier)
+
+
+def _impl_ml_build_board_21(board):
+    """Phase 2.2: side-preserving support overlay around Phase 2.1."""
+    df = _impl_ml_build_board_20(board)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    idx = _ml22_matchup_index(board)
+    out = df.copy()
+    for ridx, rr in out.iterrows():
+        row = rr.to_dict()
+        matchup = str(row.get("Matchup") or "")
+        try:
+            away, home = [ml_canonical_abbr(x) for x in matchup.split(" @ ", 1)]
+        except Exception:
+            away = home = ""
+        ap = idx.get((matchup, away), {})
+        hp = idx.get((matchup, home), {})
+        aprof = _ml22_pitcher_cross_profile(ap)
+        hprof = _ml22_pitcher_cross_profile(hp)
+
+        canonical_pick = ml_canonical_abbr(row.get("ML Final Pick") or row.get("ML Official Pick") or row.get("Pick"))
+        pick_is_away = canonical_pick == away
+        pick_sp = aprof if pick_is_away else hprof
+        opp_sp = hprof if pick_is_away else aprof
+
+        away_runs = _ml22_num(row.get("ML Card Away Projected Runs"), _ml22_num(row.get("Away Projected Runs"), 4.45)) or 4.45
+        home_runs = _ml22_num(row.get("ML Card Home Projected Runs"), _ml22_num(row.get("Home Projected Runs"), 4.45)) or 4.45
+        # Opposing starter residual affects each offense. This remains diagnostic/support-only.
+        enh_away_runs = float(clamp(away_runs + hprof.get("run_residual", 0.0), 2.0, 7.8))
+        enh_home_runs = float(clamp(home_runs + aprof.get("run_residual", 0.0), 2.0, 7.8))
+        enh_probs = _mlv3_poisson_probs(enh_away_runs, enh_home_runs)
+        enh_pick_prob = enh_probs["away_ml"] if pick_is_away else enh_probs["home_ml"]
+        base_prob = _ml22_num(row.get("ML Card Best Play Prob %"), 50.0) or 50.0
+        prob_delta = float(clamp(enh_pick_prob - base_prob, -ML_PHASE22_MAX_PROB_DELTA, ML_PHASE22_MAX_PROB_DELTA))
+        support_prob = float(clamp(base_prob + prob_delta, 50.0, 65.0))
+
+        offense_gap = (_ml22_num(row.get("Away Offense Center"), 4.45) or 4.45) - (_ml22_num(row.get("Home Offense Center"), 4.45) or 4.45)
+        starter_gap = (_ml22_num(row.get("Away SP Strength"), 50.0) or 50.0) - (_ml22_num(row.get("Home SP Strength"), 50.0) or 50.0)
+        bullpen_gap = (_ml22_num(row.get("Away Bullpen"), 50.0) or 50.0) - (_ml22_num(row.get("Home Bullpen"), 50.0) or 50.0)
+        if not pick_is_away:
+            offense_gap *= -1.0; starter_gap *= -1.0; bullpen_gap *= -1.0
+        k_edge = float(pick_sp.get("k_signal", 0.0) - opp_sp.get("k_signal", 0.0))
+        contact_edge = float(opp_sp.get("damage_signal", 0.0) - pick_sp.get("damage_signal", 0.0))
+
+        score = 0.0
+        families = []
+        def fam(name, val, strong=0.0, weak=0.0, scale=1.0):
+            nonlocal score
+            points = 0.0
+            if val >= strong and strong > 0:
+                points = scale
+            elif val >= weak and weak > 0:
+                points = scale * 0.55
+            elif val <= -strong and strong > 0:
+                points = -scale
+            elif val <= -weak and weak > 0:
+                points = -scale * 0.55
+            score += points
+            state = "PLUS" if points > 0 else "MINUS" if points < 0 else "EVEN"
+            families.append((name, state, round(val, 3), round(points, 1)))
+
+        fam("OFFENSE_VS_HAND", offense_gap, 0.35, 0.18, 18)
+        fam("STARTER", starter_gap, 5.0, 2.5, 16)
+        fam("K_SUPPRESSION", k_edge, 0.35, 0.18, 16)
+        fam("CONTACT", contact_edge, 0.35, 0.18, 14)
+        fam("BULLPEN", bullpen_gap, 5.0, 2.5, 15)
+
+        market_available = bool(row.get("ML Market Available"))
+        market_agrees = bool(row.get("ML Market Agreement"))
+        if market_available:
+            market_points = 12.0 if market_agrees else -12.0
+            score += market_points
+            families.append(("MARKET", "PLUS" if market_points > 0 else "MINUS", 1 if market_agrees else -1, market_points))
+        else:
+            families.append(("MARKET", "NO_DATA", 0, 0.0))
+
+        run_gap = abs(_ml22_num(row.get("Score Edge"), 0.0) or 0.0)
+        if run_gap < 0.30:
+            score -= 8.0
+            families.append(("THIN_RUN_EDGE", "MINUS", run_gap, -8.0))
+
+        score = float(clamp(score, -100.0, 100.0))
+        plus_count = sum(1 for _, state, _, _ in families if state == "PLUS")
+        minus_count = sum(1 for _, state, _, _ in families if state == "MINUS")
+        support_state = "STRONG_SUPPORT" if score >= 35 and plus_count >= 3 else "SUPPORTED" if score >= 15 else "RISK" if score <= -20 else "MIXED"
+
+        tier = str(row.get("ML Official Tier") or "PASS ML")
+        original_tier = tier
+        if score <= -45 or minus_count >= 4:
+            tier = _ml22_tier_downgrade(tier, 2)
+        elif score <= -20 or minus_count >= 3:
+            tier = _ml22_tier_downgrade(tier, 1)
+        elif score >= 38 and plus_count >= 4 and base_prob >= 51.0 and tier == "PASS ML":
+            # Full slate remains visible. Strong multi-family support may promote a raw PASS
+            # only to TRACK, never to an official betting tier.
+            tier = _ml22_tier_upgrade_track_only(tier)
+
+        venue, location, roof_hint = _ml22_park_meta(home, row)
+        weather = _ml22_weather_context(hp or ap, venue, roof_hint)
+        park_factor = _ml22_num(row.get("Park Factor"), 1.0) or 1.0
+        park_label = str(row.get("Park Label") or "NEUTRAL")
+
+        pick_bp_usage = row.get("Away Bullpen Usage") if pick_is_away else row.get("Home Bullpen Usage")
+        opp_bp_usage = row.get("Home Bullpen Usage") if pick_is_away else row.get("Away Bullpen Usage")
+        bp_read = f"{canonical_pick}: {pick_bp_usage or 'UNKNOWN'} | Opp: {opp_bp_usage or 'UNKNOWN'}"
+
+        final_status = "STRONG ML" if tier == "OFFICIAL ML" else "LEAN ML" if tier == "PLAYABLE ML" else "MODEL LEAN" if tier in {"LEAN / TRACK ML", "MODEL ONLY / TRACK"} else "PASS"
+        grade = f"🔥 ML EDGE — {canonical_pick}" if tier == "OFFICIAL ML" else f"✅ ML LEAN — {canonical_pick}" if tier in {"PLAYABLE ML", "LEAN / TRACK ML", "MODEL ONLY / TRACK"} else f"🚫 PASS ML — {canonical_pick}"
+        rating = f"{tier.replace(' ML','')} {base_prob:.0f}%"
+
+        updates = {
+            "ML Official Tier": tier,
+            "Status": final_status,
+            "ML Final Status": final_status,
+            "ML Grade": grade,
+            "ML Card Rating": rating,
+            "ML Phase22 Version": ML_PHASE22_VERSION,
+            "ML Phase22 Original Tier": original_tier,
+            "ML Phase22 Canonical Pick Preserved": True,
+            "ML Support Score": round(score, 1),
+            "ML Support State": support_state,
+            "ML Support Plus Families": plus_count,
+            "ML Support Minus Families": minus_count,
+            "ML Support Adjusted Win %": round(support_prob, 1),
+            "ML Support Probability Delta": round(prob_delta, 2),
+            "ML Enhanced Away Runs": round(enh_away_runs, 2),
+            "ML Enhanced Home Runs": round(enh_home_runs, 2),
+            "ML Enhanced Projected Score": f"{away} {enh_away_runs:.1f} - {home} {enh_home_runs:.1f}",
+            "ML K Suppression Edge": round(k_edge, 3),
+            "ML Contact Quality Edge": round(contact_edge, 3),
+            "ML Offense Vs Hand Edge": round(offense_gap, 3),
+            "ML Starter Edge": round(starter_gap, 2),
+            "ML Bullpen Edge": round(bullpen_gap, 2),
+            "ML Pick Starter K Profile": pick_sp.get("k_detail"),
+            "ML Opp Starter K Profile": opp_sp.get("k_detail"),
+            "ML Pick Starter Contact Profile": pick_sp.get("contact_detail"),
+            "ML Opp Starter Contact Profile": opp_sp.get("contact_detail"),
+            "ML Bullpen Availability Read": bp_read,
+            "Ballpark": venue,
+            "Ballpark Location": location,
+            "Ballpark Roof": roof_hint,
+            "ML Weather Summary": weather.get("label"),
+            "ML Weather Temp F": weather.get("temp"),
+            "ML Weather Wind MPH": weather.get("wind"),
+            "ML Weather Humidity": weather.get("humidity"),
+            "ML Weather Precip %": weather.get("precip"),
+            "ML Park Context": f"PF {park_factor:.2f} · {park_label.replace('_',' ').title()}",
+            "ML Support Families JSON": json.dumps([{"family": n, "state": s, "value": v, "points": pts} for n, s, v, pts in families], default=str),
+        }
+        for key, value in updates.items():
+            out.at[ridx, key] = value
+
+    if not out.empty:
+        order = {"OFFICIAL ML": 0, "PLAYABLE ML": 1, "LEAN / TRACK ML": 2, "MODEL ONLY / TRACK": 3, "PASS ML": 4}
+        out["_ml22_sort"] = out["ML Official Tier"].astype(str).map(lambda x: order.get(x, 9))
+        out["_ml22_prob"] = pd.to_numeric(out["ML Card Best Play Prob %"], errors="coerce").fillna(-999)
+        out = out.sort_values(["_ml22_sort", "_ml22_prob"], ascending=[True, False]).drop(columns=["_ml22_sort", "_ml22_prob"])
+    return out
+
+
+# UI override: keep canonical best play prominent, show ballpark/location in the middle,
+# and expose the new support families without hiding small-edge games.
+def _mlui_row_card(row):
+    row = row.to_dict() if isinstance(row, pd.Series) else dict(row or {})
+    away, home = _mlcard_matchup_teams(row) if "_mlcard_matchup_teams" in globals() else ("AWAY", "HOME")
+    if "ml_canonical_abbr" in globals():
+        away, home = ml_canonical_abbr(away), ml_canonical_abbr(home)
+    away_win = _mlui_float(row.get("ML Card Away Win %") or row.get("Away Model %"), 50.0)
+    home_win = _mlui_float(row.get("ML Card Home Win %") or row.get("Home Model %"), 100.0-away_win)
+    total = max(away_win + home_win, 1.0)
+    away_w = max(4.0, min(96.0, away_win / total * 100.0)); home_w = max(4.0, min(96.0, home_win / total * 100.0))
+    away_runs = row.get("ML Card Away Projected Runs") or row.get("Away Projected Runs") or "—"
+    home_runs = row.get("ML Card Home Projected Runs") or row.get("Home Projected Runs") or "—"
+    best = row.get("ML Card Best Play") or row.get("ML Final Pick") or row.get("Pick") or "—"
+    best_prob = row.get("ML Card Best Play Prob %") or "—"
+    rating = row.get("ML Card Rating") or row.get("ML Official Tier") or row.get("Status") or "TRACK"
+    cover = row.get("ML Card Cover Lean") or "—"; cover_prob = row.get("ML Card Cover Prob %") or "—"
+    total_pick = row.get("ML Card Total Pick") or "—"; total_prob = row.get("ML Card Total Prob %") or "—"
+    away_price = _mlui_price(row.get("ML Card Away Price") or row.get("Away Price")); home_price = _mlui_price(row.get("ML Card Home Price") or row.get("Home Price"))
+    away_sp = row.get("Away SP") or "—"; home_sp = row.get("Home SP") or "—"
+    card_status = row.get("ML Official Tier") or row.get("Status") or "REVIEW"
+    data_note = row.get("ML Missing Data") or row.get("ML Data Note") or ""
+    rating_label = str(rating or "TRACK"); rating_label = rating_label if rating_label.strip().startswith(("⚡","🔥")) else f"⚡ {rating_label}"
+    badge_class = "elite" if "OFFICIAL" in str(card_status).upper() else "high" if "PLAYABLE" in str(card_status).upper() else "medium" if "TRACK" in str(card_status).upper() else "track"
+    away_logo = _visual_team_logo_html(away, "ml-logo-img", "ml-logo-fallback"); home_logo = _visual_team_logo_html(home, "ml-logo-img", "ml-logo-fallback")
+
+    ballpark = row.get("Ballpark") or row.get("Park") or "Unknown venue"
+    location = row.get("Ballpark Location") or ""
+    park_ctx = row.get("ML Park Context") or ""
+    weather = row.get("ML Weather Summary") or "Weather unavailable"
+    support_state = row.get("ML Support State") or "MIXED"
+    support_score = _mlui_float(row.get("ML Support Score"), 0.0)
+    support_prob = row.get("ML Support Adjusted Win %")
+    kedge = _mlui_float(row.get("ML K Suppression Edge"), 0.0)
+    cedge = _mlui_float(row.get("ML Contact Quality Edge"), 0.0)
+    oedge = _mlui_float(row.get("ML Offense Vs Hand Edge"), 0.0)
+    spedge = _mlui_float(row.get("ML Starter Edge"), 0.0)
+    bpedge = _mlui_float(row.get("ML Bullpen Edge"), 0.0)
+    market_state = "AGREE" if bool(row.get("ML Market Available")) and bool(row.get("ML Market Agreement")) else "OPPOSE" if bool(row.get("ML Market Available")) else "NO DATA"
+    def edge_label(x, pos=0.12):
+        return "PLUS" if x >= pos else "MINUS" if x <= -pos else "EVEN"
+    def pill(label, state):
+        cls = "plus" if state == "PLUS" or state == "AGREE" else "minus" if state == "MINUS" or state == "OPPOSE" else "even"
+        return f'<div class="ml-support-pill {cls}"><b>{_mlui_safe(label)}</b><span>{_mlui_safe(state)}</span></div>'
+
+    support_prob_text = _mlui_pct(support_prob) if support_prob not in (None,"", "—") else "—"
+    return f"""
+    <div class="ml-edge-card">
+      <div class="ml-card-top"><div class="ml-game-time">{_mlui_safe(row.get('Start Time') or row.get('Game Time') or '')}</div><div class="ml-rating {badge_class}">{_mlui_safe(rating_label)}</div></div>
+      <div class="ml-teams ml-teams-venue">
+        <div class="ml-team">{away_logo}<div class="ml-team-name">{_mlui_safe(away)}</div><div class="ml-sp">{_mlui_safe(away_sp)}</div></div>
+        <div class="ml-venue-center"><div class="ml-vs">vs</div><strong>{_mlui_safe(ballpark)}</strong><span>{_mlui_safe(location)}</span><small>{_mlui_safe(park_ctx)}</small><em>{_mlui_safe(weather)}</em></div>
+        <div class="ml-team right">{home_logo}<div class="ml-team-name">{_mlui_safe(home)}</div><div class="ml-sp">{_mlui_safe(home_sp)}</div></div>
+      </div>
+      <div class="ml-win-row"><span>{away_win:.0f}%</span><div class="ml-winbar"><div class="away" style="width:{away_w:.1f}%"></div><div class="home" style="width:{home_w:.1f}%"></div></div><span>{home_win:.0f}%</span></div>
+      <div class="ml-runs"><div><span>{_mlui_safe(away)}</span><strong>{_mlui_safe(away_runs)}</strong><small>ML {_mlui_safe(away_price)}</small></div><div><span>{_mlui_safe(home)}</span><strong>{_mlui_safe(home_runs)}</strong><small>ML {_mlui_safe(home_price)}</small></div></div>
+      <div class="ml-best"><span>⚡ BEST PLAY · CANONICAL SIDE PRESERVED</span><strong>{_mlui_safe(best)}</strong><b>{_mlui_safe(_mlui_pct(best_prob))}</b></div>
+      <div class="ml-support-box">
+        <div class="ml-support-head"><strong>ML SUPPORT PROFILE · {_mlui_safe(support_state)}</strong><span>Score {support_score:+.0f} · support-adjusted {support_prob_text}</span></div>
+        <div class="ml-support-grid">
+          {pill('Starter Edge', edge_label(spedge,2.5))}
+          {pill('K Suppression', edge_label(kedge,0.18))}
+          {pill('Contact Quality', edge_label(cedge,0.18))}
+          {pill('Bullpen', edge_label(bpedge,2.5))}
+          {pill('Offense vs Hand', edge_label(oedge,0.18))}
+          {pill('Market', market_state)}
+        </div>
+        <div class="ml-bp-read">{_mlui_safe(row.get('ML Bullpen Availability Read') or '')}</div>
+      </div>
+      <div class="ml-mini-grid"><div><strong>{_mlui_safe(total_pick)}</strong><span>{_mlui_safe(_mlui_pct(total_prob))}</span></div><div><strong>{_mlui_safe(cover)}</strong><span>{_mlui_safe(_mlui_pct(cover_prob))}</span></div></div>
+      <div class="ml-card-foot"><strong>{_mlui_safe(card_status)}</strong><span>{_mlui_safe(data_note)}</span></div>
+    </div>
+    """
+
+
+def _render_moneyline_visual_cards(df, max_cards=None):
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return
+    import streamlit.components.v1 as components
+    css = """
+    <style>
+    body{margin:0;background:transparent}.ml-card-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px;margin:12px 0 18px}.ml-edge-card{background:#070b14;border:1px solid #16335f;border-radius:18px;padding:16px;color:#eaf2ff;box-shadow:0 0 18px rgba(40,95,190,.18)}
+    .ml-card-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}.ml-game-time{font-size:12px;color:#7e8da7}.ml-rating{font-size:12px;font-weight:800;border-radius:999px;padding:5px 10px;border:1px solid #385bff;color:#a9c2ff;background:#101a38}.ml-rating.elite{border-color:#f2d24b;color:#ffe982;background:#352b07}.ml-rating.high{border-color:#5b80ff}.ml-rating.medium{border-color:#2d80ff;color:#8fc3ff}.ml-rating.track{border-color:#42506a;color:#c5ccda}
+    .ml-teams{display:grid;grid-template-columns:1fr 118px 1fr;align-items:center;gap:6px}.ml-team{text-align:left}.ml-team.right{text-align:right}.ml-logo-img{width:64px;height:64px;object-fit:contain;filter:drop-shadow(0 0 10px rgba(255,255,255,.18))}.ml-logo-fallback{display:inline-flex;align-items:center;justify-content:center;width:58px;height:58px;border-radius:50%;background:#111a2d;border:1px solid #293e68;font-weight:900;color:#fff}.ml-team-name{font-weight:800;font-size:15px;margin-top:7px}.ml-sp{font-size:11px;color:#8c98ad;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ml-vs{color:#4f5c75;font-size:10px;margin-bottom:3px}.ml-venue-center{text-align:center;min-width:0}.ml-venue-center strong{display:block;font-size:11px;line-height:1.15;color:#e3ebfa}.ml-venue-center span,.ml-venue-center small,.ml-venue-center em{display:block;font-size:9px;line-height:1.25;color:#8493aa;font-style:normal;margin-top:2px}.ml-venue-center em{color:#9eb7df}
+    .ml-win-row{display:grid;grid-template-columns:42px 1fr 42px;gap:8px;align-items:center;margin:13px 0;color:#d8e5ff;font-weight:700;font-size:13px}.ml-win-row span:last-child{text-align:right}.ml-winbar{height:4px;border-radius:999px;display:flex;overflow:hidden;background:#1b2232}.ml-winbar .away{background:#245cff}.ml-winbar .home{background:#ff335f}.ml-runs{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:8px 0 12px}.ml-runs div{background:#0b1120;border:1px solid #16243d;border-radius:12px;padding:10px}.ml-runs span{display:block;color:#8a96aa;font-size:12px;font-weight:800}.ml-runs strong{font-size:32px;line-height:1}.ml-runs small{display:block;color:#42e083;margin-top:2px}
+    .ml-best{border:1px solid #1c62be;border-radius:14px;padding:12px;display:grid;grid-template-columns:1fr auto;gap:4px;align-items:end;background:#080e1d}.ml-best span{grid-column:1/3;color:#7f8da5;font-size:9px;font-weight:800;letter-spacing:.06em}.ml-best strong{font-size:24px}.ml-best b{font-size:23px;color:#f2f6ff}
+    .ml-support-box{margin-top:10px;border:1px solid #21416f;border-radius:13px;background:#09101d;padding:10px}.ml-support-head{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}.ml-support-head strong{font-size:10px;color:#dce9ff}.ml-support-head span{font-size:9px;color:#8da6cc;text-align:right}.ml-support-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.ml-support-pill{border:1px solid #263552;border-radius:9px;padding:6px;background:#0b1424;min-width:0}.ml-support-pill b{display:block;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ml-support-pill span{display:block;font-size:9px;margin-top:2px}.ml-support-pill.plus{border-color:#1d6b54}.ml-support-pill.plus span{color:#5fe0a9}.ml-support-pill.minus{border-color:#6f3045}.ml-support-pill.minus span{color:#ff829f}.ml-support-pill.even span{color:#91a0b5}.ml-bp-read{font-size:9px;color:#788ba8;margin-top:7px;white-space:normal}
+    .ml-mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.ml-mini-grid div{border:1px solid #193e78;border-radius:12px;padding:10px;background:#0b1120}.ml-mini-grid strong{display:block;font-size:13px}.ml-mini-grid span{font-size:12px;color:#9db9e8}.ml-card-foot{display:grid;gap:3px;margin-top:10px;padding-top:9px;border-top:1px solid #17233a;font-size:11px}.ml-card-foot strong{color:#c9d7ef}.ml-card-foot span{color:#76849a;white-space:normal;overflow-wrap:anywhere}
+    @media(max-width:520px){.ml-card-wrap{grid-template-columns:1fr}.ml-edge-card{padding:13px}.ml-teams{grid-template-columns:1fr 100px 1fr}.ml-logo-img{width:54px;height:54px}.ml-best strong{font-size:20px}.ml-support-grid{grid-template-columns:repeat(2,1fr)}}
+    </style>
+    """
+    try:
+        d = df.copy()
+        if "ML Card Rating Score" in d.columns:
+            d["_sort"] = pd.to_numeric(d["ML Card Rating Score"], errors="coerce").fillna(-999)
+            d = d.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+        card_count = len(d) if max_cards is None else min(len(d), max(0, int(max_cards)))
+        cards = "\n".join(_mlui_row_card(r) for _, r in d.head(card_count).iterrows())
+        components.html(f'{css}<div class="ml-card-wrap">{cards}</div>', height=max(1100, min(32000, 800*max(1,card_count))+260), scrolling=True)
+    except Exception as e:
+        st.info(f"Moneyline visual cards unavailable: {e}")
+
+
+def _impl_render_moneyline_edge_tab_17(board, dates=None):
+    st.markdown('<div class="section-title-pro">All Moneyline Matchup Cards · Phase 2.2</div>', unsafe_allow_html=True)
+    st.caption("Every game stays visible. Phase 2.2 preserves the Phase 2.1 baseball winner, then cross-checks K suppression, contact quality, bullpen, offense-vs-hand, park/weather and market context to strengthen or downgrade playability.")
+    try:
+        df = ml_build_board(board)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            st.info("No ML board yet. Refresh the K board first.")
+            return
+        priced = int(df.get("ML Market Available", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if "ML Market Available" in df else 0
+        track = int(df.get("ML Official Tier", pd.Series(dtype=str)).astype(str).isin(["LEAN / TRACK ML","MODEL ONLY / TRACK"]).sum())
+        playable = int(df.get("ML Official Tier", pd.Series(dtype=str)).astype(str).isin(["OFFICIAL ML","PLAYABLE ML"]).sum())
+        strong_support = int(df.get("ML Support State", pd.Series(dtype=str)).astype(str).eq("STRONG_SUPPORT").sum()) if "ML Support State" in df else 0
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Games Shown", len(df)); m2.metric("Market Priced", priced); m3.metric("Official / Playable", playable); m4.metric("Strong Support", strong_support)
+        _render_moneyline_visual_cards(df, max_cards=None)
+        st.markdown('<div class="section-title-pro">Moneyline Support Audit</div>', unsafe_allow_html=True)
+        cols = [c for c in ["Matchup","ML Card Best Play","ML Card Best Play Prob %","ML Official Tier","ML Support State","ML Support Score","ML Support Adjusted Win %","Ballpark","Ballpark Location","ML Weather Summary","ML Starter Edge","ML K Suppression Edge","ML Contact Quality Edge","ML Bullpen Edge","ML Offense Vs Hand Edge","ML Market Agreement","ML Risk Reasons","ML Support Signals","ML Phase22 Original Tier"] if c in df.columns]
+        st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+        with st.expander("Full ML board debug", expanded=False):
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"Moneyline edge unavailable: {e}")
+
+
+# Public-path rebinding. K/Challenger and every non-Moneyline engine remain untouched.
+ml_build_board = _impl_ml_build_board_21
+render_moneyline_edge_tab = _impl_render_moneyline_edge_tab_17
 
 
 
