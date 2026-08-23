@@ -10,12 +10,17 @@ on:
     paths:
       - 'tools/refresh_savant_installer.py'
       - '.github/workflows/refresh_savant_installer.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/refresh_savant_installer.py'
+      - '.github/workflows/refresh_savant_installer.yml'
 
 permissions:
   contents: write
 
 concurrency:
-  group: challenger-savant-installer-refresh
+  group: challenger-savant-installer-refresh-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -99,6 +104,7 @@ jobs:
           PY
 
       - name: Commit refreshed Savant installer files only
+        if: github.event_name != 'pull_request'
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
