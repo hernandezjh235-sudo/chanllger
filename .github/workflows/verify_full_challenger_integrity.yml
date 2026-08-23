@@ -16,8 +16,8 @@ jobs:
         run: pip install -r requirements.txt
       - name: Apply K Savant authority
         run: python tools/apply_savant_k_authority_patch.py --app app.py
-      - name: Apply batter display bridge
-        run: python tools/apply_savant_batter_display_patch.py --app app.py
+      - name: Apply batter display bridge V5
+        run: python tools/apply_savant_batter_display_patch_v5.py --app app.py
       - name: Apply ML weather delay
         run: python tools/apply_ml_weather_delay_patch.py --app app.py
       - name: Apply ML environment V2
@@ -55,8 +55,8 @@ jobs:
 
           text = Path('app.py').read_text(encoding='utf-8')
           assert 'CHALLENGER_SAVANT_K_AUTHORITY_V1_2026_08_23' in text
-          assert 'CHALLENGER_SAVANT_BATTER_DISPLAY_V3_2026_08_23' in text
-          assert 'FINAL_CARD_SAVANT_SO_PA_V3' in text
+          assert 'CHALLENGER_SAVANT_BATTER_DISPLAY_V5_2026_08_23' in text
+          assert 'FINAL_CARD_SAVANT_SO_PA_V4' in text
           assert 'def _v269_savant_shadow_rows(' in text
           assert 'NAME_CANONICAL' in text
           assert 'Savant Raw Math' in text
