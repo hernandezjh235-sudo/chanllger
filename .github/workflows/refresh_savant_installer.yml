@@ -10,6 +10,7 @@ on:
     paths:
       - 'tools/refresh_savant_installer.py'
       - 'tools/refresh_savant_installer_v2.py'
+      - 'tools/refresh_savant_installer_v3.py'
       - '.github/workflows/refresh_savant_installer.yml'
   pull_request:
     branches: [main]
@@ -45,7 +46,7 @@ jobs:
           python -m pip install pandas requests
 
       - name: Pull live Baseball Savant and build 10 installer files
-        run: python tools/refresh_savant_installer_v2.py --out learning_data
+        run: python tools/refresh_savant_installer_v3.py --out learning_data
 
       - name: Validate exact installer outputs
         run: |
@@ -88,10 +89,23 @@ jobs:
               'pitch_mix_matchups.csv': 1500,
           }
           counts = {}
+          frames = {}
           for name, minimum in minimums.items():
               df = pd.read_csv(root/name)
+              frames[name] = df
               counts[name] = len(df)
               assert len(df) >= minimum, (name, len(df), minimum)
+
+          # V3 safety: a roster-only file is not a successful platoon refresh.
+          plat = frames['savant_batter_platoon_2026.csv']
+          r_pa = pd.to_numeric(plat['vs_rhp_pa'], errors='coerce')
+          l_pa = pd.to_numeric(plat['vs_lhp_pa'], errors='coerce')
+          r_k = pd.to_numeric(plat['vs_rhp_k_pct'], errors='coerce')
+          l_k = pd.to_numeric(plat['vs_lhp_k_pct'], errors='coerce')
+          assert int(r_pa.gt(0).sum()) >= 450, 'insufficient batter PA coverage vs RHP'
+          assert int(l_pa.gt(0).sum()) >= 350, 'insufficient batter PA coverage vs LHP'
+          assert int(r_k.notna().sum()) >= 450, 'insufficient K% coverage vs RHP'
+          assert int(l_k.notna().sum()) >= 350, 'insufficient K% coverage vs LHP'
 
           pm = json.loads((root/'savant_refresh_manifest.json').read_text())
           am = json.loads((root/'savant_aux_refresh_manifest.json').read_text())
@@ -100,6 +114,8 @@ jobs:
           assert int(pm.get('season')) == 2026
           assert int(am.get('season')) == 2026
           print('validated', counts)
+          print('platoon vs RHP players', int(r_pa.gt(0).sum()))
+          print('platoon vs LHP players', int(l_pa.gt(0).sum()))
           print('platoon last_success_at', pm.get('last_success_at'))
           print('aux last_success_at', am.get('last_success_at'))
           PY
