@@ -1,0 +1,33 @@
+name: Verify Savant K Authority
+
+on:
+  pull_request:
+    paths:
+      - 'tools/apply_savant_k_authority_patch.py'
+      - 'Procfile'
+      - '.github/workflows/verify_savant_k_authority.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check patch against current app
+        run: python tools/apply_savant_k_authority_patch.py --check-only --app app.py
+      - name: Apply patch exactly as Railway will
+        run: python tools/apply_savant_k_authority_patch.py --app app.py
+      - name: Compile patched app
+        run: python -m py_compile app.py
+      - name: Assert marker and Savant-first wrappers
+        run: |
+          grep -q 'CHALLENGER_SAVANT_K_AUTHORITY_V1_2026_08_23' app.py
+          grep -q 'Baseball Savant current-season vs' app.py
+          grep -q 'Savant authority' app.py
