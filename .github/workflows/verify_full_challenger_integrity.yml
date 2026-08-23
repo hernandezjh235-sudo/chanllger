@@ -1,0 +1,100 @@
+name: Verify Full Challenger Integrity
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+      - name: Apply K Savant authority
+        run: python tools/apply_savant_k_authority_patch.py --app app.py
+      - name: Apply batter display bridge
+        run: python tools/apply_savant_batter_display_patch.py --app app.py
+      - name: Apply ML weather delay
+        run: python tools/apply_ml_weather_delay_patch.py --app app.py
+      - name: Apply ML environment V2
+        run: python tools/apply_ml_environment_v2_patch.py --app app.py
+      - name: Apply PO Workload V3 shadow
+        run: python tools/apply_po_workload_v3_patch.py --app app.py
+      - name: Compile combined Railway app
+        run: python -m py_compile app.py
+      - name: Validate Savant source math and display bridge
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+          import math
+
+          p = Path('learning_data/savant_batter_platoon_2026.csv')
+          assert p.exists(), p
+          df = pd.read_csv(p)
+          required = {'mlbam_id','player_name','vs_rhp_pa','vs_rhp_so','vs_rhp_k_pct','vs_lhp_pa','vs_lhp_so','vs_lhp_k_pct'}
+          assert required.issubset(df.columns), required - set(df.columns)
+          for hand in ('rhp','lhp'):
+              pa = pd.to_numeric(df[f'vs_{hand}_pa'], errors='coerce')
+              so = pd.to_numeric(df[f'vs_{hand}_so'], errors='coerce')
+              kp = pd.to_numeric(df[f'vs_{hand}_k_pct'], errors='coerce')
+              mask = (pa > 0) & so.notna() & kp.notna()
+              assert int(mask.sum()) >= 600, (hand, int(mask.sum()))
+              calc = 100.0 * so[mask] / pa[mask]
+              max_err = float((calc-kp[mask]).abs().max())
+              assert max_err <= 0.15, (hand, max_err)
+          # Known high-sample player check without freezing today's exact PA totals.
+          neto = df[pd.to_numeric(df['mlbam_id'], errors='coerce') == 687263]
+          assert not neto.empty
+          n = neto.iloc[-1]
+          assert float(n['vs_rhp_pa']) >= 300
+          assert abs(float(n['vs_rhp_k_pct']) - 100.0*float(n['vs_rhp_so'])/float(n['vs_rhp_pa'])) <= 0.15
+
+          text = Path('app.py').read_text(encoding='utf-8')
+          assert 'CHALLENGER_SAVANT_K_AUTHORITY_V1_2026_08_23' in text
+          assert 'CHALLENGER_SAVANT_BATTER_DISPLAY_V2_2026_08_23' in text
+          assert 'SAVANT_TRUE_SPLIT_UNAVAILABLE' in text
+          assert 'Savant Raw Math' in text
+          print('Savant source/display integrity PASS')
+          PY
+      - name: Verify PO remains shadow and production-safe
+        run: |
+          python tools/test_po_workload_v3.py
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('app.py').read_text(encoding='utf-8')
+          assert 'PO_WORKLOAD_V3_SHADOW_2026_08_23' in text
+          assert 'Workload V2 remains the production selector' in text
+          assert 'pitching_outs_projection_audit_v3.csv' in text
+          print('PO V3 shadow isolation PASS')
+          PY
+      - name: Verify full ML environment/weather attachment
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          text = Path('app.py').read_text(encoding='utf-8')
+          required = [
+              'ML_WEATHER_DELAY_V1_2026_08_23',
+              'ML_ENVIRONMENT_V2_2026_08_23',
+              'ml_build_board = _impl_ml_build_board_23',
+              'ML High Scoring Score',
+              'ML Team Scoring Share %',
+              'ML Projected Run Diff',
+              'ML Environment Score V2',
+              'ML Environment Data Score',
+              'ML Environment Support State',
+              'ML Environment Adjusted Win %',
+              'ML Postponement Risk',
+              'ML Starter Disruption Risk Score',
+              'ML Wind Direction',
+              'ML Weather Run Effect',
+              'canonical side preserving',
+          ]
+          missing = [x for x in required if x not in text]
+          assert not missing, missing
+          print('ML full environment/weather attachment PASS')
+          PY
