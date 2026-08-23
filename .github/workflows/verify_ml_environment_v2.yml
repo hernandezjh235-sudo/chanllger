@@ -1,0 +1,45 @@
+name: Verify ML Environment V2
+
+on:
+  pull_request:
+    paths:
+      - 'tools/apply_ml_environment_v2_patch.py'
+      - 'tools/apply_ml_weather_delay_patch.py'
+      - 'tools/apply_savant_k_authority_patch.py'
+      - 'Procfile'
+      - '.github/workflows/verify_ml_environment_v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply Savant K authority
+        run: python tools/apply_savant_k_authority_patch.py --app app.py
+      - name: Apply ML rain delay overlay
+        run: python tools/apply_ml_weather_delay_patch.py --app app.py
+      - name: Check ML environment V2
+        run: python tools/apply_ml_environment_v2_patch.py --check-only --app app.py
+      - name: Apply ML environment V2
+        run: python tools/apply_ml_environment_v2_patch.py --app app.py
+      - name: Compile combined app
+        run: python -m py_compile app.py
+      - name: Assert isolated bindings and fields
+        run: |
+          grep -q 'CHALLENGER_SAVANT_K_AUTHORITY_V1_2026_08_23' app.py
+          grep -q 'CHALLENGER_ML_WEATHER_DELAY_V1_2026_08_23' app.py
+          grep -q 'CHALLENGER_ML_ENVIRONMENT_V2_2026_08_23' app.py
+          grep -q 'ml_build_board = _impl_ml_build_board_23' app.py
+          grep -q 'ML High Scoring Score' app.py
+          grep -q 'ML Team Scoring Share %' app.py
+          grep -q 'ML Environment Score V2' app.py
+          grep -q 'ML Postponement Risk' app.py
+          grep -q 'ML Wind Direction' app.py
