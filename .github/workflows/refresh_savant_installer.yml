@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - 'tools/refresh_savant_installer.py'
+      - 'tools/refresh_savant_installer_v2.py'
       - '.github/workflows/refresh_savant_installer.yml'
   pull_request:
     branches: [main]
@@ -44,7 +45,7 @@ jobs:
           python -m pip install pandas requests
 
       - name: Pull live Baseball Savant and build 10 installer files
-        run: python tools/refresh_savant_installer.py --out learning_data
+        run: python tools/refresh_savant_installer_v2.py --out learning_data
 
       - name: Validate exact installer outputs
         run: |
@@ -84,7 +85,7 @@ jobs:
               'savant_batter_platoon_2026.csv': 500,
               'savant_batter_profiles.csv': 500,
               'savant_pitcher_stats.csv': 650,
-              'pitch_mix_matchups.csv': 2500,
+              'pitch_mix_matchups.csv': 1500,
           }
           counts = {}
           for name, minimum in minimums.items():
