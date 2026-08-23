@@ -1,0 +1,139 @@
+name: Challenger Live Savant Installer Refresh
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 13 * * *'
+    - cron: '20 18 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'tools/refresh_savant_installer.py'
+      - '.github/workflows/refresh_savant_installer.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: challenger-savant-installer-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout Challenger
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install refresh dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas requests
+
+      - name: Pull live Baseball Savant and build 10 installer files
+        run: python tools/refresh_savant_installer.py --out learning_data
+
+      - name: Validate exact installer outputs
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json
+          import pandas as pd
+
+          root = Path('learning_data')
+          expected = [
+              'savant_batter_platoon_2026.csv',
+              'savant_batter_platoon_2026.last_good.csv',
+              'savant_refresh_manifest.json',
+              'savant_batter_profiles.csv',
+              'savant_batter_profiles.last_good.csv',
+              'savant_pitcher_stats.csv',
+              'savant_pitcher_stats.last_good.csv',
+              'pitch_mix_matchups.csv',
+              'pitch_mix_matchups.last_good.csv',
+              'savant_aux_refresh_manifest.json',
+          ]
+          for name in expected:
+              p = root / name
+              assert p.exists(), f'missing {name}'
+              assert p.stat().st_size > 20, f'empty {name}'
+
+          pairs = [
+              ('savant_batter_platoon_2026.csv', 'savant_batter_platoon_2026.last_good.csv'),
+              ('savant_batter_profiles.csv', 'savant_batter_profiles.last_good.csv'),
+              ('savant_pitcher_stats.csv', 'savant_pitcher_stats.last_good.csv'),
+              ('pitch_mix_matchups.csv', 'pitch_mix_matchups.last_good.csv'),
+          ]
+          for a, b in pairs:
+              assert (root/a).read_bytes() == (root/b).read_bytes(), f'active/LAST_GOOD mismatch: {a}'
+
+          minimums = {
+              'savant_batter_platoon_2026.csv': 500,
+              'savant_batter_profiles.csv': 500,
+              'savant_pitcher_stats.csv': 650,
+              'pitch_mix_matchups.csv': 2500,
+          }
+          counts = {}
+          for name, minimum in minimums.items():
+              df = pd.read_csv(root/name)
+              counts[name] = len(df)
+              assert len(df) >= minimum, (name, len(df), minimum)
+
+          pm = json.loads((root/'savant_refresh_manifest.json').read_text())
+          am = json.loads((root/'savant_aux_refresh_manifest.json').read_text())
+          assert pm.get('status') == 'SUCCESS'
+          assert am.get('status') == 'SUCCESS'
+          assert int(pm.get('season')) == 2026
+          assert int(am.get('season')) == 2026
+          print('validated', counts)
+          print('platoon last_success_at', pm.get('last_success_at'))
+          print('aux last_success_at', am.get('last_success_at'))
+          PY
+
+      - name: Commit refreshed Savant installer files only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            learning_data/savant_batter_platoon_2026.csv \
+            learning_data/savant_batter_platoon_2026.last_good.csv \
+            learning_data/savant_refresh_manifest.json \
+            learning_data/savant_batter_profiles.csv \
+            learning_data/savant_batter_profiles.last_good.csv \
+            learning_data/savant_pitcher_stats.csv \
+            learning_data/savant_pitcher_stats.last_good.csv \
+            learning_data/pitch_mix_matchups.csv \
+            learning_data/pitch_mix_matchups.last_good.csv \
+            learning_data/savant_aux_refresh_manifest.json
+          if git diff --cached --quiet; then
+            echo 'Savant installer data already current; nothing to commit.'
+          else
+            git commit -m 'Refresh Challenger Baseball Savant installer data'
+            git push origin HEAD:main
+          fi
+
+      - name: Upload 10 individual installer files
+        uses: actions/upload-artifact@v4
+        with:
+          name: challenger-savant-installer-files
+          path: |
+            learning_data/savant_batter_platoon_2026.csv
+            learning_data/savant_batter_platoon_2026.last_good.csv
+            learning_data/savant_refresh_manifest.json
+            learning_data/savant_batter_profiles.csv
+            learning_data/savant_batter_profiles.last_good.csv
+            learning_data/savant_pitcher_stats.csv
+            learning_data/savant_pitcher_stats.last_good.csv
+            learning_data/pitch_mix_matchups.csv
+            learning_data/pitch_mix_matchups.last_good.csv
+            learning_data/savant_aux_refresh_manifest.json
+          if-no-files-found: error
+          retention-days: 14
