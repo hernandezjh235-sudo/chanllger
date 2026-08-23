@@ -1,0 +1,48 @@
+name: Verify PO Workload V3
+
+on:
+  pull_request:
+    paths:
+      - 'tools/apply_po_workload_v3_patch.py'
+      - 'tools/apply_savant_k_authority_patch.py'
+      - 'tools/apply_ml_weather_delay_patch.py'
+      - 'tools/apply_ml_environment_v2_patch.py'
+      - 'Procfile'
+      - '.github/workflows/verify_po_workload_v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply existing K authority patch
+        run: python tools/apply_savant_k_authority_patch.py --app app.py
+      - name: Apply existing ML rain delay patch
+        run: python tools/apply_ml_weather_delay_patch.py --app app.py
+      - name: Apply existing ML environment patch
+        run: python tools/apply_ml_environment_v2_patch.py --app app.py
+      - name: Check PO V3 against combined app
+        run: python tools/apply_po_workload_v3_patch.py --check-only --app app.py
+      - name: Apply PO V3 exactly as Railway will
+        run: python tools/apply_po_workload_v3_patch.py --app app.py
+      - name: Compile combined app
+        run: python -m py_compile app.py
+      - name: Assert PO-only shadow bindings and diagnostics
+        run: |
+          grep -q 'CHALLENGER_PO_WORKLOAD_V3_2026_08_23' app.py
+          grep -q '_beta_projection_rows = _impl_beta_projection_rows_po_v3' app.py
+          grep -q 'render_beta_pitching_outs_tab = _impl_render_beta_pitching_outs_tab_po_v3' app.py
+          grep -q 'PO V3 Data Completeness %' app.py
+          grep -q 'PO V3 Recent IP Baseline' app.py
+          grep -q 'CORRECT_SIDE_BAD_PROJECTION' app.py
+          grep -q 'pitching_outs_projection_audit_v3.csv' app.py
+          grep -q 'SHADOW_ONLY' app.py
+          grep -q 'PO_WORKLOAD_V2_ACTIVE_FOR_SELECTOR = True' app.py
