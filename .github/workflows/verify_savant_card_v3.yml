@@ -1,0 +1,98 @@
+name: Verify Savant Card V3
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install runtime dependencies
+        run: pip install -q pandas numpy streamlit requests
+      - name: Apply K authority first
+        run: python tools/apply_savant_k_authority_patch.py --app app.py
+      - name: Apply final-card Savant V3
+        run: python tools/apply_savant_batter_display_patch.py --app app.py
+      - name: Runtime-test exact final-card function
+        run: |
+          python - <<'PY'
+          import ast, math, re, unicodedata
+          from pathlib import Path
+          from datetime import datetime
+          import pandas as pd
+          text=Path('app.py').read_text(encoding='utf-8-sig')
+          tree=ast.parse(text)
+          nodes=[n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='_v269_savant_shadow_rows' and n.col_offset==0]
+          assert len(nodes)==1, len(nodes)
+          n=nodes[0]
+          src='\n'.join(text.splitlines()[n.lineno-1:n.end_lineno])
+          class Service:
+              def load(self):
+                  return pd.read_csv('learning_data/savant_batter_platoon_2026.csv')
+          ns={'math':math,'re':re,'unicodedata':unicodedata,'Path':Path,'datetime':datetime,'pd':pd,'_v269_savant_service':lambda:Service()}
+          exec(src,ns)
+          fn=ns['_v269_savant_shadow_rows']
+          angels=['Jose Siri','Mike Trout','Vaughn Grissom','Zach Neto','Moisés Ballesteros','Denzer Guzman','Josh Lowe','Tyler Heineman','Adam Frazier']
+          rows=[{'Batter':x,'Used K%':20.0} for x in angels]
+          out,audit=fn(rows,'R',21.4,{})
+          assert audit['matched']==9, audit
+          d={r['Batter']:r for r in out}
+          assert d['Mike Trout']['savant_raw_vs_hand_pa']==357 and d['Mike Trout']['savant_raw_vs_hand_so']==94, d['Mike Trout']
+          assert abs(d['Mike Trout']['savant_raw_vs_hand_k_pct']-26.3305)<0.01, d['Mike Trout']
+          assert d['Zach Neto']['savant_raw_vs_hand_pa']==407 and d['Zach Neto']['savant_raw_vs_hand_so']==132, d['Zach Neto']
+          assert abs(d['Zach Neto']['savant_raw_vs_hand_k_pct']-32.4324)<0.01, d['Zach Neto']
+          bos=['Nick Sogard','Ceddanne Rafaela','Wilyer Abreu','Willson Contreras','Adley Rutschman','Caleb Durbin','Jarren Duran','Andruw Monasterio','Mickey Gasper']
+          out2,a2=fn([{'Batter':x,'Used K%':20.0} for x in bos],'L',9.7,{})
+          assert a2['matched']==9, a2
+          dd={r['Batter']:r for r in out2}
+          assert dd['Wilyer Abreu']['savant_raw_vs_hand_pa']==164 and dd['Wilyer Abreu']['savant_raw_vs_hand_so']==26, dd['Wilyer Abreu']
+          lad=['Shohei Ohtani','Freddie Freeman','Andy Pages','Max Muncy','Mookie Betts','Kyle Tucker','Tommy Edman','Teoscar Hernández','Hunter Feduccia']
+          out3,a3=fn([{'Batter':x,'Used K%':20.0} for x in lad],'R',9.0,{})
+          assert a3['matched']==9, a3
+          d3={r['Batter']:r for r in out3}
+          assert d3['Shohei Ohtani']['savant_raw_vs_hand_pa']==364 and d3['Shohei Ohtani']['savant_raw_vs_hand_so']==82, d3['Shohei Ohtani']
+          print('FINAL CARD SAVANT V3 RUNTIME PASS')
+          print('Angels', audit)
+          print('Trout', d['Mike Trout'])
+          print('Neto', d['Zach Neto'])
+          print('Boston', a2)
+          print('Dodgers', a3)
+          PY
+      - name: Apply ML and PO layers exactly like Railway
+        run: |
+          python tools/apply_ml_weather_delay_patch.py --app app.py
+          python tools/apply_ml_environment_v2_patch.py --app app.py
+          python tools/apply_po_workload_v3_patch.py --app app.py
+      - name: Compile full combined app
+        run: python -m py_compile app.py
+      - name: Confirm isolation and full ML/PO markers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          t=Path('app.py').read_text(encoding='utf-8-sig')
+          for marker in [
+            'CHALLENGER_SAVANT_K_AUTHORITY_V1_2026_08_23',
+            'CHALLENGER_SAVANT_BATTER_DISPLAY_V3_2026_08_23',
+            'CHALLENGER_ML_WEATHER_DELAY_V1_2026_08_23',
+            'CHALLENGER_ML_ENVIRONMENT_V2_2026_08_23',
+            'CHALLENGER_PO_WORKLOAD_V3_2026_08_23',
+            'PO_WORKLOAD_V3_SHADOW_2026_08_23',
+            'ml_build_board = _impl_ml_build_board_23',
+          ]:
+              assert marker in t, marker
+          print('COMBINED APP MARKERS PASS')
+          PY
+      - name: Package full fixed app
+        run: |
+          mkdir -p dist
+          cp app.py dist/app_CHALLENGER_SAVANT_CARD_V3_FIXED.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: challenger-savant-card-v3-full-app
+          path: dist/app_CHALLENGER_SAVANT_CARD_V3_FIXED.py
+          retention-days: 14
