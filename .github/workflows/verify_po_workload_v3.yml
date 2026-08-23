@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'tools/apply_po_workload_v3_patch.py'
+      - 'tools/test_po_workload_v3.py'
       - 'tools/apply_savant_k_authority_patch.py'
       - 'tools/apply_ml_weather_delay_patch.py'
       - 'tools/apply_ml_environment_v2_patch.py'
@@ -23,6 +24,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install semantic-test dependencies
+        run: pip install numpy pandas
+      - name: Run PO V3 workload semantic tests
+        run: python tools/test_po_workload_v3.py
       - name: Apply existing K authority patch
         run: python tools/apply_savant_k_authority_patch.py --app app.py
       - name: Apply existing ML rain delay patch
