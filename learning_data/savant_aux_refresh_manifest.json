@@ -16,9 +16,9 @@
       "status": "SUCCESS"
     }
   },
-  "last_success_at": "2026-08-23T13:58:35+00:00",
-  "refresh_completed_at": "2026-08-23T13:58:35+00:00",
-  "refresh_started_at": "2026-08-23T13:47:40+00:00",
+  "last_success_at": "2026-08-23T19:03:35+00:00",
+  "refresh_completed_at": "2026-08-23T19:03:35+00:00",
+  "refresh_started_at": "2026-08-23T18:51:24+00:00",
   "schema_version": "SAVANT_AUX_MANIFEST_SCHEMA_V1",
   "season": 2026,
   "status": "SUCCESS"
