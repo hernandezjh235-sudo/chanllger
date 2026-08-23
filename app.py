@@ -1,3 +1,5 @@
+# CHALLENGER_SAVANT_BATTER_DISPLAY_V3_2026_08_23
+# CHALLENGER_SAVANT_K_AUTHORITY_V1_2026_08_23
 
 
 # -*- coding: utf-8 -*-
@@ -6632,7 +6634,7 @@ def get_batter_season_k_rate(player_id):
 
 @st.cache_data(ttl=600, show_spinner=False)
 
-def get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand):
+def _legacy_get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand):
 
     if not player_id or pitcher_hand not in ["R", "L"]:
 
@@ -6677,6 +6679,70 @@ def get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand):
                     return float(so / denom), so, denom, f"Real split vs {'RHP' if pitcher_hand == 'R' else 'LHP'}"
 
     return None, None, None, "Split unavailable"
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand):
+    """Current-season batter K% vs pitcher hand, Savant-first.
+
+    The validated Savant installer is the authoritative split source. The
+    legacy MLB Stats API implementation remains the fallback when a player is
+    genuinely absent from the current/LAST_GOOD Savant data.
+    """
+    if not player_id or pitcher_hand not in ["R", "L"]:
+        return None, None, None, "No pitcher hand"
+
+    try:
+        pid = str(int(float(player_id)))
+    except Exception:
+        return _legacy_get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand)
+
+    season = int(datetime.now().year)
+    hand_key = "rhp" if pitcher_hand == "R" else "lhp"
+    pa_col = f"vs_{hand_key}_pa"
+    so_col = f"vs_{hand_key}_so"
+    k_col = f"vs_{hand_key}_k_pct"
+
+    try:
+        global _CHALLENGER_SAVANT_K_TABLE_CACHE
+        cache = globals().get("_CHALLENGER_SAVANT_K_TABLE_CACHE")
+        cache_key = (season,)
+        if not isinstance(cache, dict) or cache.get("key") != cache_key:
+            active = Path("learning_data") / f"savant_batter_platoon_{season}.csv"
+            last_good = Path("learning_data") / f"savant_batter_platoon_{season}.last_good.csv"
+            source_path = active if active.exists() else last_good
+            frame = pd.read_csv(source_path) if source_path.exists() else pd.DataFrame()
+            if not frame.empty and "mlbam_id" in frame.columns:
+                ids = pd.to_numeric(frame["mlbam_id"], errors="coerce")
+                frame = frame.assign(_challenger_pid=ids).dropna(subset=["_challenger_pid"])
+                frame["_challenger_pid"] = frame["_challenger_pid"].astype(int).astype(str)
+                frame = frame.drop_duplicates("_challenger_pid", keep="last").set_index("_challenger_pid", drop=False)
+            cache = {"key": cache_key, "frame": frame, "path": str(source_path)}
+            _CHALLENGER_SAVANT_K_TABLE_CACHE = cache
+
+        frame = cache.get("frame") if isinstance(cache, dict) else None
+        if isinstance(frame, pd.DataFrame) and not frame.empty and pid in frame.index:
+            rec = frame.loc[pid]
+            if isinstance(rec, pd.DataFrame):
+                rec = rec.iloc[-1]
+
+            def _num(value):
+                try:
+                    out = float(value)
+                    return out if out == out else None
+                except Exception:
+                    return None
+
+            pa = _num(rec.get(pa_col))
+            so = _num(rec.get(so_col))
+            kpct = _num(rec.get(k_col))
+            if pa is not None and pa > 0 and kpct is not None:
+                rate = kpct / 100.0 if abs(kpct) > 1.0 else kpct
+                rate = max(0.0, min(1.0, float(rate)))
+                return rate, int(round(so or 0.0)), int(round(pa)), f"Baseball Savant current-season vs {pitcher_hand}HP"
+    except Exception:
+        pass
+
+    return _legacy_get_batter_k_rate_vs_pitcher_hand(player_id, pitcher_hand)
 
 
 
@@ -6762,7 +6828,7 @@ def get_batter_rolling_k_rates(player_id, days_list=(14, 30)):
 
 
 
-def blend_batter_k_inputs(season_k, split_k=None, season_pa=None, split_pa=None, rolling14=None, rolling30=None):
+def _legacy_blend_batter_k_inputs(season_k, split_k=None, season_pa=None, split_pa=None, rolling14=None, rolling30=None):
 
     """Blend only real batter K inputs. Missing parts get zero weight."""
 
@@ -6801,6 +6867,57 @@ def blend_batter_k_inputs(season_k, split_k=None, season_pa=None, split_pa=None,
     sources = ", ".join(src for _, _, src in parts)
 
     return clamp(blended, 0.04, 0.55), f"Blended real K inputs: {sources}"
+
+def blend_batter_k_inputs(season_k, split_k=None, season_pa=None, split_pa=None, rolling14=None, rolling30=None):
+    """Preserve Challenger blend with large-sample Savant authority.
+
+    The legacy blend remains the baseline. When the current vs-hand split has a
+    meaningful sample, cap how far overlapping recent/season windows may pull
+    the model away from that observed split. This avoids double-counting recent
+    PA while still allowing small-sample shrinkage.
+    """
+    blended, source = _legacy_blend_batter_k_inputs(
+        season_k,
+        split_k=split_k,
+        season_pa=season_pa,
+        split_pa=split_pa,
+        rolling14=rolling14,
+        rolling30=rolling30,
+    )
+    try:
+        if split_k is None or split_pa is None:
+            return blended, source
+        split = float(split_k)
+        pa = float(split_pa)
+        if abs(split) > 1.0:
+            split /= 100.0
+        if blended is None:
+            return split, "Baseball Savant vs-hand split"
+        value = float(blended)
+        if abs(value) > 1.0:
+            value /= 100.0
+
+        # Large samples get progressively stronger authority. These are caps,
+        # not hard replacements: recent/season information can still move the
+        # expected K rate, just not by an outsized amount.
+        if pa >= 300:
+            cap = 0.025
+        elif pa >= 200:
+            cap = 0.030
+        elif pa >= 100:
+            cap = 0.040
+        elif pa >= 50:
+            cap = 0.050
+        else:
+            return value, f"{source}; Savant small-sample shrinkage ({int(pa)} PA)"
+
+        guarded = max(split - cap, min(split + cap, value))
+        guarded = max(0.02, min(0.60, guarded))
+        if abs(guarded - value) > 1e-9:
+            return guarded, f"{source}; Savant authority {int(pa)} PA (cap ±{cap*100:.1f}pp)"
+        return value, f"{source}; Savant authority {int(pa)} PA"
+    except Exception:
+        return blended, source
 
 
 
@@ -106331,50 +106448,229 @@ def _v269_start_savant_refresh_if_needed(board=None):
 
 
 def _v269_savant_shadow_rows(lineup_rows, pitcher_hand, expected_bf, board_row=None):
+    """Authoritative final-card Savant enrichment.
+
+    This is the function the live Batter-by-Batter card calls immediately before
+    `_kcard_lineup_html`.  It resolves MLBAM id first, then canonicalized player
+    name, and calculates the visible split percentage directly from SO/PA.
+    """
+    rows = [dict(x) for x in (lineup_rows or []) if isinstance(x, dict)][:9]
+    hand = str(pitcher_hand or "").upper()
+    split = "lhp" if hand.startswith("L") else "rhp"
+    pa_col = f"vs_{split}_pa"
+    so_col = f"vs_{split}_so"
+    k_col = f"vs_{split}_k_pct"
+
+    def _num(value, default=None):
+        try:
+            if value in (None, "", "—", "-", "nan", "NaN"):
+                return default
+            out = float(str(value).replace("%", "").replace(",", "").strip())
+            return out if math.isfinite(out) else default
+        except Exception:
+            return default
+
+    def _pid(value):
+        try:
+            if value in (None, ""):
+                return ""
+            return str(int(float(value)))
+        except Exception:
+            return ""
+
+    def _canon_name(value):
+        try:
+            text = str(value or "").strip()
+            # Baseball/Savant CSVs commonly use "Last, First"; lineup feeds use
+            # "First Last".  Reorder before punctuation is stripped.
+            if "," in text:
+                left, right = text.split(",", 1)
+                if left.strip() and right.strip():
+                    text = f"{right.strip()} {left.strip()}"
+            text = "".join(
+                ch for ch in unicodedata.normalize("NFKD", text)
+                if not unicodedata.combining(ch)
+            ).lower()
+            text = re.sub(r"[^a-z0-9 ]+", " ", text)
+            text = re.sub(r"\b(jr|sr|ii|iii|iv)\b", " ", text)
+            return " ".join(text.split())
+        except Exception:
+            return str(value or "").lower().strip()
+
+    def _token_key(value):
+        name = _canon_name(value)
+        return " ".join(sorted(name.split())) if name else ""
+
+    def _row_pid(row):
+        for key in (
+            "mlbam_id", "MLBAM ID", "MLBAM_ID", "player_id", "Player ID",
+            "Batter ID", "batter_id", "person_id", "Person ID", "id",
+        ):
+            got = _pid(row.get(key))
+            if got:
+                return got
+        return ""
+
+    def _row_name(row):
+        for key in ("Batter", "Player", "Name", "player_name", "batter_name"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return ""
 
     try:
-
         service = _v269_savant_service()
+        # service.load() already performs current -> targeted -> LAST_GOOD
+        # handling in the compatibility implementation.
+        platoon = service.load() if hasattr(service, "load") else pd.DataFrame()
+    except Exception:
+        service = None
+        platoon = pd.DataFrame()
 
-        mtime = service.active_path.stat().st_mtime if service.active_path.exists() else 0.0
+    # Direct source fallback protects the card even if the optional helper
+    # service changes or returns an incomplete frame.
+    frames = []
+    if isinstance(platoon, pd.DataFrame) and not platoon.empty:
+        frames.append(("LIVE/CACHE", platoon.copy()))
+    try:
+        season = int(datetime.now().year)
+    except Exception:
+        season = 2026
+    for label, path in (
+        ("CURRENT", Path("learning_data") / f"savant_batter_platoon_{season}.csv"),
+        ("TARGETED", Path("learning_data") / f"savant_batter_platoon_{season}.targeted.csv"),
+        ("LAST_GOOD", Path("learning_data") / f"savant_batter_platoon_{season}.last_good.csv"),
+    ):
+        try:
+            if path.exists():
+                frame = pd.read_csv(path)
+                if isinstance(frame, pd.DataFrame) and not frame.empty:
+                    frames.append((label, frame))
+        except Exception:
+            pass
 
-        targeted_mtime = service.targeted_path.stat().st_mtime if service.targeted_path.exists() else 0.0
+    by_id, by_name, by_tokens = {}, {}, {}
+    for source, frame in frames:
+        required = {"mlbam_id", "player_name", pa_col, so_col}
+        if not required.issubset(frame.columns):
+            continue
+        for _, rec in frame.iterrows():
+            pa = _num(rec.get(pa_col), None)
+            so = _num(rec.get(so_col), None)
+            if pa is None or pa <= 0 or so is None or so < 0:
+                continue
+            raw_k = 100.0 * float(so) / float(pa)
+            payload = {
+                "pa": int(round(pa)),
+                "so": int(round(so)),
+                "k_pct": float(raw_k),
+                "stored_k_pct": _num(rec.get(k_col), None),
+                "source": source,
+                "player_name": str(rec.get("player_name") or ""),
+            }
+            rid = _pid(rec.get("mlbam_id"))
+            rname = _canon_name(rec.get("player_name"))
+            rtok = _token_key(rec.get("player_name"))
+            if rid and rid not in by_id:
+                by_id[rid] = payload
+            if rname and rname not in by_name:
+                by_name[rname] = payload
+            if rtok and rtok not in by_tokens:
+                by_tokens[rtok] = payload
 
-        platoon = _v269_load_savant_platoon(mtime, targeted_mtime)
+    bf = max(0.0, _num(expected_bf, 0.0) or 0.0)
+    lo = int(math.floor(bf))
+    frac = bf - lo
+    def _counts(n):
+        out = []
+        for slot in range(1, 10):
+            out.append(0.0 if n < slot else float(1 + (n - slot) // 9))
+        return out
+    ca, cb = _counts(lo), _counts(lo + 1)
+    slot_counts = [ca[i] * (1.0 - frac) + cb[i] * frac for i in range(9)]
 
-        enriched, audit = attach_savant_shadow(lineup_rows, pitcher_hand, platoon, expected_bf)
+    matched_values, weighted_pairs = [], []
+    top, middle, bottom = [], [], []
+    match_methods = []
 
-        if isinstance(board_row, dict):
+    for idx, row in enumerate(rows):
+        pid = _row_pid(row)
+        name = _row_name(row)
+        rec = by_id.get(pid) if pid else None
+        method = "MLBAM_ID" if rec is not None else ""
+        if rec is None and name:
+            rec = by_name.get(_canon_name(name))
+            method = "NAME_CANONICAL" if rec is not None else ""
+        if rec is None and name:
+            rec = by_tokens.get(_token_key(name))
+            method = "NAME_TOKEN_KEY" if rec is not None else ""
 
-            board_row.update({
+        if rec is None:
+            row["Savant Match Status"] = "SAVANT_PLAYER_MATCH_UNCERTAIN"
+            rows[idx] = row
+            continue
 
-                "savant_enriched_lineup_rows": [dict(item) for item in enriched if isinstance(item, dict)],
+        raw_pa = int(rec["pa"])
+        raw_so = int(rec["so"])
+        raw_k = round(100.0 * raw_so / raw_pa, 3)
+        row["savant_raw_vs_hand_k_pct"] = raw_k
+        row["savant_raw_vs_hand_pa"] = raw_pa
+        row["savant_raw_vs_hand_so"] = raw_so
+        row["Savant Match Status"] = method
+        row["Savant Split Source"] = rec.get("source")
+        row["Savant Raw Math"] = f"{raw_so}/{raw_pa}"
 
-                "savant_shadow_status": audit.get("status"),
+        stored = rec.get("stored_k_pct")
+        if stored is not None:
+            row["Savant Stored-vs-Math Delta pp"] = round(float(stored) - raw_k, 3)
 
-                "savant_shadow_matched_hitters": audit.get("matched"),
+        used = None
+        for key in ("Used K%", "K% Used", "Raw_K_Rate", "Split K%", "Season K%"):
+            value = _num(row.get(key), None)
+            if value is not None:
+                used = value * 100.0 if abs(value) <= 1.0 else value
+                break
+        if used is not None:
+            delta = round(float(used) - raw_k, 3)
+            # `_kcard_lineup_html` reads model_minus_savant_pp.
+            row["model_minus_savant_pp"] = delta
+            row["savant_model_delta_pp"] = delta
 
-                "simple_savant_lineup_k_pct": audit.get("simple_savant_lineup_k_pct"),
+        matched_values.append(raw_k)
+        weight = slot_counts[idx] if idx < len(slot_counts) else 1.0
+        weighted_pairs.append((raw_k, weight))
+        (top if idx < 3 else middle if idx < 6 else bottom).append(raw_k)
+        match_methods.append(method)
+        rows[idx] = row
 
-                "raw_savant_order_weighted_k_exposure": audit.get("order_weighted_savant_k_pct"),
+    matched = len(matched_values)
+    wsum = sum(w for _, w in weighted_pairs)
+    audit = {
+        "status": "FULL" if rows and matched == len(rows) else "PARTIAL" if matched else "UNAVAILABLE",
+        "matched": matched,
+        "simple_savant_lineup_k_pct": round(sum(matched_values) / matched, 3) if matched else None,
+        "order_weighted_savant_k_pct": round(sum(v*w for v,w in weighted_pairs) / wsum, 3) if wsum > 0 else None,
+        "top3_savant_k_pct": round(sum(top) / len(top), 3) if top else None,
+        "middle3_savant_k_pct": round(sum(middle) / len(middle), 3) if middle else None,
+        "bottom3_savant_k_pct": round(sum(bottom) / len(bottom), 3) if bottom else None,
+        "display_bridge": "FINAL_CARD_SAVANT_SO_PA_V3",
+        "match_methods": match_methods,
+    }
 
-                "top3_savant_k_pct": audit.get("top3_savant_k_pct"),
-
-                "middle3_savant_k_pct": audit.get("middle3_savant_k_pct"),
-
-                "bottom3_savant_k_pct": audit.get("bottom3_savant_k_pct"),
-
-                "savant_shadow_projection_effect_k": 0.0,
-
-                "savant_shadow_mode": "SHADOW_NO_PRODUCTION_EFFECT",
-
-            })
-
-        return enriched, audit
-
-    except Exception as exc:
-
-        return list(lineup_rows or []), {"status": "UNAVAILABLE", "error": str(exc)[:140], "matched": 0}
+    if isinstance(board_row, dict):
+        board_row.update({
+            "savant_enriched_lineup_rows": [dict(x) for x in rows],
+            "savant_shadow_status": audit["status"],
+            "savant_shadow_matched_hitters": matched,
+            "simple_savant_lineup_k_pct": audit["simple_savant_lineup_k_pct"],
+            "raw_savant_order_weighted_k_exposure": audit["order_weighted_savant_k_pct"],
+            "top3_savant_k_pct": audit["top3_savant_k_pct"],
+            "middle3_savant_k_pct": audit["middle3_savant_k_pct"],
+            "bottom3_savant_k_pct": audit["bottom3_savant_k_pct"],
+            "savant_shadow_projection_effect_k": 0.0,
+            "savant_shadow_mode": "DISPLAY_ONLY_NO_PRODUCTION_EFFECT",
+        })
+    return rows, audit
 
 
 
@@ -124428,7 +124724,635 @@ if _batter_fs_from_context is None:
 
     raise RuntimeError("No implementation available for _batter_fs_from_context")
 
-_beta_projection_rows = globals().get('_impl_beta_projection_rows_07', globals().get('_impl_beta_projection_rows_06', globals().get('_impl_beta_projection_rows_05', globals().get('_impl_beta_projection_rows_04', globals().get('_impl_beta_projection_rows_03', globals().get('_impl_beta_projection_rows_02', globals().get('_impl_beta_projection_rows_01', None)))))))
+# CHALLENGER_PO_WORKLOAD_V3_2026_08_23
+# Pitching-Outs-only shadow challenger. Workload V2 remains the production selector.
+PO_WORKLOAD_V3_VERSION = "PO_WORKLOAD_V3_SHADOW_2026_08_23"
+PO_WORKLOAD_V3_CONFIG = {
+    "normal_starter_floor_ip": 4.55,
+    "strong_recent_floor_min_ip": 4.75,
+    "strong_recent_floor_max_ip": 5.20,
+    "low_data_prob_cap": 74.0,
+    "medium_data_prob_cap": 82.0,
+    "good_data_prob_cap": 90.0,
+    "absolute_prob_cap": 95.0,
+    "boundary_outs": 1.0,
+    "severe_miss_outs": 5.0,
+    "extreme_miss_outs": 8.0,
+}
+PO_WORKLOAD_V3_AUDIT_FILE = os.path.join(
+    str(globals().get("STORAGE_DIR", "learning_data")),
+    "pitching_outs_projection_audit_v3.csv",
+)
+
+
+def _po_v3_num(row, keys, default=np.nan):
+    for key in keys:
+        try:
+            value = row.get(key) if isinstance(row, dict) else None
+        except Exception:
+            value = None
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            continue
+        try:
+            out = float(str(value).replace("%", "").replace(",", "").strip())
+            if np.isfinite(out):
+                return out
+        except Exception:
+            continue
+    return default
+
+
+def _po_v3_text(row, keys, default=""):
+    for key in keys:
+        try:
+            value = row.get(key) if isinstance(row, dict) else None
+        except Exception:
+            value = None
+        if value not in (None, "", "—", "-", "nan", "NaN"):
+            return str(value)
+    return default
+
+
+def _po_v3_recent_ip(row):
+    direct = [
+        ("APP97 Live L5 IP Avg", "APP97_L5_IP"),
+        ("L5 IP Avg", "L5_IP"),
+        ("Recent IP L5", "RECENT_IP_L5"),
+        ("Recent Starts IP Avg", "RECENT_START_IP"),
+        ("recent_ip_l5", "HISTORY_RECENT_IP_L5"),
+        ("recent_ip", "HISTORY_RECENT_IP"),
+        ("AVG IP", "AVG_IP"),
+    ]
+    for key, source in direct:
+        v = _po_v3_num(row, [key], np.nan)
+        if np.isfinite(v) and 0.1 <= v <= 9.0:
+            return float(v), source
+    for key, source in [
+        ("Recent Outs L5", "RECENT_OUTS_L5"),
+        ("Recent Outs Median", "RECENT_OUTS_MEDIAN"),
+        ("L5 Outs Avg", "L5_OUTS"),
+    ]:
+        v = _po_v3_num(row, [key], np.nan)
+        if np.isfinite(v) and 1 <= v <= 27:
+            return float(v) / 3.0, source
+    return np.nan, "MISSING"
+
+
+def _po_v3_recent_bf(row):
+    for keys, source in [
+        (["APP97 Live L5 BF Median"], "APP97_L5_BF"),
+        (["APP97 Live L10 BF Median"], "APP97_L10_BF"),
+        (["Recent BF L5", "L5 BF Avg", "BF Avg L5"], "RECENT_L5_BF"),
+        (["Recent BF", "Recent BF Avg"], "RECENT_BF"),
+    ]:
+        v = _po_v3_num(row, keys, np.nan)
+        if np.isfinite(v) and 3 <= v <= 40:
+            return float(v), source
+    return np.nan, "MISSING"
+
+
+def _po_v3_pc_inputs(row):
+    families = {
+        "L3": _po_v3_num(row, ["Pitch Count Avg L3", "PO Fill Pitch Count L3", "pitch_count_avg_l3"], np.nan),
+        "L5": _po_v3_num(row, ["Pitch Count Avg L5", "PO Fill Pitch Count L5", "pitch_count_avg_l5"], np.nan),
+        "L10": _po_v3_num(row, ["Pitch Count Avg L10", "PO Fill Pitch Count L10"], np.nan),
+        "SEASON": _po_v3_num(row, ["Season Avg Pitch Count", "PO Fill Season Pitch Count Avg"], np.nan),
+        "LAST": _po_v3_num(row, ["Last Start Pitch Count", "PO Fill Last Pitch Count"], np.nan),
+        "MAX": _po_v3_num(row, ["Max Pitch Count L10", "PO Fill Max Pitch Count L10"], np.nan),
+    }
+    return {k: v for k, v in families.items() if np.isfinite(v) and 20 <= v <= 130}
+
+
+def _po_v3_pc_baseline(row):
+    vals = _po_v3_pc_inputs(row)
+    weights = {"L3": 1.15, "L5": 1.25, "L10": 1.00, "SEASON": 0.85, "LAST": 0.55, "MAX": 0.25}
+    if not vals:
+        return np.nan, "MISSING"
+    num = sum(float(v) * weights[k] for k, v in vals.items())
+    den = sum(weights[k] for k in vals)
+    return float(num / den), "+".join(vals.keys())
+
+
+def _po_v3_capacity_ip(row, pc):
+    if not np.isfinite(pc):
+        return np.nan, "MISSING"
+    pbf = _po_v3_num(row, ["Pitch Efficiency P/BF", "PO Fill P/BF", "P/BF"], np.nan)
+    if np.isfinite(pbf) and pbf > 0:
+        return float(np.clip((pc / max(pbf, 3.15)) / 4.25, 2.0, 8.0)), "PC/PBF"
+    ppi = _po_v3_num(row, ["Pitch Efficiency P/IP", "PO Fill P/IP", "P/IP"], np.nan)
+    if np.isfinite(ppi) and ppi > 0:
+        return float(np.clip(pc / max(ppi, 12.5), 2.0, 8.0)), "PC/PIP"
+    return float(np.clip(pc / 16.8, 2.0, 8.0)), "PC/DEFAULT_EFF"
+
+
+def _po_v3_restriction(row, recent_ip, recent_bf):
+    role = _po_workload_v2_role_context(row) if "_po_workload_v2_role_context" in globals() else {"label": "STARTER", "explicit_short_role": False, "ip_cap": None}
+    blob = ""
+    try:
+        blob = _po_workload_v2_blob(row) if "_po_workload_v2_blob" in globals() else " ".join(str(v) for v in row.values()).upper()
+    except Exception:
+        blob = ""
+    explicit_terms = [
+        "RETURN FROM IL", "INJURY_RETURN", "REHAB", "BUILD UP", "RAMP",
+        "PITCH LIMIT", "PITCH_LIMIT", "OPENER", "OPENING PITCHER", "BULK",
+        "TANDEM", "PIGGYBACK", "NON_TRADITIONAL_ROLE", "ROLE_CHANGE",
+    ]
+    reasons = [x for x in explicit_terms if x in blob]
+    hard = bool(role.get("explicit_short_role")) or bool(reasons)
+    confidence = 95.0 if hard else 0.0
+    rtype = str(role.get("label") or "STARTER") if hard else "NONE"
+
+    pcs = _po_v3_pc_inputs(row)
+    l5 = pcs.get("L5")
+    last = pcs.get("LAST")
+    corroborated_short = (
+        l5 is not None and last is not None and l5 <= 78 and last <= 70
+        and ((np.isfinite(recent_ip) and recent_ip <= 4.50) or (np.isfinite(recent_bf) and recent_bf <= 19.0))
+    )
+    if not hard and corroborated_short:
+        hard = True
+        confidence = 84.0
+        rtype = "VERIFIED_SHORT_WORKLOAD"
+        reasons.append("SHORT_PC+RECENT_IP/BF")
+    elif not hard and l5 is not None and last is not None and l5 <= 78 and last <= 70:
+        # Pitch count alone is evidence, but not enough to become a hard restriction.
+        confidence = 55.0
+        rtype = "SHORT_PC_WATCH"
+        reasons.append("SHORT_PC_UNCORROBORATED")
+    return hard, rtype, confidence, reasons, role
+
+
+def _po_v3_completeness(row, recent_ip, recent_bf, pc, role):
+    score = 0.0
+    missing = []
+    if np.isfinite(recent_ip): score += 25.0
+    else: missing.append("recent IP")
+    if np.isfinite(recent_bf): score += 20.0
+    else: missing.append("recent BF")
+    if np.isfinite(pc): score += 25.0
+    else: missing.append("recent pitch count")
+    ppi = _po_v3_num(row, ["Pitch Efficiency P/IP", "PO Fill P/IP", "P/IP"], np.nan)
+    pbf = _po_v3_num(row, ["Pitch Efficiency P/BF", "PO Fill P/BF", "P/BF"], np.nan)
+    if np.isfinite(ppi) or np.isfinite(pbf): score += 10.0
+    else: missing.append("pitch efficiency")
+    if role and str(role.get("label") or "").strip(): score += 10.0
+    else: missing.append("role")
+    hook = _po_v3_num(row, ["Recent Hook Rate", "PO Fill Hook Rate"], np.nan)
+    deep = _po_v3_num(row, ["Deep Start Rate", "PO Fill Deep Start Rate"], np.nan)
+    if np.isfinite(hook) or np.isfinite(deep): score += 10.0
+    else: missing.append("manager leash")
+    label = "HIGH" if score >= 80 else "GOOD" if score >= 65 else "LIMITED" if score >= 45 else "LOW"
+    return float(score), label, missing
+
+
+def _po_v3_candidate_probability(row, projection, line, side, completeness, hard_conf):
+    if not np.isfinite(projection) or not np.isfinite(line) or side not in {"OVER", "UNDER"}:
+        return np.nan, np.nan, np.nan, ""
+    vol = _po_v3_num(row, ["IP Volatility Score"], 50.0)
+    vol = 50.0 if not np.isfinite(vol) else float(vol)
+    sd = 2.25 + max(0.0, min(80.0, vol)) / 34.0
+    if completeness < 45: sd += 0.90
+    elif completeness < 65: sd += 0.50
+    elif completeness < 80: sd += 0.20
+    hook = _po_v3_num(row, ["Recent Hook Rate", "PO Fill Hook Rate"], np.nan)
+    if np.isfinite(hook) and hook >= 50: sd += 0.35
+    damage_score = _po_v3_num(row, ["Damage Risk Score", "PO Fill Damage Score", "run_damage_score"], np.nan)
+    damage_label = _po_v3_text(row, ["Damage Risk Label", "PO Fill Damage Label", "run_damage_risk_level"], "").upper()
+    if "HIGH" in damage_label or (np.isfinite(damage_score) and damage_score >= 65): sd += 0.35
+    elif "MED" in damage_label or (np.isfinite(damage_score) and damage_score >= 45): sd += 0.15
+    sd = float(np.clip(sd, 2.0, 6.2))
+    try:
+        rng = _sim_stable_rng("PO_V3", _po_v3_text(row, ["Pitcher"], ""), round(float(projection), 3), round(sd, 3), PO_WORKLOAD_V3_VERSION)
+    except Exception:
+        rng = np.random.default_rng(20260823)
+    samples = np.rint(rng.normal(float(projection), sd, 12000)).astype(int)
+    samples = np.clip(samples, 0, 27)
+    over = float(np.mean(samples > float(line)) * 100.0)
+    under = float(np.mean(samples < float(line)) * 100.0)
+    p = over if side == "OVER" else under
+    cap = float(PO_WORKLOAD_V3_CONFIG["absolute_prob_cap"])
+    if hard_conf < 85:
+        if completeness < 45: cap = min(cap, PO_WORKLOAD_V3_CONFIG["low_data_prob_cap"])
+        elif completeness < 65: cap = min(cap, PO_WORKLOAD_V3_CONFIG["medium_data_prob_cap"])
+        elif completeness < 80: cap = min(cap, PO_WORKLOAD_V3_CONFIG["good_data_prob_cap"])
+    p = min(float(p), float(cap))
+    return round(p, 1), round(over, 1), round(under, 1), round(sd, 2)
+
+
+def _po_v3_profile(row):
+    row = dict(row or {})
+    line = _po_v3_num(row, ["UD Line", "Line", "Outs Line"], np.nan)
+    beta_ip = _po_v3_num(row, ["Beta IP"], np.nan)
+    beta_proj = _po_v3_num(row, ["Beta Projection", "Projection", "Projected Outs"], np.nan)
+    if not np.isfinite(beta_ip) and np.isfinite(beta_proj): beta_ip = beta_proj / 3.0
+    original_ip = _po_v3_num(row, ["Original IP"], np.nan)
+    recent_ip, recent_ip_source = _po_v3_recent_ip(row)
+    recent_bf, recent_bf_source = _po_v3_recent_bf(row)
+    pc, pc_source = _po_v3_pc_baseline(row)
+    capacity_ip, capacity_source = _po_v3_capacity_ip(row, pc)
+    hard, restriction_type, restriction_conf, hard_reasons, role = _po_v3_restriction(row, recent_ip, recent_bf)
+    completeness, confidence_label, missing = _po_v3_completeness(row, recent_ip, recent_bf, pc, role)
+
+    components = []
+    if np.isfinite(recent_ip): components.append((recent_ip, 0.40, "recent IP"))
+    if np.isfinite(recent_bf): components.append((recent_bf / 4.25, 0.22, "recent BF"))
+    if np.isfinite(capacity_ip): components.append((capacity_ip, 0.18, "pitch capacity"))
+    if np.isfinite(original_ip): components.append((original_ip, 0.12, "original IP"))
+    if np.isfinite(beta_ip): components.append((beta_ip, 0.08, "legacy Beta IP"))
+    if not components:
+        return {
+            "PO V3 Version": PO_WORKLOAD_V3_VERSION,
+            "PO V3 Status": "UNAVAILABLE",
+            "PO V3 Workload Reason": "No workload inputs available",
+            "PO V3 Data Completeness %": round(completeness, 1),
+            "PO V3 Workload Confidence": confidence_label,
+            "PO V3 Missing Inputs": ", ".join(missing),
+        }
+    wsum = sum(w for _, w, _ in components)
+    pre_ip = sum(v * w for v, w, _ in components) / wsum
+    base_ip = float(pre_ip)
+
+    soft_score, soft_reasons = _po_workload_v2_soft_risk(row) if "_po_workload_v2_soft_risk" in globals() else (0.0, [])
+    soft_penalty = min(max(0.0, float(soft_score)) * 0.26, 0.30)
+    support_boost = 0.0
+    deep = _po_v3_num(row, ["Deep Start Rate", "PO Fill Deep Start Rate"], np.nan)
+    if np.isfinite(deep) and deep >= 55 and (not np.isfinite(pc) or pc >= 84): support_boost += 0.12
+    if np.isfinite(pc) and pc >= 92: support_boost += 0.08
+
+    final_ip = base_ip - soft_penalty + support_boost
+    reason_bits = ["baseline=" + "+".join(name for _, _, name in components)]
+    if hard:
+        reason_bits.append("HARD=" + restriction_type)
+        role_cap = role.get("ip_cap") if isinstance(role, dict) else None
+        try: role_cap = float(role_cap)
+        except Exception: role_cap = np.nan
+        if np.isfinite(role_cap):
+            final_ip = min(final_ip, role_cap)
+        elif np.isfinite(capacity_ip):
+            final_ip = min(final_ip - 0.15, capacity_ip + 0.10)
+        else:
+            final_ip -= 0.30
+    else:
+        # Soft matchup/hook/damage risk can lower the mean gradually, but it cannot
+        # turn a normal established starter into a 1-3 IP projection by itself.
+        starter_floor = float(PO_WORKLOAD_V3_CONFIG["normal_starter_floor_ip"])
+        if np.isfinite(recent_ip) and completeness >= 60 and recent_ip >= 5.25:
+            recent_floor = min(float(PO_WORKLOAD_V3_CONFIG["strong_recent_floor_max_ip"]), recent_ip - 0.60)
+            starter_floor = max(starter_floor, float(PO_WORKLOAD_V3_CONFIG["strong_recent_floor_min_ip"]), recent_floor)
+            reason_bits.append(f"recent-workload floor {starter_floor:.2f} IP")
+        elif np.isfinite(recent_ip) and completeness >= 60 and recent_ip >= 4.90:
+            starter_floor = max(starter_floor, min(4.75, recent_ip - 0.30))
+        if final_ip < starter_floor:
+            final_ip = starter_floor
+            reason_bits.append(f"normal-starter floor {starter_floor:.2f} IP")
+
+    final_ip = float(np.clip(final_ip, 0.1, 8.2))
+    projection = round(final_ip * 3.0, 1)
+    edge = projection - line if np.isfinite(line) else np.nan
+    side = "OVER" if np.isfinite(edge) and edge > 0 else "UNDER" if np.isfinite(edge) and edge < 0 else "PASS"
+    prob, over_prob, under_prob, sd = _po_v3_candidate_probability(row, projection, line, side, completeness, restriction_conf)
+
+    abs_edge = abs(edge) if np.isfinite(edge) else 0.0
+    if side not in {"OVER", "UNDER"}:
+        tier = "PASS"
+    elif completeness < 45 and restriction_conf < 85:
+        tier = "TRACK ONLY"
+    elif abs_edge >= 3.0 and np.isfinite(prob) and prob >= 60 and completeness >= 65:
+        tier = "V3 OFFICIAL CANDIDATE"
+    elif abs_edge >= 1.75 and np.isfinite(prob) and prob >= 57 and completeness >= 55:
+        tier = "V3 PLAYABLE CANDIDATE"
+    else:
+        tier = "V3 TRACK"
+
+    if soft_reasons:
+        reason_bits.append("soft risk=" + ", ".join(soft_reasons[:4]))
+    if np.isfinite(pc): reason_bits.append(f"PC {pc:.0f}")
+    if np.isfinite(recent_ip): reason_bits.append(f"recent IP {recent_ip:.2f}")
+    if np.isfinite(recent_bf): reason_bits.append(f"recent BF {recent_bf:.1f}")
+    if missing: reason_bits.append("missing=" + ", ".join(missing))
+
+    return {
+        "PO V3 Version": PO_WORKLOAD_V3_VERSION,
+        "PO V3 Status": "SHADOW_ONLY",
+        "PO V3 Recent IP Baseline": round(recent_ip, 2) if np.isfinite(recent_ip) else "",
+        "PO V3 Recent IP Source": recent_ip_source,
+        "PO V3 Recent BF Baseline": round(recent_bf, 1) if np.isfinite(recent_bf) else "",
+        "PO V3 Recent BF Source": recent_bf_source,
+        "PO V3 Recent PC Baseline": round(pc, 1) if np.isfinite(pc) else "",
+        "PO V3 Recent PC Source": pc_source,
+        "PO V3 Capacity IP": round(capacity_ip, 2) if np.isfinite(capacity_ip) else "",
+        "PO V3 Capacity Source": capacity_source,
+        "PO V3 Data Completeness %": round(completeness, 1),
+        "PO V3 Workload Confidence": confidence_label,
+        "PO V3 Missing Inputs": ", ".join(missing),
+        "PO V3 Restriction Type": restriction_type,
+        "PO V3 Restriction Confidence %": round(restriction_conf, 1),
+        "PO V3 Hard Restriction": "YES" if hard else "NO",
+        "PO V3 Restriction Reasons": ", ".join(hard_reasons),
+        "PO V3 Pre-Risk IP": round(pre_ip, 2),
+        "PO V3 Soft Risk Score": round(float(soft_score), 2),
+        "PO V3 Soft Adjustment IP": round(-soft_penalty + support_boost, 2),
+        "PO V3 Final IP": round(final_ip, 2),
+        "PO V3 Projection": projection,
+        "PO V3 Candidate Lean": side,
+        "PO V3 Candidate Edge": round(edge, 2) if np.isfinite(edge) else "",
+        "PO V3 Candidate Probability %": prob if np.isfinite(_po_v3_num({"p": prob}, ["p"], np.nan)) else "",
+        "PO V3 Over %": over_prob if np.isfinite(_po_v3_num({"p": over_prob}, ["p"], np.nan)) else "",
+        "PO V3 Under %": under_prob if np.isfinite(_po_v3_num({"p": under_prob}, ["p"], np.nan)) else "",
+        "PO V3 SD Outs": sd,
+        "PO V3 Candidate Tier": tier,
+        "PO V3 Total Workload Adjustment Outs": round((final_ip - pre_ip) * 3.0, 2),
+        "PO V3 Workload Reason": "; ".join(reason_bits),
+    }
+
+
+_PO_V3_BASE_ROWS = globals().get('_impl_beta_projection_rows_07', globals().get('_impl_beta_projection_rows_06', globals().get('_impl_beta_projection_rows_05', globals().get('_impl_beta_projection_rows_04', globals().get('_impl_beta_projection_rows_03', globals().get('_impl_beta_projection_rows_02', globals().get('_impl_beta_projection_rows_01', None)))))))
+
+
+def _impl_beta_projection_rows_po_v3(board, market):
+    if _PO_V3_BASE_ROWS is None:
+        return pd.DataFrame()
+    df = _PO_V3_BASE_ROWS(board, market)
+    if not isinstance(df, pd.DataFrame) or df.empty or str(market or '').upper() != 'OUTS':
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_po_v3_profile(row))
+        except Exception as exc:
+            row["PO V3 Version"] = PO_WORKLOAD_V3_VERSION
+            row["PO V3 Status"] = "ERROR"
+            row["PO V3 Workload Reason"] = f"V3 profile error: {str(exc)[:140]}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _po_v3_side_result(side, actual, line):
+    side = str(side or '').upper()
+    if not np.isfinite(actual) or not np.isfinite(line) or side not in {'OVER','UNDER'}:
+        return 'NO_ACTION'
+    if actual == line: return 'PUSH'
+    win = actual > line if side == 'OVER' else actual < line
+    return 'WIN' if win else 'LOSS'
+
+
+def _po_v3_outcome_class(side_result, abs_error, actual, line):
+    cfg = PO_WORKLOAD_V3_CONFIG
+    if side_result == 'LOSS' and np.isfinite(actual) and np.isfinite(line) and abs(actual-line) <= cfg['boundary_outs']:
+        return 'BOUNDARY_LOSS'
+    if side_result == 'WIN' and np.isfinite(abs_error) and abs_error >= cfg['severe_miss_outs']:
+        return 'CORRECT_SIDE_BAD_PROJECTION'
+    if np.isfinite(abs_error) and abs_error >= cfg['extreme_miss_outs']:
+        return 'EXTREME_PROJECTION_MISS'
+    if np.isfinite(abs_error) and abs_error >= cfg['severe_miss_outs']:
+        return 'SEVERE_PROJECTION_MISS'
+    if side_result == 'LOSS': return 'NORMAL_MISS'
+    if side_result == 'WIN': return 'CORRECT_SIDE_GOOD_PROJECTION'
+    return side_result
+
+
+def _po_v3_append_audit(po_df, actuals_df):
+    if not isinstance(po_df, pd.DataFrame) or po_df.empty or not isinstance(actuals_df, pd.DataFrame) or actuals_df.empty:
+        return 0
+    actual_map = {}
+    for _, rr in actuals_df.iterrows():
+        name = _tpl_norm_name(rr.get('Pitcher') or rr.get('Player') or rr.get('Name')) if '_tpl_norm_name' in globals() else str(rr.get('Pitcher') or '').lower().strip()
+        if name: actual_map[name] = rr.to_dict()
+    audit = []
+    for _, rr in po_df.iterrows():
+        row = rr.to_dict()
+        # Ensure V3 exists even if grader receives a saved row from before the public V3 wrapper.
+        if not row.get('PO V3 Version'):
+            try: row.update(_po_v3_profile(row))
+            except Exception: pass
+        name = _tpl_norm_name(row.get('Pitcher')) if '_tpl_norm_name' in globals() else str(row.get('Pitcher') or '').lower().strip()
+        actual_row = actual_map.get(name)
+        if not actual_row: continue
+        actual = _tpl_num(actual_row.get('Actual Outs'), None) if '_tpl_num' in globals() else None
+        if actual is None and '_tpl_ip_to_outs' in globals():
+            actual = _tpl_ip_to_outs(actual_row.get('Actual IP') or actual_row.get('IP'))
+        try: actual = float(actual)
+        except Exception: continue
+        line = _po_v3_num(row, ['UD Line','Line'], np.nan)
+        if not np.isfinite(line): continue
+        v2_proj = _po_v3_num(row, ['PO Active Projection','PO Workload V2 Projection','Beta Projection'], np.nan)
+        v2_side = _po_v3_text(row, ['PO Active Lean','PO Workload V2 Lean','Beta Lean'], '')
+        v2_prob = _po_v3_num(row, ['PO Active Hit %','PO Sim Current Side Prob %','PO Workload V2 Hit %'], np.nan)
+        v3_proj = _po_v3_num(row, ['PO V3 Projection'], np.nan)
+        v3_side = _po_v3_text(row, ['PO V3 Candidate Lean'], '')
+        v3_prob = _po_v3_num(row, ['PO V3 Candidate Probability %'], np.nan)
+        v2_abs = abs(actual-v2_proj) if np.isfinite(v2_proj) else np.nan
+        v3_abs = abs(actual-v3_proj) if np.isfinite(v3_proj) else np.nan
+        v2_result = _po_v3_side_result(v2_side, actual, line)
+        v3_result = _po_v3_side_result(v3_side, actual, line)
+        date = _po_v3_text(row, ['Date','Game Date','game_date','date'], datetime.now().date().isoformat())
+        audit.append({
+            'Date': date,
+            'Pitcher': row.get('Pitcher',''),
+            'Opponent': _po_v3_text(row, ['Opponent','opponent','Matchup'], ''),
+            'Line': line,
+            'Production Side': v2_side,
+            'Production Projection Outs': v2_proj if np.isfinite(v2_proj) else '',
+            'Production Projection IP': round(v2_proj/3.0,2) if np.isfinite(v2_proj) else '',
+            'Production Probability %': v2_prob if np.isfinite(v2_prob) else '',
+            'Production Status': row.get('PO Official Tier',''),
+            'Production Side Result': v2_result,
+            'Production Abs Projection Error': round(v2_abs,2) if np.isfinite(v2_abs) else '',
+            'Production Signed Error': round(actual-v2_proj,2) if np.isfinite(v2_proj) else '',
+            'V3 Side': v3_side,
+            'V3 Projection Outs': v3_proj if np.isfinite(v3_proj) else '',
+            'V3 Projection IP': round(v3_proj/3.0,2) if np.isfinite(v3_proj) else '',
+            'V3 Probability %': v3_prob if np.isfinite(v3_prob) else '',
+            'V3 Candidate Tier': row.get('PO V3 Candidate Tier',''),
+            'V3 Side Result': v3_result,
+            'V3 Abs Projection Error': round(v3_abs,2) if np.isfinite(v3_abs) else '',
+            'V3 Signed Error': round(actual-v3_proj,2) if np.isfinite(v3_proj) else '',
+            'V3 Outcome Class': _po_v3_outcome_class(v3_result, v3_abs, actual, line),
+            'Actual Outs': actual,
+            'Actual IP': actual_row.get('Actual IP') or actual_row.get('IP') or '',
+            'Distance Actual From Line': round(actual-line,2),
+            'Recent IP Baseline': row.get('PO V3 Recent IP Baseline',''),
+            'Recent BF Baseline': row.get('PO V3 Recent BF Baseline',''),
+            'Recent Pitch Count Baseline': row.get('PO V3 Recent PC Baseline',''),
+            'Workload Data Completeness %': row.get('PO V3 Data Completeness %',''),
+            'Workload Confidence': row.get('PO V3 Workload Confidence',''),
+            'Restriction Type': row.get('PO V3 Restriction Type',''),
+            'Restriction Confidence %': row.get('PO V3 Restriction Confidence %',''),
+            'Pre-Cal Projection': row.get('Pre-PO Calibration Projection', row.get('Beta Projection','')),
+            'V3 Pre-Risk IP': row.get('PO V3 Pre-Risk IP',''),
+            'V3 Final Projection': row.get('PO V3 Projection',''),
+            'V3 Total Workload Adjustment Outs': row.get('PO V3 Total Workload Adjustment Outs',''),
+            'V3 Workload Reason': row.get('PO V3 Workload Reason',''),
+            'V3 Version': PO_WORKLOAD_V3_VERSION,
+            'Graded At': datetime.now().isoformat(timespec='seconds'),
+        })
+    if not audit: return 0
+    new = pd.DataFrame(audit)
+    try:
+        os.makedirs(os.path.dirname(PO_WORKLOAD_V3_AUDIT_FILE) or '.', exist_ok=True)
+        if os.path.exists(PO_WORKLOAD_V3_AUDIT_FILE):
+            old = pd.read_csv(PO_WORKLOAD_V3_AUDIT_FILE, low_memory=False)
+            out = pd.concat([old,new], ignore_index=True, sort=False)
+        else:
+            out = new
+        keys = [c for c in ['Date','Pitcher','Line','V3 Version'] if c in out.columns]
+        if keys: out = out.drop_duplicates(subset=keys, keep='last')
+        out.to_csv(PO_WORKLOAD_V3_AUDIT_FILE, index=False)
+    except Exception:
+        return 0
+    return len(new)
+
+
+_po_v3_legacy_grade_pitching_outs_loss_lab = grade_pitching_outs_loss_lab
+
+def grade_pitching_outs_loss_lab(po_df, actuals_df):
+    result = _po_v3_legacy_grade_pitching_outs_loss_lab(po_df, actuals_df)
+    try:
+        n = _po_v3_append_audit(po_df, actuals_df)
+        if isinstance(result, dict):
+            result = dict(result)
+            result['projection_audit_v3_rows'] = n
+            result['projection_audit_v3_path'] = PO_WORKLOAD_V3_AUDIT_FILE
+    except Exception:
+        pass
+    return result
+
+
+def _po_v3_calibration_summary():
+    try:
+        if not os.path.exists(PO_WORKLOAD_V3_AUDIT_FILE): return pd.DataFrame()
+        df = pd.read_csv(PO_WORKLOAD_V3_AUDIT_FILE, low_memory=False)
+        if df.empty: return pd.DataFrame()
+        p = pd.to_numeric(df.get('V3 Probability %'), errors='coerce')
+        bins = [55,60,65,70,75,80,85,90,95,101]
+        labels = ['55-59.9','60-64.9','65-69.9','70-74.9','75-79.9','80-84.9','85-89.9','90-94.9','95%+']
+        df = df.assign(_bucket=pd.cut(p, bins=bins, labels=labels, right=False))
+        df = df[df['_bucket'].notna()].copy()
+        if df.empty: return pd.DataFrame()
+        df['_win'] = df['V3 Side Result'].astype(str).eq('WIN').astype(int)
+        df['_loss'] = df['V3 Side Result'].astype(str).eq('LOSS').astype(int)
+        df['_abs'] = pd.to_numeric(df['V3 Abs Projection Error'], errors='coerce')
+        df['_signed'] = pd.to_numeric(df['V3 Signed Error'], errors='coerce')
+        out = df.groupby('_bucket', observed=False).agg(
+            Plays=('V3 Side Result','count'), Wins=('_win','sum'), Losses=('_loss','sum'),
+            Avg_Projection_Error=('_abs','mean'), Avg_Signed_Error=('_signed','mean')
+        ).reset_index().rename(columns={'_bucket':'Probability Bucket'})
+        out['Win %'] = np.where(out['Wins']+out['Losses']>0, 100*out['Wins']/(out['Wins']+out['Losses']), np.nan)
+        out['Avg Projection Error'] = out['Avg_Projection_Error'].round(2)
+        out['Avg Signed Error'] = out['Avg_Signed_Error'].round(2)
+        return out[['Probability Bucket','Plays','Wins','Losses','Win %','Avg Projection Error','Avg Signed Error']]
+    except Exception:
+        return pd.DataFrame()
+
+
+_po_v3_legacy_card_renderer = _po_render_player_cards
+
+def _po_render_player_cards(df, board=None, limit=None):
+    """Cleaner PO cards. Production V2 remains primary; V3 is clearly labeled shadow."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty: return 0
+    show = df.head(int(limit)) if limit else df
+    cards = []
+    for _, rr in show.iterrows():
+        try:
+            row = rr.to_dict()
+            pitcher = _po_v3_text(row, ['Pitcher'], 'Pitcher')
+            matchup = _po_v3_text(row, ['Matchup'], '')
+            away, home = _po_card_matchup_teams(matchup) if '_po_card_matchup_teams' in globals() else ('','')
+            logo_team = away or home
+            if board and '_kcard_board_lookup' in globals() and '_kcard_pitcher_team' in globals():
+                try:
+                    lookup = _kcard_board_lookup(board)
+                    key = _tpl_norm_name(pitcher) if '_tpl_norm_name' in globals() else pitcher.lower().strip()
+                    p = lookup.get(key,{})
+                    logo_team = _kcard_pitcher_team(row,p) or logo_team
+                except Exception: pass
+            logo_url = _po_card_team_logo(logo_team) if '_po_card_team_logo' in globals() else ''
+            logo_html = f"<img class='pov3-logo' src='{html.escape(logo_url)}'/>" if logo_url else f"<div class='pov3-logo pov3-fallback'>{html.escape((logo_team or 'MLB')[:3])}</div>"
+            line = _po_v3_num(row,['UD Line'],np.nan)
+            active_proj = _po_v3_num(row,['PO Active Projection','PO Workload V2 Projection'],np.nan)
+            active_ip = _po_v3_num(row,['PO Active IP','PO Workload V2 IP'],np.nan)
+            active_side = _po_v3_text(row,['PO Active Lean'],'TRACK').upper()
+            active_prob = _po_v3_num(row,['PO Active Hit %','PO Sim Current Side Prob %'],np.nan)
+            tier = _po_v3_text(row,['PO Official Tier'],'TRACK')
+            v3_proj = _po_v3_num(row,['PO V3 Projection'],np.nan)
+            v3_ip = _po_v3_num(row,['PO V3 Final IP'],np.nan)
+            v3_side = _po_v3_text(row,['PO V3 Candidate Lean'],'—')
+            v3_prob = _po_v3_num(row,['PO V3 Candidate Probability %'],np.nan)
+            v3_tier = _po_v3_text(row,['PO V3 Candidate Tier'],'SHADOW')
+            data = _po_v3_num(row,['PO V3 Data Completeness %'],np.nan)
+            conf = _po_v3_text(row,['PO V3 Workload Confidence'],'—')
+            rip = _po_v3_num(row,['PO V3 Recent IP Baseline'],np.nan)
+            rbf = _po_v3_num(row,['PO V3 Recent BF Baseline'],np.nan)
+            rpc = _po_v3_num(row,['PO V3 Recent PC Baseline'],np.nan)
+            restriction = _po_v3_text(row,['PO V3 Restriction Type'],'NONE')
+            rconf = _po_v3_num(row,['PO V3 Restriction Confidence %'],np.nan)
+            hook = _po_v3_num(row,['Recent Hook Rate','PO Fill Hook Rate'],np.nan)
+            damage = _po_v3_text(row,['Damage Risk Label','PO Fill Damage Label','run_damage_risk_level'],'—')
+            reason = _po_v3_text(row,['PO V3 Workload Reason'],'')
+            missing = _po_v3_text(row,['PO V3 Missing Inputs'],'')
+            cls = 'over' if 'OVER' in active_side else 'under' if 'UNDER' in active_side else 'track'
+            def f(v,d=1): return '—' if not np.isfinite(v) else f'{v:.{d}f}'
+            cards.append(f"""
+            <article class='pov3-card {cls}'>
+              <div class='pov3-head'><div class='pov3-id'>{logo_html}<div><h3>{html.escape(pitcher)}</h3><p>{html.escape(matchup)}</p></div></div><span class='pov3-tier'>{html.escape(tier)}</span></div>
+              <div class='pov3-compare'>
+                <div class='pov3-primary'><span>PRODUCTION V2</span><strong>{f(active_proj)}</strong><b>{html.escape(active_side)} {f(line)}</b><small>{f(active_ip,2)} IP · {f(active_prob)}%</small></div>
+                <div class='pov3-shadow'><span>CHALLENGER V3 · SHADOW</span><strong>{f(v3_proj)}</strong><b>{html.escape(v3_side)} {f(line)}</b><small>{f(v3_ip,2)} IP · {f(v3_prob)}% · {html.escape(v3_tier)}</small></div>
+              </div>
+              <div class='pov3-grid'>
+                <div><span>RECENT IP</span><b>{f(rip,2)}</b></div><div><span>RECENT BF</span><b>{f(rbf)}</b></div><div><span>RECENT PC</span><b>{f(rpc)}</b></div>
+                <div><span>DATA</span><b>{f(data,0)}%</b><small>{html.escape(conf)}</small></div><div><span>HOOK</span><b>{f(hook,0)}%</b></div><div><span>DAMAGE</span><b>{html.escape(damage)}</b></div>
+              </div>
+              <div class='pov3-context'><b>Role / restriction:</b> {html.escape(restriction)}{(' · '+f(rconf,0)+'% confidence') if np.isfinite(rconf) and rconf>0 else ''}</div>
+              <div class='pov3-note'><b>V3 workload:</b> {html.escape(reason or 'No extra workload note')}</div>
+              {f"<div class='pov3-warning'><b>Missing workload data:</b> {html.escape(missing)}</div>" if missing else ''}
+            </article>""")
+        except Exception as exc:
+            cards.append(f"<article class='pov3-card track'><h3>Pitching Outs row</h3><p>{html.escape(str(exc)[:160])}</p></article>")
+    css = r"""
+    <style>
+    .pov3-wrap{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:8px 0 18px}
+    .pov3-card{background:linear-gradient(145deg,#0b1321,#07101c);border:1px solid #26364b;border-radius:17px;padding:15px;color:#eef5ff;box-shadow:0 10px 26px rgba(0,0,0,.23)}
+    .pov3-card.over{border-top:3px solid #2ed8ff}.pov3-card.under{border-top:3px solid #ffe06a}.pov3-card.track{border-top:3px solid #ff6b75}
+    .pov3-head,.pov3-id{display:flex;align-items:center}.pov3-head{justify-content:space-between;gap:10px;margin-bottom:10px}.pov3-id{gap:10px;min-width:0}
+    .pov3-logo{width:40px;height:40px;object-fit:contain;border-radius:50%;background:#111b2a;border:1px solid #2c3c52;padding:4px}.pov3-fallback{display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:900}
+    .pov3-head h3{margin:0;font-size:17px}.pov3-head p{margin:3px 0 0;color:#98a8bd;font-size:10px}.pov3-tier{font-size:9px;font-weight:900;border:1px solid #51647d;border-radius:999px;padding:5px 8px;white-space:nowrap}
+    .pov3-compare{display:grid;grid-template-columns:1fr 1fr;gap:8px}.pov3-primary,.pov3-shadow{background:#0d1827;border:1px solid #22344d;border-radius:13px;padding:11px}.pov3-shadow{border-color:#21586b}
+    .pov3-compare span,.pov3-grid span{display:block;color:#8fa1b9;font-size:8px;font-weight:900;letter-spacing:.07em}.pov3-compare strong{display:block;color:#47d9ff;font-size:27px;line-height:1;margin:6px 0}.pov3-shadow strong{color:#9cecff}.pov3-compare b{font-size:11px}.pov3-compare small{display:block;color:#a8b4c3;font-size:9px;margin-top:4px}
+    .pov3-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:9px}.pov3-grid>div{background:#0a1421;border:1px solid #1e2f45;border-radius:10px;padding:8px;min-height:49px}.pov3-grid b{display:block;font-size:13px;margin-top:4px}.pov3-grid small{font-size:8px;color:#9fb0c4}
+    .pov3-context,.pov3-note,.pov3-warning{font-size:9.5px;line-height:1.35;color:#aeb9c7;border-top:1px solid #1d2b3e;padding-top:8px;margin-top:8px}.pov3-context b,.pov3-note b{color:#eff5ff}.pov3-warning{color:#ffd28a}
+    @media(max-width:900px){.pov3-wrap{grid-template-columns:1fr}}@media(max-width:520px){.pov3-card{padding:11px}.pov3-compare strong{font-size:24px}.pov3-grid{gap:5px}.pov3-grid>div{padding:7px}}
+    </style>"""
+    full = css + "<div class='pov3-wrap'>" + ''.join(cards) + "</div>"
+    full = "\n".join(line.lstrip() for line in full.splitlines()).strip()
+    st.html(full) if hasattr(st,'html') else st.markdown(full, unsafe_allow_html=True)
+    return len(cards)
+
+
+_po_v3_legacy_render_po = _impl_render_beta_pitching_outs_tab_06
+
+def _impl_render_beta_pitching_outs_tab_po_v3(board):
+    _po_v3_legacy_render_po(board)
+    summary = _po_v3_calibration_summary()
+    if isinstance(summary, pd.DataFrame) and not summary.empty:
+        with st.expander('Pitching Outs V3 — forward calibration / projection accuracy', expanded=False):
+            st.caption('V3 is shadow-only. Side accuracy and projection accuracy are tracked separately; production V2 is not replaced from this table automatically.')
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+            try:
+                audit = pd.read_csv(PO_WORKLOAD_V3_AUDIT_FILE, low_memory=False)
+                if not audit.empty:
+                    a = pd.to_numeric(audit['V3 Abs Projection Error'], errors='coerce')
+                    s = pd.to_numeric(audit['V3 Signed Error'], errors='coerce')
+                    c1,c2,c3,c4 = st.columns(4)
+                    c1.metric('V3 MAE', '—' if a.dropna().empty else f'{a.mean():.2f} outs')
+                    c2.metric('V3 RMSE', '—' if a.dropna().empty else f'{np.sqrt(np.nanmean(np.square(a))):.2f}')
+                    c3.metric('V3 Signed Bias', '—' if s.dropna().empty else f'{s.mean():+.2f}')
+                    c4.metric('5+ Out Misses', int((a>=PO_WORKLOAD_V3_CONFIG['severe_miss_outs']).sum()))
+            except Exception:
+                pass
+
+_beta_projection_rows = _impl_beta_projection_rows_po_v3
 
 if _beta_projection_rows is None:
 
@@ -136109,7 +137033,7 @@ def _ub_v114_self_test_report():
 
 
 
-render_beta_pitching_outs_tab = globals().get('_impl_render_beta_pitching_outs_tab_06', globals().get('_impl_render_beta_pitching_outs_tab_05', globals().get('_impl_render_beta_pitching_outs_tab_04', globals().get('_impl_render_beta_pitching_outs_tab_03', globals().get('_impl_render_beta_pitching_outs_tab_02', globals().get('_impl_render_beta_pitching_outs_tab_01', None))))))
+render_beta_pitching_outs_tab = _impl_render_beta_pitching_outs_tab_po_v3
 
 if render_beta_pitching_outs_tab is None:
 
@@ -136666,8 +137590,792 @@ def _impl_render_moneyline_edge_tab_17(board, dates=None):
         st.info(f"Moneyline edge unavailable: {e}")
 
 
+# CHALLENGER_ML_WEATHER_DELAY_V1_2026_08_23
+# Moneyline-only weather risk overlay. Canonical Phase 2.2 side is preserved.
+ML_WEATHER_DELAY_VERSION = "ML_WEATHER_DELAY_V1_2026_08_23"
+
+
+def _mlwd_num(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        out = float(str(value).replace("%", "").replace(",", "").strip())
+        return out if math.isfinite(out) else default
+    except Exception:
+        return default
+
+
+def _mlwd_team(value):
+    try:
+        return ml_canonical_abbr(value) if "ml_canonical_abbr" in globals() else str(value or "").strip().upper()
+    except Exception:
+        return str(value or "").strip().upper()
+
+
+def _mlwd_first(mapping, keys, default=None):
+    if not isinstance(mapping, dict):
+        return default
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _mlwd_game_meta(board, row):
+    row = row if isinstance(row, dict) else {}
+    away = _mlwd_team(_mlwd_first(row, ["Away", "Away Team", "away_team", "AwayTeam"], ""))
+    home = _mlwd_team(_mlwd_first(row, ["Home", "Home Team", "home_team", "HomeTeam"], ""))
+
+    fallback = ML_PHASE22_BALLPARKS.get(home, ("Unknown venue", "", "Unknown")) if "ML_PHASE22_BALLPARKS" in globals() else ("Unknown venue", "", "Unknown")
+    venue = str(_mlwd_first(row, ["Ballpark", "Park", "Venue", "venue"], fallback[0]) or fallback[0])
+    roof = str(_mlwd_first(row, ["ML Real Roof", "Roof", "Ballpark Roof", "roof"], fallback[2]) or fallback[2])
+    game_time = _mlwd_first(row, ["game_time", "Game Time", "Game Date Time", "Start Time", "start_time", "Commence Time", "commence_time"], None)
+
+    if game_time in (None, "") or venue.lower() == "unknown venue":
+        for p in board or []:
+            if not isinstance(p, dict):
+                continue
+            team = _mlwd_team(_mlwd_first(p, ["team", "Team", "pitcher_team", "Pitcher Team"], ""))
+            opp = _mlwd_team(_mlwd_first(p, ["opponent", "Opponent", "opp", "Opp"], ""))
+            if away and home and {team, opp} != {away, home}:
+                continue
+            if game_time in (None, ""):
+                game_time = _mlwd_first(p, ["game_time", "Game Time", "start_time", "Start Time", "commence_time", "Commence Time"], None)
+            if not venue or venue.lower() == "unknown venue":
+                venue = str(_mlwd_first(p, ["venue", "Venue", "Park", "Ballpark"], fallback[0]) or fallback[0])
+            if roof in ("", "Unknown"):
+                roof = str(_mlwd_first(p, ["Roof", "roof"], fallback[2]) or fallback[2])
+            if game_time not in (None, "") and venue and venue.lower() != "unknown venue":
+                break
+    return away, home, venue, roof, game_time
+
+
+def _mlwd_hour_key(game_time):
+    try:
+        if "parse_game_hour_pt" in globals():
+            key = parse_game_hour_pt(game_time)
+            if key:
+                return key
+    except Exception:
+        pass
+    try:
+        s = str(game_time or "").replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if getattr(dt, "tzinfo", None) is not None and "pytz" in globals() and pytz:
+            dt = dt.astimezone(pytz.timezone("America/Los_Angeles"))
+        return dt.strftime("%Y-%m-%dT%H:00")
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _mlwd_forecast_window(lat, lon, start_date, end_date):
+    try:
+        params = {
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "hourly": "temperature_2m,relative_humidity_2m,precipitation_probability,precipitation,rain,showers,weather_code,wind_speed_10m,wind_gusts_10m",
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "timezone": "America/Los_Angeles",
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+        }
+        if "safe_get_json" in globals():
+            data = safe_get_json("https://api.open-meteo.com/v1/forecast", params=params, timeout=12) or {}
+        else:
+            r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mlwd_risk(board, row):
+    away, home, venue, roof, game_time = _mlwd_game_meta(board, row)
+    result = {
+        "source": "UNAVAILABLE",
+        "tier": "UNAVAILABLE",
+        "score": None,
+        "peak_precip_prob": None,
+        "peak_precip_mm": None,
+        "peak_rain_mm": None,
+        "peak_showers_mm": None,
+        "wind_mph": None,
+        "gust_mph": None,
+        "temp_f": None,
+        "humidity": None,
+        "window": "",
+        "venue": venue,
+        "roof": roof,
+        "game_time": game_time,
+        "note": "Weather window unavailable",
+    }
+
+    meta = venue_weather_meta(venue) if "venue_weather_meta" in globals() else None
+    if not meta:
+        return result
+    lat, lon, meta_indoor = meta
+
+    roof_text = str(roof or "").upper()
+    explicitly_open = "OPEN" in roof_text and "CLOSED" not in roof_text
+    roof_capable = bool(meta_indoor) or any(token in roof_text for token in ["INDOOR", "CLOSED", "RETRACTABLE", "DOME"])
+    roof_protected = roof_capable and not explicitly_open
+
+    hour_key = _mlwd_hour_key(game_time)
+    if not hour_key:
+        if roof_protected:
+            result.update({"source": "ROOF", "tier": "ROOF_PROTECTED", "score": 0.0, "note": "Roof/indoor park; delay risk protected"})
+        return result
+
+    try:
+        center = datetime.fromisoformat(hour_key)
+    except Exception:
+        return result
+    start = center - timedelta(hours=1)
+    end = center + timedelta(hours=4)
+    data = _mlwd_forecast_window(lat, lon, start.date().isoformat(), end.date().isoformat())
+    hourly = data.get("hourly") if isinstance(data, dict) else None
+    if not isinstance(hourly, dict):
+        if roof_protected:
+            result.update({"source": "ROOF", "tier": "ROOF_PROTECTED", "score": 0.0, "note": "Roof/indoor park; delay risk protected"})
+        return result
+
+    times = hourly.get("time") or []
+    indices = []
+    parsed_times = []
+    for i, raw in enumerate(times):
+        try:
+            dt = datetime.fromisoformat(str(raw))
+        except Exception:
+            continue
+        if start <= dt <= end:
+            indices.append(i)
+            parsed_times.append(dt)
+    if not indices:
+        return result
+
+    def vals(key):
+        arr = hourly.get(key) or []
+        out = []
+        for i in indices:
+            if i >= len(arr):
+                continue
+            v = _mlwd_num(arr[i], None)
+            if v is not None:
+                out.append(v)
+        return out
+
+    def nearest(key):
+        arr = hourly.get(key) or []
+        pairs = []
+        for i, dt in zip(indices, parsed_times):
+            if i >= len(arr):
+                continue
+            v = _mlwd_num(arr[i], None)
+            if v is not None:
+                pairs.append((abs((dt - center).total_seconds()), v))
+        return min(pairs, key=lambda x: x[0])[1] if pairs else None
+
+    probs = vals("precipitation_probability")
+    precip = vals("precipitation")
+    rain = vals("rain")
+    showers = vals("showers")
+    gusts = vals("wind_gusts_10m")
+    wind = vals("wind_speed_10m")
+    codes = vals("weather_code")
+
+    peak_prob = max(probs) if probs else 0.0
+    peak_precip = max(precip) if precip else 0.0
+    peak_rain = max(rain) if rain else 0.0
+    peak_showers = max(showers) if showers else 0.0
+    peak_gust = max(gusts) if gusts else None
+    peak_wind = max(wind) if wind else None
+    thunder = any(int(round(c)) in {95, 96, 99} for c in codes)
+    heavy_code = any(int(round(c)) in {65, 67, 82} for c in codes)
+
+    # Risk index: weather uncertainty / delay concern, NOT a literal delay probability.
+    score = 0.65 * float(peak_prob)
+    score += min(18.0, float(max(peak_precip, peak_rain, peak_showers)) * 10.0)
+    if thunder:
+        score += 24.0
+    elif heavy_code:
+        score += 12.0
+    if peak_gust is not None and peak_gust >= 30.0:
+        score += min(8.0, (peak_gust - 25.0) * 0.5)
+    score = max(0.0, min(100.0, score))
+
+    if roof_protected:
+        tier = "ROOF_PROTECTED"
+        applied_score = 0.0
+        note = f"Outside weather {peak_prob:.0f}% precip peak; roof/indoor protection"
+    else:
+        applied_score = score
+        if score >= 75.0:
+            tier = "SEVERE"
+        elif score >= 55.0:
+            tier = "HIGH"
+        elif score >= 30.0:
+            tier = "MEDIUM"
+        else:
+            tier = "LOW"
+        note = f"{tier} rain/delay risk index · peak precip {peak_prob:.0f}%"
+        if thunder:
+            note += " · thunderstorm signal"
+
+    result.update({
+        "source": "OPEN_METEO_FIRST_PITCH_WINDOW",
+        "tier": tier,
+        "score": round(float(applied_score), 1),
+        "raw_score": round(float(score), 1),
+        "peak_precip_prob": round(float(peak_prob), 1),
+        "peak_precip_mm": round(float(peak_precip), 2),
+        "peak_rain_mm": round(float(peak_rain), 2),
+        "peak_showers_mm": round(float(peak_showers), 2),
+        "wind_mph": None if peak_wind is None else round(float(peak_wind), 1),
+        "gust_mph": None if peak_gust is None else round(float(peak_gust), 1),
+        "temp_f": nearest("temperature_2m"),
+        "humidity": nearest("relative_humidity_2m"),
+        "window": f"{start.strftime('%m-%d %H:%M')} to {end.strftime('%H:%M')} PT",
+        "note": note,
+    })
+    return result
+
+
+def _mlwd_append_reason(existing, reason):
+    text = str(existing or "").strip()
+    if not reason:
+        return text
+    if not text:
+        return reason
+    if reason.lower() in text.lower():
+        return text
+    return f"{text}; {reason}"
+
+
+def _impl_ml_build_board_22(board):
+    """Phase 2.2 + automatic rain/delay window. Side preserving."""
+    df = _impl_ml_build_board_21(board)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    for ridx, rr in out.iterrows():
+        row = rr.to_dict()
+        wx = _mlwd_risk(board, row)
+        tier = str(wx.get("tier") or "UNAVAILABLE")
+        existing_summary = str(row.get("ML Weather Summary") or "").strip()
+        if tier == "ROOF_PROTECTED":
+            summary = wx.get("note") or "Roof/indoor weather protected"
+        elif tier != "UNAVAILABLE":
+            pieces = [wx.get("note")]
+            if wx.get("temp_f") is not None:
+                pieces.append(f"{float(wx['temp_f']):.0f}°F")
+            if wx.get("wind_mph") is not None:
+                pieces.append(f"wind {float(wx['wind_mph']):.0f} mph")
+            if wx.get("gust_mph") is not None and float(wx.get("gust_mph") or 0) >= 20:
+                pieces.append(f"gust {float(wx['gust_mph']):.0f} mph")
+            summary = " · ".join([str(x) for x in pieces if x not in (None, "")])
+        else:
+            summary = existing_summary or "Weather unavailable"
+
+        out.at[ridx, "ML Weather Summary"] = summary
+        out.at[ridx, "ML Rain Delay Risk"] = tier
+        out.at[ridx, "ML Rain Delay Risk Score"] = wx.get("score")
+        out.at[ridx, "ML Weather Source"] = wx.get("source")
+        out.at[ridx, "ML Weather Window"] = wx.get("window")
+        out.at[ridx, "ML Weather Precip Peak %"] = wx.get("peak_precip_prob")
+        out.at[ridx, "ML Weather Precip Peak MM"] = wx.get("peak_precip_mm")
+        out.at[ridx, "ML Weather Gust MPH"] = wx.get("gust_mph")
+        out.at[ridx, "ML Weather Roof Read"] = wx.get("roof")
+        out.at[ridx, "ML Weather Version"] = ML_WEATHER_DELAY_VERSION
+
+        # Weather is a playability warning only in V1. It never flips the canonical winner.
+        if tier in {"HIGH", "SEVERE"}:
+            reason = f"{tier} RAIN/DELAY RISK"
+            if wx.get("peak_precip_prob") is not None:
+                reason += f" ({float(wx['peak_precip_prob']):.0f}% peak precip)"
+            out.at[ridx, "ML Risk Reasons"] = _mlwd_append_reason(row.get("ML Risk Reasons"), reason)
+            out.at[ridx, "ML Weather Playability"] = "PASS / WAIT FOR WEATHER" if tier == "SEVERE" else "DOWNGRADE / RECHECK"
+        elif tier == "MEDIUM":
+            out.at[ridx, "ML Risk Reasons"] = _mlwd_append_reason(row.get("ML Risk Reasons"), "MEDIUM RAIN/DELAY WATCH")
+            out.at[ridx, "ML Weather Playability"] = "WATCH"
+        elif tier == "ROOF_PROTECTED":
+            out.at[ridx, "ML Weather Playability"] = "ROOF PROTECTED"
+        elif tier == "LOW":
+            out.at[ridx, "ML Weather Playability"] = "CLEAR"
+        else:
+            out.at[ridx, "ML Weather Playability"] = "UNAVAILABLE"
+    return out
+
+# CHALLENGER_ML_ENVIRONMENT_V2_2026_08_23
+# Moneyline support/environment overlay. Canonical side remains protected.
+ML_ENVIRONMENT_V2_VERSION = "ML_ENVIRONMENT_V2_2026_08_23"
+
+
+def _mlenv_num(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        out = float(str(value).replace("%", "").replace(",", "").strip())
+        return out if math.isfinite(out) else default
+    except Exception:
+        return default
+
+
+def _mlenv_clamp(value, lo=0.0, hi=100.0):
+    try:
+        return max(float(lo), min(float(hi), float(value)))
+    except Exception:
+        return float(lo)
+
+
+def _mlenv_first(mapping, keys, default=None):
+    if not isinstance(mapping, dict):
+        return default
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def _mlenv_team(value):
+    text = str(value or "").strip().upper()
+    text = text.replace(" MONEYLINE", "").replace(" ML", "").strip()
+    try:
+        return ml_canonical_abbr(text) if "ml_canonical_abbr" in globals() else text
+    except Exception:
+        return text
+
+
+def _mlenv_interp(x, points):
+    try:
+        x = float(x)
+    except Exception:
+        return 50.0
+    pts = sorted((float(a), float(b)) for a, b in points)
+    if x <= pts[0][0]:
+        return pts[0][1]
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x0 <= x <= x1:
+            if x1 == x0:
+                return y1
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return 50.0
+
+
+def _mlenv_projected_runs(row, away, home):
+    away_runs = _mlenv_num(_mlenv_first(row, [
+        "ML Card Away Projected Runs", "Away Projected Runs", "Away Expected Runs",
+        "Away Runs", "ML Away Projected Runs", "Away Exp Runs"
+    ]), None)
+    home_runs = _mlenv_num(_mlenv_first(row, [
+        "ML Card Home Projected Runs", "Home Projected Runs", "Home Expected Runs",
+        "Home Runs", "ML Home Projected Runs", "Home Exp Runs"
+    ]), None)
+    if away_runs is not None and home_runs is not None:
+        return away_runs, home_runs, "PROJECTED_RUN_FIELDS"
+
+    # Fallback: parse two run values from an existing projected-score string.
+    score_text = str(_mlenv_first(row, [
+        "ML Score Brain Projected Score", "Projected Score", "ML Projected Score",
+        "Score Projection", "Projected Final Score"
+    ], "") or "")
+    try:
+        nums = [float(x) for x in re.findall(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)", score_text)]
+        if len(nums) >= 2:
+            return nums[0], nums[1], "PROJECTED_SCORE_PARSE"
+    except Exception:
+        pass
+    return None, None, "MISSING"
+
+
+def _mlenv_pick(row, away, home):
+    raw = _mlenv_first(row, [
+        "ML Card Best Play", "Canonical Winner", "ML Canonical Winner", "ML Pick",
+        "Pick", "Winner"
+    ], "")
+    pick = _mlenv_team(raw)
+    if pick == away or pick == home:
+        return pick
+    # Some cards contain strings such as "LAD ML" or "LAD -135".
+    for team in (away, home):
+        if team and team in str(raw or "").upper().split():
+            return team
+    return pick
+
+
+def _mlenv_run_score(runs):
+    if runs is None:
+        return 50.0
+    return _mlenv_interp(float(runs), [
+        (2.0, 20), (3.0, 35), (4.0, 50), (5.0, 66), (6.0, 82), (7.0, 94)
+    ])
+
+
+def _mlenv_total_score(total_runs):
+    if total_runs is None:
+        return 50.0
+    return _mlenv_interp(float(total_runs), [
+        (6.5, 18), (7.0, 27), (8.0, 42), (9.0, 58), (10.0, 75), (11.0, 88), (12.0, 96)
+    ])
+
+
+def _mlenv_diff_score(run_diff):
+    if run_diff is None:
+        return 50.0
+    return _mlenv_interp(float(run_diff), [
+        (-1.0, 18), (0.0, 42), (0.5, 52), (1.0, 62), (1.5, 72),
+        (2.0, 81), (2.5, 88), (3.0, 94), (4.0, 98)
+    ])
+
+
+def _mlenv_edge_score(value, scale=3.0):
+    v = _mlenv_num(value, None)
+    if v is None:
+        return 50.0
+    # Phase 2.2 edges are support deltas, so zero is neutral. Cap aggressively.
+    return _mlenv_clamp(50.0 + float(v) * float(scale), 15.0, 85.0)
+
+
+def _mlenv_cardinal(degrees):
+    d = _mlenv_num(degrees, None)
+    if d is None:
+        return ""
+    labels = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S",
+              "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+    return labels[int((float(d) + 11.25) // 22.5) % 16]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _mlenv_direction_forecast(lat, lon, start_date, end_date):
+    """Small companion request for wind direction + weather code.
+
+    The existing ML weather patch already supplies temperature/rain/wind speed.
+    This request intentionally adds only fields that are not already present.
+    """
+    try:
+        params = {
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "hourly": "wind_direction_10m,weather_code",
+            "timezone": "America/Los_Angeles",
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+        }
+        if "safe_get_json" in globals():
+            data = safe_get_json("https://api.open-meteo.com/v1/forecast", params=params, timeout=12) or {}
+        else:
+            r = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mlenv_weather_extra(board, row, wx):
+    result = {"wind_dir_deg": None, "wind_dir": "", "weather_code": None, "thunder": False}
+    try:
+        away, home, venue, roof, game_time = _mlwd_game_meta(board, row)
+        meta = venue_weather_meta(venue) if "venue_weather_meta" in globals() else None
+        hour_key = _mlwd_hour_key(game_time) if "_mlwd_hour_key" in globals() else None
+        if not meta or not hour_key:
+            return result
+        lat, lon, _ = meta
+        center = datetime.fromisoformat(hour_key)
+        data = _mlenv_direction_forecast(lat, lon, center.date().isoformat(), center.date().isoformat())
+        hourly = data.get("hourly") if isinstance(data, dict) else None
+        if not isinstance(hourly, dict):
+            return result
+        times = hourly.get("time") or []
+        best = None
+        for i, raw in enumerate(times):
+            try:
+                dt = datetime.fromisoformat(str(raw))
+                dist = abs((dt - center).total_seconds())
+            except Exception:
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, i)
+        if best is None:
+            return result
+        i = best[1]
+        dirs = hourly.get("wind_direction_10m") or []
+        codes = hourly.get("weather_code") or []
+        d = _mlenv_num(dirs[i], None) if i < len(dirs) else None
+        c = _mlenv_num(codes[i], None) if i < len(codes) else None
+        result["wind_dir_deg"] = d
+        result["wind_dir"] = _mlenv_cardinal(d)
+        result["weather_code"] = c
+        result["thunder"] = c is not None and int(round(c)) in {95, 96, 99}
+        return result
+    except Exception:
+        return result
+
+
+def _mlenv_weather_risks(wx, extra):
+    tier = str((wx or {}).get("tier") or "UNAVAILABLE").upper()
+    thunder = bool((extra or {}).get("thunder"))
+    peak = _mlenv_num((wx or {}).get("peak_precip_prob"), 0.0) or 0.0
+    precip = _mlenv_num((wx or {}).get("peak_precip_mm"), 0.0) or 0.0
+
+    if tier == "ROOF_PROTECTED":
+        return "NONE", 0.0
+    disruption = {"SEVERE": 88.0, "HIGH": 68.0, "MEDIUM": 38.0, "LOW": 10.0}.get(tier, 20.0)
+    if thunder:
+        disruption = min(100.0, disruption + 10.0)
+
+    # This is a risk label, not a claim that MLB has postponed the game.
+    if tier == "SEVERE" and thunder and (peak >= 80 or precip >= 1.0):
+        postpone = "HIGH"
+    elif tier == "SEVERE":
+        postpone = "MODERATE"
+    elif tier == "HIGH" and thunder:
+        postpone = "MODERATE"
+    elif tier == "HIGH" and peak >= 70:
+        postpone = "LOW/MODERATE"
+    elif tier == "MEDIUM":
+        postpone = "LOW"
+    else:
+        postpone = "VERY LOW"
+    return postpone, disruption
+
+
+def _mlenv_weather_run_effect(wx, extra, existing_summary=""):
+    """Tiny run-environment residual; direction is informational unless park-relative text exists."""
+    if str((wx or {}).get("tier") or "").upper() == "ROOF_PROTECTED":
+        return 0.0
+    temp = _mlenv_num((wx or {}).get("temp_f"), None)
+    wind = _mlenv_num((wx or {}).get("wind_mph"), None)
+    effect = 0.0
+    if temp is not None:
+        if temp >= 90:
+            effect += 0.18
+        elif temp >= 80:
+            effect += 0.10
+        elif temp <= 50:
+            effect -= 0.12
+        elif temp <= 60:
+            effect -= 0.05
+    # Do not guess "out" or "in" from compass direction without stadium orientation.
+    text = str(existing_summary or "").lower()
+    if wind is not None and wind >= 8:
+        if "wind out" in text or "out to" in text:
+            effect += min(0.22, (wind - 5.0) * 0.012)
+        elif "wind in" in text or "in from" in text:
+            effect -= min(0.22, (wind - 5.0) * 0.012)
+    return round(max(-0.30, min(0.30, effect)), 2)
+
+
+def _mlenv_data_quality(row, projected_runs_ok, wx, venue):
+    score = 100.0
+    if not projected_runs_ok:
+        score -= 40.0
+    if str((wx or {}).get("source") or "UNAVAILABLE").upper() == "UNAVAILABLE":
+        score -= 12.0
+    if not venue or "UNKNOWN" in str(venue).upper():
+        score -= 6.0
+    if _mlenv_num(row.get("ML Starter Edge"), None) is None:
+        score -= 8.0
+    if _mlenv_num(row.get("ML Bullpen Edge"), None) is None:
+        score -= 8.0
+    lineup_text = str(_mlenv_first(row, ["Lineup", "Lineup Status", "ML Lineup Status"], "") or "").upper()
+    if "EXPECTED" in lineup_text and "CONFIRMED" not in lineup_text:
+        score -= 8.0
+    price = _mlenv_first(row, ["ML Card Best Play Price", "Best Play Price", "ML Price", "Price"], None)
+    if price in (None, ""):
+        score -= 4.0
+    return round(_mlenv_clamp(score, 0.0, 100.0), 1)
+
+
+def _mlenv_probability_adjustment(env_score, quality):
+    e = float(env_score)
+    if 45.0 <= e <= 55.0:
+        raw = 0.0
+    elif 55.0 < e < 65.0:
+        raw = 0.5 + (e - 56.0) / 8.0 * 1.0
+    elif 65.0 <= e < 75.0:
+        raw = 1.5 + (e - 65.0) / 9.0 * 1.5
+    elif 75.0 <= e < 85.0:
+        raw = 3.0 + (e - 75.0) / 9.0 * 1.5
+    elif e >= 85.0:
+        raw = min(5.0, 4.5 + (e - 85.0) / 15.0 * 0.5)
+    elif 35.0 <= e < 45.0:
+        raw = -(0.5 + (44.0 - e) / 9.0 * 1.0)
+    elif 25.0 <= e < 35.0:
+        raw = -(1.5 + (34.0 - e) / 9.0 * 1.5)
+    else:
+        raw = -min(4.0, 3.0 + max(0.0, 25.0 - e) / 25.0)
+
+    q = float(quality)
+    if q < 60.0:
+        return 0.0
+    authority = _mlenv_clamp((q - 50.0) / 50.0, 0.0, 1.0)
+    return round(raw * authority, 2)
+
+
+def _mlenv_support_state(env_score, blowout, quality, disruption):
+    if quality < 60:
+        return "LOW_DATA"
+    if disruption >= 85:
+        return "WEATHER_CONFLICT"
+    if env_score >= 80 and blowout >= 75:
+        return "ELITE_SUPPORT"
+    if env_score >= 70 and blowout >= 65:
+        return "STRONG_SUPPORT"
+    if env_score >= 60:
+        return "SUPPORTED"
+    if env_score < 40:
+        return "CONFLICTED"
+    return "NEUTRAL"
+
+
+def _mlenv_append(existing, text):
+    old = str(existing or "").strip()
+    if not text:
+        return old
+    if text.lower() in old.lower():
+        return old
+    return text if not old else f"{old}; {text}"
+
+
+def _impl_ml_build_board_23(board):
+    """Phase 2.2 + weather delay V1 + environment V2; canonical side preserving."""
+    df = _impl_ml_build_board_22(board)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+
+    for ridx, rr in out.iterrows():
+        row = rr.to_dict()
+        away, home, venue, roof, game_time = _mlwd_game_meta(board, row)
+        pick = _mlenv_pick(row, away, home)
+        away_runs, home_runs, run_source = _mlenv_projected_runs(row, away, home)
+        projected_ok = away_runs is not None and home_runs is not None
+
+        if pick == away:
+            pick_runs, opp_runs = away_runs, home_runs
+        elif pick == home:
+            pick_runs, opp_runs = home_runs, away_runs
+        else:
+            pick_runs, opp_runs = None, None
+
+        total_runs = None if not projected_ok else float(away_runs) + float(home_runs)
+        run_diff = None if pick_runs is None or opp_runs is None else float(pick_runs) - float(opp_runs)
+        share = None if pick_runs is None or total_runs in (None, 0) else 100.0 * float(pick_runs) / float(total_runs)
+
+        wx = _mlwd_risk(board, row) if "_mlwd_risk" in globals() else {}
+        extra = _mlenv_weather_extra(board, row, wx)
+        postpone, disruption = _mlenv_weather_risks(wx, extra)
+        wx_run_effect = _mlenv_weather_run_effect(wx, extra, row.get("ML Weather Summary"))
+
+        total_score = _mlenv_total_score(total_runs)
+        park_factor = _mlenv_num(_mlenv_first(row, ["Park Factor", "ML Park Factor"], 1.0), 1.0) or 1.0
+        park_score = _mlenv_clamp(50.0 + (park_factor - 1.0) * 180.0, 25.0, 75.0)
+        weather_score = _mlenv_clamp(50.0 + wx_run_effect * 35.0, 35.0, 65.0)
+        # Projected total already absorbs offense/starter/bullpen; avoid stacking them again.
+        high_score = _mlenv_clamp(0.85 * total_score + 0.10 * park_score + 0.05 * weather_score)
+
+        share_score = 50.0 if share is None else _mlenv_clamp(50.0 + (share - 50.0) * 3.0, 10.0, 95.0)
+        diff_score = _mlenv_diff_score(run_diff)
+        team_adv = 0.60 * diff_score + 0.40 * share_score
+
+        offense_edge = _mlenv_num(row.get("ML Offense Vs Hand Edge"), 0.0) or 0.0
+        contact_edge = _mlenv_num(row.get("ML Contact Quality Edge"), 0.0) or 0.0
+        starter_score = _mlenv_edge_score(row.get("ML Starter Edge"), 3.0)
+        bullpen_score = _mlenv_edge_score(row.get("ML Bullpen Edge"), 3.0)
+        pick_run_strength = _mlenv_clamp(_mlenv_run_score(pick_runs) + 0.6 * offense_edge + 0.2 * contact_edge)
+        opp_run_strength = _mlenv_clamp(_mlenv_run_score(opp_runs) - 0.6 * offense_edge - 0.2 * contact_edge)
+        offensive_edge_score = pick_run_strength - opp_run_strength
+
+        existing_blowout = _mlenv_num(row.get("ML Blowout Score"), None)
+        if existing_blowout is None:
+            offense_support_score = _mlenv_clamp(50.0 + offensive_edge_score, 10.0, 90.0)
+            blowout = _mlenv_clamp(
+                0.30 * diff_score + 0.20 * starter_score + 0.17 * offense_support_score +
+                0.13 * bullpen_score + 0.08 * 50.0 + 0.07 * 50.0 + 0.05 * 50.0
+            )
+            blowout_source = "ENV_V2_FALLBACK"
+        else:
+            blowout = _mlenv_clamp(existing_blowout)
+            blowout_source = "EXISTING_ML_BLOWOUT"
+
+        env_score = _mlenv_clamp(
+            0.35 * team_adv + 0.25 * blowout + 0.15 * starter_score +
+            0.10 * bullpen_score + 0.10 * share_score + 0.05 * high_score
+        )
+        quality = _mlenv_data_quality(row, projected_ok, wx, venue)
+        env_adj = _mlenv_probability_adjustment(env_score, quality)
+
+        canonical_prob = _mlenv_num(_mlenv_first(row, [
+            "ML Card Best Play Prob %", "Canonical Win Probability", "ML Win Prob %", "Win Probability"
+        ]), None)
+        adjusted_prob = None
+        if canonical_prob is not None:
+            adjusted_prob = float(canonical_prob) + float(env_adj)
+            # Weather disruption reduces confidence but never reverses the canonical side.
+            if disruption >= 85:
+                adjusted_prob -= 2.0
+            elif disruption >= 65:
+                adjusted_prob -= 1.2
+            elif disruption >= 35:
+                adjusted_prob -= 0.5
+            adjusted_prob = max(50.0, min(99.0, adjusted_prob))
+
+        state = _mlenv_support_state(env_score, blowout, quality, disruption)
+        direction = extra.get("wind_dir") or ""
+        deg = extra.get("wind_dir_deg")
+
+        out.at[ridx, "ML High Scoring Score"] = round(high_score, 1)
+        out.at[ridx, "ML Team Run Strength"] = round(pick_run_strength, 1)
+        out.at[ridx, "ML Opp Team Run Strength"] = round(opp_run_strength, 1)
+        out.at[ridx, "ML Offensive Edge Score"] = round(offensive_edge_score, 1)
+        out.at[ridx, "ML Team Scoring Share %"] = None if share is None else round(share, 1)
+        out.at[ridx, "ML Projected Run Diff"] = None if run_diff is None else round(run_diff, 2)
+        out.at[ridx, "ML Environment Score V2"] = round(env_score, 1)
+        out.at[ridx, "ML Environment Data Score"] = quality
+        out.at[ridx, "ML Environment Support State"] = state
+        out.at[ridx, "ML Environment Probability Adj"] = env_adj
+        out.at[ridx, "ML Environment Adjusted Win %"] = None if adjusted_prob is None else round(adjusted_prob, 1)
+        out.at[ridx, "ML Environment Run Source"] = run_source
+        out.at[ridx, "ML Environment Version"] = ML_ENVIRONMENT_V2_VERSION
+        out.at[ridx, "ML Blowout Source V2"] = blowout_source
+        out.at[ridx, "ML Weather Run Effect"] = wx_run_effect
+        out.at[ridx, "ML Wind Direction"] = direction
+        out.at[ridx, "ML Wind Direction Deg"] = deg
+        out.at[ridx, "ML Postponement Risk"] = postpone
+        out.at[ridx, "ML Starter Disruption Risk Score"] = round(disruption, 1)
+        out.at[ridx, "ML Weather Code"] = extra.get("weather_code")
+
+        # Make the new context visible without altering the canonical pick/tier.
+        summary = str(row.get("ML Weather Summary") or "").strip()
+        if direction:
+            summary = _mlenv_append(summary, f"wind dir {direction}")
+        if postpone not in {"VERY LOW", "NONE"}:
+            summary = _mlenv_append(summary, f"postpone risk {postpone}")
+        out.at[ridx, "ML Weather Summary"] = summary
+
+        env_note = f"ENV {env_score:.0f} · HS {high_score:.0f}"
+        if share is not None:
+            env_note += f" · share {share:.1f}%"
+        env_note += f" · blowout {blowout:.0f} · data {quality:.0f}"
+        out.at[ridx, "ML Support Signals"] = _mlenv_append(row.get("ML Support Signals"), env_note)
+
+        if disruption >= 65:
+            out.at[ridx, "ML Risk Reasons"] = _mlenv_append(
+                row.get("ML Risk Reasons"), f"STARTER DISRUPTION WEATHER RISK {disruption:.0f}/100"
+            )
+
+    return out
+
 # Public-path rebinding. K/Challenger and every non-Moneyline engine remain untouched.
-ml_build_board = _impl_ml_build_board_21
+ml_build_board = _impl_ml_build_board_23
 render_moneyline_edge_tab = _impl_render_moneyline_edge_tab_17
 
 
