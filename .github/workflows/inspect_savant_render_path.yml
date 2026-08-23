@@ -1,0 +1,43 @@
+name: Inspect Savant Render Path
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/inspect_savant_render_path.yml'
+      - 'app.py'
+      - 'tools/**'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Inspect final render definitions and callers
+        run: |
+          python - <<'PY'
+          import ast, pathlib
+          p=pathlib.Path('app.py')
+          text=p.read_text(encoding='utf-8-sig')
+          lines=text.splitlines()
+          tree=ast.parse(text)
+          needles=['Savant Raw vs Hand','savant_raw_vs_hand_k_pct','SAVANT_SPLIT_MISSING','attach_savant_shadow','kc-lineup','raw simple']
+          print('TOTAL_LINES', len(lines))
+          print('--- TOP LEVEL DEFINITIONS ---')
+          for n in tree.body:
+              if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)):
+                  seg='\n'.join(lines[n.lineno-1:n.end_lineno])
+                  if any(x in seg for x in needles):
+                      print(f'FUNC {n.name} {n.lineno}-{n.end_lineno}')
+                      for i in range(max(n.lineno-1,1), min(n.end_lineno+2,len(lines))+1):
+                          print(f'{i}: {lines[i-1]}')
+                      print('---END FUNC---')
+          print('--- ALL STRING OCCURRENCES ---')
+          for i,line in enumerate(lines,1):
+              if any(x in line for x in needles):
+                  print(i, line[:500])
+          PY
