@@ -133976,7 +133976,9 @@ def _ub_apply_beta_to_k_frame(base_df, beta_df):
 
         final_decision = str(ub.get("UB Final Decision") or raw_side or "PASS").upper()
 
-        side = final_decision if final_decision in {"OVER", "UNDER"} else raw_side
+        # V1.14 decision sync: the canonical card/export side must respect an
+        # authoritative PASS. Keep the underlying model lean in a separate field.
+        side = final_decision if final_decision in {"OVER", "UNDER", "PASS"} else "PASS"
 
         play = ub.get("Undefeated Beta Playability")
 
@@ -133991,6 +133993,8 @@ def _ub_apply_beta_to_k_frame(base_df, beta_df):
         _ub_overlay_set(idx, "Canonical Line", line)
 
         _ub_overlay_set(idx, "Canonical Side", side)
+
+        _ub_overlay_set(idx, "UB Raw Lean Side", raw_side)
 
         _ub_overlay_set(idx, "Final Decision State", state)
 
@@ -134406,9 +134410,17 @@ def grade_saved_undefeated_beta():
 
         merge_side = str(row.get("Merge Control Side") or "").upper()
 
+        undefeated_control_side = str(
+            row.get("UB V1.14 Primary Control Side")
+            or row.get("UB Biological Side")
+            or ""
+        ).upper()
+
         beta_result = _ub_grade_side(beta_side, line, actual.get("Actual K"))
 
         merge_result = _ub_grade_side(merge_side, line, actual.get("Actual K"))
+
+        undefeated_control_result = _ub_grade_side(undefeated_control_side, line, actual.get("Actual K"))
 
         playability = str(row.get("Undefeated Beta Playability") or "")
 
@@ -134419,6 +134431,12 @@ def grade_saved_undefeated_beta():
         avoided_loss = bool(merge_result == "LOSS" and playability == "PASS")
 
         broken = bool(merge_result == "WIN" and beta_result == "LOSS" and playability in {"OFFICIAL_PLAY", "LEAN"})
+
+        undefeated_rescue = bool(undefeated_control_result == "LOSS" and beta_result == "WIN" and playability in {"OFFICIAL_PLAY", "LEAN"})
+
+        undefeated_avoided = bool(undefeated_control_result == "LOSS" and playability == "PASS")
+
+        undefeated_broken = bool(undefeated_control_result == "WIN" and beta_result == "LOSS" and playability in {"OFFICIAL_PLAY", "LEAN"})
 
         actual_bf = actual.get("Actual BF")
 
@@ -134436,11 +134454,24 @@ def grade_saved_undefeated_beta():
 
         low35_loss = bool(beta_result == "LOSS" and beta_side == "UNDER" and line is not None and abs(float(line) - 3.5) < 1e-9)
 
-        bad_control_flip = bool(beta_result == "LOSS" and merge_result == "WIN" and beta_side in {"OVER","UNDER"} and merge_side in {"OVER","UNDER"} and beta_side != merge_side)
+        bad_undefeated_flip = bool(
+            beta_result == "LOSS" and undefeated_control_result == "WIN"
+            and beta_side in {"OVER","UNDER"} and undefeated_control_side in {"OVER","UNDER"}
+            and beta_side != undefeated_control_side
+        )
+        bad_merge_flip = bool(
+            beta_result == "LOSS" and merge_result == "WIN"
+            and beta_side in {"OVER","UNDER"} and merge_side in {"OVER","UNDER"}
+            and beta_side != merge_side
+        )
 
-        if bad_control_flip:
+        if bad_undefeated_flip:
 
-            miss_class = "BAD_CONTROL_FLIP"
+            miss_class = "BAD_UNDEFEATED_CONTROL_FLIP"
+
+        elif bad_merge_flip:
+
+            miss_class = "BAD_MERGE_CONTROL_FLIP"
 
         elif low35_loss:
 
@@ -134482,11 +134513,18 @@ def grade_saved_undefeated_beta():
 
             "Grade Key": key, "Graded At": now_iso(), "Undefeated Beta Result": beta_result,
 
+            "UB Resolved Side For Grading": beta_side,
             "Undefeated Beta Official Result": official_beta_result, "Merge Control Result": merge_result,
+            "Undefeated Primary Control Side": undefeated_control_side,
+            "Undefeated Primary Control Result": undefeated_control_result,
 
             "Merge Loss Rescued": rescue, "Merge Loss Avoided By PASS": avoided_loss, "Merge Win Broken": broken,
+            "Undefeated Loss Rescued": undefeated_rescue, "Undefeated Loss Avoided By PASS": undefeated_avoided,
+            "Undefeated Win Broken": undefeated_broken,
 
-            "Net Rescue Value": int(rescue) - int(broken), "Actual K/BF": actual_kbf, "BF Error": bf_error, "K/BF Error": kbf_error,
+            "Net Rescue Value": int(rescue) - int(broken),
+            "Net Rescue vs Undefeated": int(undefeated_rescue) - int(undefeated_broken),
+            "Actual K/BF": actual_kbf, "BF Error": bf_error, "K/BF Error": kbf_error,
 
             "Miss Class": miss_class, "Outcome Context": "NORMAL_OR_UNKNOWN", "Clean Model Eligible": True,
 
@@ -134556,11 +134594,21 @@ def build_undefeated_beta_grade_report():
 
     merge_losses = int((graded.get("Merge Control Result") == "LOSS").sum()) if not graded.empty and "Merge Control Result" in graded.columns else 0
 
+    undefeated_wins = int((graded.get("Undefeated Primary Control Result") == "WIN").sum()) if not graded.empty and "Undefeated Primary Control Result" in graded.columns else 0
+
+    undefeated_losses = int((graded.get("Undefeated Primary Control Result") == "LOSS").sum()) if not graded.empty and "Undefeated Primary Control Result" in graded.columns else 0
+
     rescued = int(graded.get("Merge Loss Rescued", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not graded.empty else 0
 
     avoided = int(graded.get("Merge Loss Avoided By PASS", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not graded.empty else 0
 
     broken = int(graded.get("Merge Win Broken", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not graded.empty else 0
+
+    undefeated_rescued = int(graded.get("Undefeated Loss Rescued", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not graded.empty else 0
+
+    undefeated_avoided = int(graded.get("Undefeated Loss Avoided By PASS", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not graded.empty else 0
+
+    undefeated_broken = int(graded.get("Undefeated Win Broken", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not graded.empty else 0
 
 
 
@@ -134688,7 +134736,11 @@ def build_undefeated_beta_grade_report():
 
         "merge_same_snapshot_record": {"wins": merge_wins, "losses": merge_losses, "win_rate": None if merge_wins+merge_losses == 0 else round(merge_wins/(merge_wins+merge_losses),4)},
 
+        "undefeated_primary_control_record": {"wins": undefeated_wins, "losses": undefeated_losses, "win_rate": None if undefeated_wins+undefeated_losses == 0 else round(undefeated_wins/(undefeated_wins+undefeated_losses),4)},
+
         "net_rescue": {"losses_rescued": rescued, "losses_avoided_by_pass": avoided, "wins_broken": broken, "net_rescue_value": rescued-broken},
+
+        "net_rescue_vs_undefeated": {"losses_rescued": undefeated_rescued, "losses_avoided_by_pass": undefeated_avoided, "wins_broken": undefeated_broken, "net_rescue_value": undefeated_rescued-undefeated_broken},
 
         "projection": {
 
@@ -134702,7 +134754,7 @@ def build_undefeated_beta_grade_report():
 
         },
 
-        "side_records": record_by("Undefeated Beta Side", ["OVER","UNDER"]),
+        "side_records": record_by("UB Resolved Side For Grading", ["OVER","UNDER"]),
 
         "tier_records": record_by("Best Play Tier", ["S","A","B","PASS"]),
 
@@ -134724,6 +134776,13 @@ def _ub_summary_metrics(beta_df):
 
         return {"S": 0, "A": 0, "official": 0, "disagreements": 0}
 
+    if "UB Final Decision" in beta_df.columns:
+        resolved_side = beta_df["UB Final Decision"].fillna(beta_df["Undefeated Beta Side"]).astype(str).str.upper()
+    else:
+        resolved_side = beta_df["Undefeated Beta Side"].astype(str).str.upper()
+    merge_side = beta_df["Merge Control Side"].astype(str).str.upper()
+    comparable = resolved_side.isin(["OVER", "UNDER"]) & merge_side.isin(["OVER", "UNDER"])
+
     return {
 
         "S": int((beta_df["Best Play Tier"] == "S").sum()),
@@ -134732,7 +134791,7 @@ def _ub_summary_metrics(beta_df):
 
         "official": int(beta_df["Undefeated Beta Playability"].isin(["OFFICIAL_PLAY", "LEAN"]).sum()),
 
-        "disagreements": int((beta_df["Undefeated Beta Side"].astype(str) != beta_df["Merge Control Side"].astype(str)).sum()),
+        "disagreements": int((resolved_side[comparable] != merge_side[comparable]).sum()),
 
     }
 
@@ -135596,7 +135655,7 @@ def _ub_v113_flip_evidence(out):
         and bool(out.get("UB Recent Starter Authority"))
         and abs(_ub_num(out.get("UB Workload Delta"), 0.0) or 0.0) >= 2.0
     )
-    required = int(UB_CONFIG["v113_large_flip_evidence"] if delta >= float(UB_CONFIG["v113_large_flip_delta_k"])
+    required = int(UB_CONFIG["v113_flip_evidence_large"] if delta >= float(UB_CONFIG["v113_large_flip_delta_k"])
                    else UB_CONFIG["v113_flip_evidence_normal"])
     return {
         "count": len(families), "required": required, "families": families,
@@ -135787,7 +135846,218 @@ def _ub_build_row(row, p):
     return out
 
 
+# ---------------------------------------------------------------------------
+# CHALLENGER V1.14 — UNDEFEATED-UNDER PRESERVE + FINAL DECISION SYNC
+# ---------------------------------------------------------------------------
+# Forward-test purpose:
+# - Preserve the Challenger corrections that already work.
+# - Treat the pre-resolver Undefeated biological side as the PRIMARY preserve
+#   reference, while Merge remains a SECONDARY independent baseline.
+# - Only add a hard protection gate for the repeatable harmful pattern observed
+#   across historical and forward tests: Undefeated UNDER -> Challenger OVER
+#   where the final OVER barely clears the sportsbook line and lacks enough
+#   independent pregame support.
+# - OVER -> UNDER Challenger corrections are audit-only here; V1.14 does not
+#   roll them back. This deliberately preserves successful Challenger rescues.
+# - No pitcher/team names or final outcomes are encoded.
 
+UB_CONFIG.update({
+    "v114_ud_under_over_thin_edge_k": 0.25,
+    "v114_ud_under_over_min_evidence": 4,
+    "v114_ud_under_over_tail_min_pct": 55.0,
+    "v114_ud_under_over_restore_prob_cap": 0.60,
+    "v114_ud_under_over_structural_workload_delta": 2.0,
+})
+UNDEFEATED_BETA_VERSION = "CHALLENGER_V1_14_UNDEFEATED_PRIMARY_PRESERVE_2026_08_22"
+
+_ub_build_row_v113_active = _ub_build_row
+
+
+def _ub_v114_primary_control_profile(out):
+    out = out or {}
+    line = _ub_num(out.get("Line"), None)
+    candidate_proj = _ub_num(out.get("Undefeated Beta Projection"), None)
+    candidate_side = str(out.get("Undefeated Beta Side") or "").upper()
+    undefeated_proj = _ub_num(out.get("UB Biological Projection"), None)
+    undefeated_side = str(out.get("UB Biological Side") or "").upper()
+    merge_side = str(out.get("Merge Control Side") or "").upper()
+
+    base = {
+        "status": "NOT_APPLICABLE", "protect": False, "families": [],
+        "reasons": [], "required": int(UB_CONFIG["v114_ud_under_over_min_evidence"]),
+        "candidate_edge": None, "structural": False,
+        "undefeated_side": undefeated_side, "merge_side": merge_side,
+    }
+    if line is None or candidate_proj is None or undefeated_proj is None:
+        return base
+    if undefeated_side != "UNDER" or candidate_side != "OVER":
+        # Direction is intentionally audit-only. Challenger OVER->UNDER rescues
+        # stay untouched so current winning behavior is preserved.
+        base["status"] = "AUDIT_ONLY" if undefeated_side != candidate_side else "AGREE"
+        return base
+
+    edge = float(candidate_proj) - float(line)
+    base["candidate_edge"] = edge
+    if edge > float(UB_CONFIG["v114_ud_under_over_thin_edge_k"]):
+        base["status"] = "CLEAR_NON_THIN"
+        return base
+
+    def rate(value):
+        value = _ub_num(value, None)
+        if value is None:
+            return None
+        return value / 100.0 if abs(value) > 1.0 else value
+
+    families, reasons = [], []
+    def vote(name, ok, reason):
+        if ok:
+            families.append(name); reasons.append(reason)
+
+    skill = rate(out.get("UB Skill K/BF"))
+    recent_l5 = rate(out.get("UB L5 Pooled K/BF"))
+    recent_l10 = rate(out.get("UB L10 Pooled K/BF"))
+    lineup = rate(out.get("UB Lineup Exposure K%"))
+    whiff = rate(out.get("UB Whiff% Used"))
+    csw = rate(out.get("UB CSW% Used"))
+    floor_state = str(out.get("UB OVER Floor Survival") or "UNKNOWN").upper()
+    tail = _ub_num(out.get("UB P(Required+ K) %"), None)
+
+    if skill is not None:
+        vote("PITCHER_K_SKILL", skill >= LEAGUE_AVG_K + 0.012, f"skill K/BF {skill:.3f}")
+    recent = [x for x in (recent_l5, recent_l10) if x is not None]
+    if recent:
+        recent_center = float(np.mean(recent))
+        vote("RECENT_K_BF", recent_center >= LEAGUE_AVG_K + 0.012, f"recent K/BF {recent_center:.3f}")
+    if lineup is not None:
+        vote("SAVANT_LINEUP_K", lineup >= LEAGUE_AVG_K + 0.010, f"lineup K% {lineup:.3f}")
+    quality = [x for x in (whiff, csw) if x is not None]
+    if quality:
+        q = float(np.mean(quality))
+        vote("ARSENAL_WHIFF_CSW", q >= 0.275, f"Whiff/CSW {q:.3f}")
+    vote("OVER_WORKLOAD_SURVIVAL", floor_state == "CLEAR", f"OVER floor {floor_state}")
+    if tail is not None:
+        vote("REQUIRED_K_TAIL", float(tail) >= float(UB_CONFIG["v114_ud_under_over_tail_min_pct"]), f"required-K tail {float(tail):.1f}%")
+
+    # Merge agreement is retained as context/evidence, but never substitutes for
+    # independent pitcher/matchup/workload support and is not counted above.
+    if merge_side == "OVER":
+        reasons.append("Merge agrees OVER (secondary baseline only)")
+
+    structural = bool(
+        str(out.get("UB Role") or "").upper() in {"FULL_STARTER", "NORMAL_STARTER", "BULK"}
+        and bool(out.get("UB Recent Starter Authority"))
+        and abs(_ub_num(out.get("UB Workload Delta"), 0.0) or 0.0)
+            >= float(UB_CONFIG["v114_ud_under_over_structural_workload_delta"])
+    )
+    protect = bool(not structural and len(families) < int(UB_CONFIG["v114_ud_under_over_min_evidence"]))
+    base.update({
+        "status": "PRESERVE_UNDEFEATED_UNDER" if protect else "ALLOW_CHALLENGER_OVER",
+        "protect": protect, "families": families, "reasons": reasons,
+        "structural": structural,
+    })
+    return base
+
+
+def _ub_v114_sync_restored_under(out, p, profile):
+    line = _ub_num(out.get("Line"), None)
+    undefeated_proj = _ub_num(out.get("UB Biological Projection"), None)
+    if line is None or undefeated_proj is None:
+        return out
+
+    # Restore the actual Undefeated biological center rather than inventing a
+    # synthetic edge. This is a side-preservation layer, not a projection tune.
+    restored_proj = round(float(undefeated_proj), 2)
+    restored_side = "UNDER" if restored_proj < float(line) else "OVER" if restored_proj > float(line) else "PUSH"
+    if restored_side != "UNDER":
+        return out
+
+    prior_final = str(out.get("UB Final Decision") or "").upper()
+    out["Undefeated Beta Projection"] = restored_proj
+    out["Undefeated Beta Side"] = "UNDER"
+    out["Undefeated Beta Edge"] = round(restored_proj - float(line), 2)
+    out["UB Final Side"] = "UNDER"
+
+    # Preserve a pre-existing risk PASS; otherwise make the restored Undefeated
+    # UNDER the authoritative decision.
+    out["UB Final Decision"] = "PASS" if prior_final == "PASS" else "UNDER"
+
+    hist = (p or {}).get("k_history_context_v256") if isinstance((p or {}).get("k_history_context_v256"), dict) else {}
+    prob = _ub_v110_probability_for_projection(restored_proj, float(line), "UNDER", _ub_num(hist.get("k_standard_deviation"), None))
+    prob = min(float(prob), float(UB_CONFIG["v114_ud_under_over_restore_prob_cap"]))
+    out["UB Calibrated Clear Probability %"] = round(float(clamp(prob, 0.01, 0.99))*100.0, 1)
+    out["UB Final Probability %"] = out["UB Calibrated Clear Probability %"]
+    out["UB Final Support State"] = "PRESERVED_UNDEFEATED_UNDER"
+
+    prior_reasons = [x for x in str(out.get("UB Decision Resolver Reasons") or "NONE").split("; ") if x and x != "NONE"]
+    prior_reasons.append("V1.14_UNDEFEATED_UNDER_THIN_OVER_PRESERVE")
+    out["UB Decision Resolver Reasons"] = "; ".join(dict.fromkeys(prior_reasons))
+    out["UB Decision Resolver Applied"] = True
+    out["UB V1.14 Restored Undefeated Projection"] = restored_proj
+    out["UB V1.14 Restored Undefeated Side"] = "UNDER"
+    return out
+
+
+def _ub_build_row(row, p):
+    out = _ub_build_row_v113_active(row, p)
+    if not out:
+        return out
+
+    profile = _ub_v114_primary_control_profile(out)
+    candidate_before = _ub_num(out.get("Undefeated Beta Projection"), None)
+    candidate_side_before = str(out.get("Undefeated Beta Side") or "").upper()
+
+    if profile.get("protect"):
+        out = _ub_v114_sync_restored_under(out, p, profile)
+
+    out["UB V1.14 Primary Control"] = "UNDEFEATED_BIOLOGICAL"
+    out["UB V1.14 Primary Control Projection"] = out.get("UB Biological Projection")
+    out["UB V1.14 Primary Control Side"] = out.get("UB Biological Side")
+    out["UB V1.14 Secondary Baseline Projection"] = out.get("Merge Control Projection")
+    out["UB V1.14 Secondary Baseline Side"] = out.get("Merge Control Side")
+    out["UB V1.14 Candidate Projection Before Preserve"] = candidate_before
+    out["UB V1.14 Candidate Side Before Preserve"] = candidate_side_before
+    out["UB V1.14 Preserve Status"] = profile.get("status")
+    out["UB V1.14 Preserve Evidence Count"] = len(profile.get("families") or [])
+    out["UB V1.14 Preserve Evidence Required"] = profile.get("required")
+    out["UB V1.14 Preserve Evidence Families"] = "; ".join(profile.get("families") or []) or "NONE"
+    out["UB V1.14 Preserve Reasons"] = "; ".join(profile.get("reasons") or []) or "NONE"
+    out["UB V1.14 Structural Exception"] = bool(profile.get("structural"))
+    out["UB V1.14 Candidate Edge K"] = None if profile.get("candidate_edge") is None else round(float(profile.get("candidate_edge")), 3)
+    out["Undefeated Beta Version"] = UNDEFEATED_BETA_VERSION
+    out["UB Pregame Feature Persistence"] = "COMPLETE_V1_14_UNDEFEATED_PRIMARY_PRESERVE"
+    return out
+
+
+def _ub_v114_self_test_report():
+    cases = []
+    def add(name, ok, detail=""):
+        cases.append({"test": name, "pass": bool(ok), "detail": detail})
+
+    # Generic thin Undefeated UNDER -> Challenger OVER with weak support must preserve.
+    a = {"Line":4.5,"UB Biological Projection":4.10,"UB Biological Side":"UNDER",
+         "Undefeated Beta Projection":4.68,"Undefeated Beta Side":"OVER",
+         "Merge Control Side":"OVER","UB OVER Floor Survival":"WATCH",
+         "UB Skill K/BF":0.22,"UB Lineup Exposure K%":0.20}
+    ap = _ub_v114_primary_control_profile(a)
+    add("thin Undefeated UNDER to weak Challenger OVER is preserved", ap.get("protect") is True, str(ap))
+
+    # Challenger OVER -> UNDER rescue remains untouched by V1.14.
+    b = {"Line":5.5,"UB Biological Projection":5.90,"UB Biological Side":"OVER",
+         "Undefeated Beta Projection":5.30,"Undefeated Beta Side":"UNDER",
+         "Merge Control Side":"UNDER"}
+    bp = _ub_v114_primary_control_profile(b)
+    add("existing Challenger OVER-to-UNDER rescue is preserved", bp.get("protect") is False, str(bp))
+
+    # Strong, independently supported thin OVER can still earn the change.
+    c = {"Line":4.5,"UB Biological Projection":4.20,"UB Biological Side":"UNDER",
+         "Undefeated Beta Projection":4.70,"Undefeated Beta Side":"OVER",
+         "Merge Control Side":"OVER","UB OVER Floor Survival":"CLEAR",
+         "UB Skill K/BF":0.27,"UB L5 Pooled K/BF":0.28,"UB L10 Pooled K/BF":0.27,
+         "UB Lineup Exposure K%":0.25,"UB Whiff% Used":0.30,"UB CSW% Used":0.30,
+         "UB P(Required+ K) %":61.0}
+    cp = _ub_v114_primary_control_profile(c)
+    add("strong evidence lets Challenger earn thin OVER", cp.get("protect") is False, str(cp))
+    return pd.DataFrame(cases)
 
 
 
