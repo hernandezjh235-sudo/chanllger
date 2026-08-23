@@ -1,0 +1,23 @@
+name: Inspect Current Pitching Outs
+
+on:
+  pull_request:
+    paths:
+      - 'tools/inspect_po_current.py'
+      - '.github/workflows/inspect_po_current.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Print current PO functions
+        run: python tools/inspect_po_current.py
