@@ -26,12 +26,11 @@ jobs:
         run: python tools/apply_po_workload_v3_patch.py --app app.py
       - name: Compile combined Railway app
         run: python -m py_compile app.py
-      - name: Validate Savant source math and display bridge
+      - name: Validate Savant source math and final-card bridge
         run: |
           python - <<'PY'
           from pathlib import Path
           import pandas as pd
-          import math
 
           p = Path('learning_data/savant_batter_platoon_2026.csv')
           assert p.exists(), p
@@ -47,7 +46,7 @@ jobs:
               calc = 100.0 * so[mask] / pa[mask]
               max_err = float((calc-kp[mask]).abs().max())
               assert max_err <= 0.15, (hand, max_err)
-          # Known high-sample player check without freezing today's exact PA totals.
+
           neto = df[pd.to_numeric(df['mlbam_id'], errors='coerce') == 687263]
           assert not neto.empty
           n = neto.iloc[-1]
@@ -56,10 +55,13 @@ jobs:
 
           text = Path('app.py').read_text(encoding='utf-8')
           assert 'CHALLENGER_SAVANT_K_AUTHORITY_V1_2026_08_23' in text
-          assert 'CHALLENGER_SAVANT_BATTER_DISPLAY_V2_2026_08_23' in text
-          assert 'SAVANT_TRUE_SPLIT_UNAVAILABLE' in text
+          assert 'CHALLENGER_SAVANT_BATTER_DISPLAY_V3_2026_08_23' in text
+          assert 'FINAL_CARD_SAVANT_SO_PA_V3' in text
+          assert 'def _v269_savant_shadow_rows(' in text
+          assert 'NAME_CANONICAL' in text
           assert 'Savant Raw Math' in text
-          print('Savant source/display integrity PASS')
+          assert 'model_minus_savant_pp' in text
+          print('Savant source/final-card integrity PASS')
           PY
       - name: Verify PO remains shadow and production-safe
         run: |
