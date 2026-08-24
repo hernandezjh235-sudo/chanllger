@@ -12,13 +12,13 @@
     },
     "pitcher_stats": {
       "error": "",
-      "row_count": 774,
+      "row_count": 776,
       "status": "SUCCESS"
     }
   },
-  "last_success_at": "2026-08-24T14:18:21+00:00",
-  "refresh_completed_at": "2026-08-24T14:18:21+00:00",
-  "refresh_started_at": "2026-08-24T14:04:47+00:00",
+  "last_success_at": "2026-08-24T19:16:48+00:00",
+  "refresh_completed_at": "2026-08-24T19:16:48+00:00",
+  "refresh_started_at": "2026-08-24T19:04:37+00:00",
   "schema_version": "SAVANT_AUX_MANIFEST_SCHEMA_V1",
   "season": 2026,
   "status": "SUCCESS"
