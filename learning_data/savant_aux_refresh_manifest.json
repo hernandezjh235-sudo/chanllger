@@ -7,18 +7,18 @@
     },
     "pitch_mix_matchups": {
       "error": "",
-      "row_count": 3511,
+      "row_count": 3520,
       "status": "SUCCESS"
     },
     "pitcher_stats": {
       "error": "",
-      "row_count": 778,
+      "row_count": 779,
       "status": "SUCCESS"
     }
   },
-  "last_success_at": "2026-08-25T19:15:23+00:00",
-  "refresh_completed_at": "2026-08-25T19:15:23+00:00",
-  "refresh_started_at": "2026-08-25T19:02:20+00:00",
+  "last_success_at": "2026-08-26T14:20:46+00:00",
+  "refresh_completed_at": "2026-08-26T14:20:46+00:00",
+  "refresh_started_at": "2026-08-26T14:06:06+00:00",
   "schema_version": "SAVANT_AUX_MANIFEST_SCHEMA_V1",
   "season": 2026,
   "status": "SUCCESS"
