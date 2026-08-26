@@ -3,8 +3,10 @@ name: Challenger Live Savant Installer Refresh
 on:
   workflow_dispatch:
   schedule:
-    - cron: '20 13 * * *'
-    - cron: '20 18 * * *'
+    # Run once nightly before late-night line pulls/saves so the resulting
+    # Railway redeploy happens before the official board is frozen.
+    # 06:00 UTC = 11:00 PM PDT / 10:00 PM PST.
+    - cron: '0 6 * * *'
   push:
     branches: [main]
     paths:
