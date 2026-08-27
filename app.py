@@ -138587,9 +138587,723 @@ def _impl_ml_build_board_23(board):
 
     return out
 
+# =============================================================================
+# CHALLENGER MONEYLINE — BATTER LINEUP SUPPORT V1 + ELITE ML CARDS
+# 2026-08-26
+#
+# Scope / safety:
+# - Moneyline only. K projection, K side, confidence, BF/IP, opponent K%, lineup
+#   weighting and all protected Challenger K/distribution logic are untouched.
+# - Canonical Moneyline winner remains preserved.
+# - Adds one controlled matchup package made from the three approved batter-app
+#   concepts: Expected Contact Quality, Batter x Starter Arsenal, and PA/TTO
+#   starter exposure.
+# - New information may strengthen/downgrade playability and adds a capped
+#   support-adjusted probability; it does not casually flip the ML side.
+# =============================================================================
+ML_BATTER_SUPPORT_V1_VERSION = "ML_BATTER_LINEUP_SUPPORT_V1_2026_08_26"
+ML_BATTER_SUPPORT_MAX_PROB_DELTA = 1.00
+ML_BATTER_SUPPORT_MIN_HITTERS = 5
+
+
+def _mlbs_num(value, default=None):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        out = float(str(value).replace("%", "").replace(",", "").strip())
+        return out if math.isfinite(out) else default
+    except Exception:
+        return default
+
+
+def _mlbs_rate(value, default=None):
+    out = _mlbs_num(value, default)
+    if out is None:
+        return None
+    if abs(out) > 1.5:
+        out /= 100.0
+    return float(out)
+
+
+def _mlbs_clip(value, lo=0.0, hi=100.0):
+    try:
+        return max(float(lo), min(float(hi), float(value)))
+    except Exception:
+        return float(lo)
+
+
+def _mlbs_first(mapping, keys, default=None):
+    if not isinstance(mapping, dict):
+        return default
+    low = {str(k).lower(): k for k in mapping.keys()}
+    for key in keys:
+        if key in mapping and mapping.get(key) not in (None, "", "—", "nan", "NaN"):
+            return mapping.get(key)
+        actual = low.get(str(key).lower())
+        if actual is not None and mapping.get(actual) not in (None, "", "—", "nan", "NaN"):
+            return mapping.get(actual)
+    return default
+
+
+def _mlbs_norm_name(value):
+    try:
+        return normalize_name(value)
+    except Exception:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _mlbs_team(value):
+    try:
+        return ml_canonical_abbr(value)
+    except Exception:
+        return str(value or "").strip().upper()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _mlbs_support_table(name, backup_name=None):
+    """Read the already-supported learning_data tables without touching K math."""
+    try:
+        df, _ = _hadb_read_csv(name) if "_hadb_read_csv" in globals() else (pd.DataFrame(), "")
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    except Exception:
+        pass
+    if backup_name:
+        try:
+            df, _ = _hadb_read_csv(backup_name) if "_hadb_read_csv" in globals() else (pd.DataFrame(), "")
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def _mlbs_find_profile(df, player_id=None, player_name=None):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {}
+    if player_id not in (None, ""):
+        for col in ["player_id", "mlbam_id", "id", "Player ID"]:
+            if col in df.columns:
+                try:
+                    hit = df[pd.to_numeric(df[col], errors="coerce") == float(player_id)]
+                    if not hit.empty:
+                        return hit.iloc[0].to_dict()
+                except Exception:
+                    pass
+    if player_name:
+        target = _mlbs_norm_name(player_name)
+        for col in ["player_name", "Player", "Name", "batter", "pitcher", "Batter", "Pitcher"]:
+            if col not in df.columns:
+                continue
+            try:
+                hit = df[df[col].map(_mlbs_norm_name) == target]
+                if not hit.empty:
+                    return hit.iloc[0].to_dict()
+            except Exception:
+                continue
+    return {}
+
+
+def _mlbs_matchup_pitchers(board):
+    """Map matchup/team to its pitcher row. A pitcher's lineup_rows are the opposing offense."""
+    out = {}
+    for p in board or []:
+        if not isinstance(p, dict):
+            continue
+        matchup = str(p.get("matchup") or p.get("Matchup") or "")
+        if " @ " not in matchup:
+            continue
+        try:
+            away, home = [_mlbs_team(x) for x in matchup.split(" @ ", 1)]
+        except Exception:
+            continue
+        team = _mlbs_team(p.get("team") or p.get("Team") or p.get("Pitcher Team"))
+        if team in {away, home}:
+            out[(f"{away} @ {home}", team)] = p
+    return out
+
+
+def _mlbs_lineup_confirmed(pitcher_row):
+    p = pitcher_row if isinstance(pitcher_row, dict) else {}
+    if bool(p.get("lineup_locked")):
+        return True
+    status = str(_mlbs_first(p, ["lineup_status", "Lineup Status", "projection_source", "Projection Source"], "") or "").upper()
+    if any(tag in status for tag in ["CONFIRMED", "LOCKED", "OFFICIAL", "TRUE LINEUP"]):
+        return True
+    rows = [r for r in (p.get("lineup_rows") or []) if isinstance(r, dict)]
+    confirmed_rows = sum(1 for r in rows[:9] if str(r.get("Lineup Source") or "").upper() == "MLB_CONFIRMED_LINEUP")
+    return confirmed_rows >= 8
+
+
+def _mlbs_order_weight(order):
+    # Mirrors the batter app's PA-distribution intent without changing the protected
+    # Challenger lineup/K weighting. This weight exists only inside ML Batter Support.
+    weights = {1:1.18, 2:1.15, 3:1.12, 4:1.08, 5:1.04, 6:1.00, 7:0.96, 8:0.92, 9:0.88}
+    try:
+        return float(weights.get(int(order), 1.0))
+    except Exception:
+        return 1.0
+
+
+def _mlbs_pct_metric(mapping, keys, default=None):
+    v = _mlbs_num(_mlbs_first(mapping, keys, default), default)
+    if v is None:
+        return None
+    return float(v * 100.0 if abs(v) <= 1.5 else v)
+
+
+def _mlbs_contact_score(batter_profile, pitcher_row, pitch_detail=None):
+    """Availability-aware Expected Contact Quality ported from the Batter app.
+
+    Missing inputs are reweighted rather than zero-filled. Pitch-detail rows provide
+    a live fallback for Contact/Whiff/SLG when the installed batter profile is thin.
+    """
+    bp = batter_profile if isinstance(batter_profile, dict) else {}
+    pp = pitcher_row if isinstance(pitcher_row, dict) else {}
+    pdx = pitch_detail if isinstance(pitch_detail, dict) else {}
+    metrics = []
+
+    def add(label, value, center, scale, weight, higher=True):
+        v = _mlbs_num(value, None)
+        if v is None or not scale:
+            return
+        # Percent metrics arrive either 0-1 or 0-100. Centers >2 identify display percentages.
+        if center > 2 and abs(v) <= 1.5:
+            v *= 100.0
+        z = max(-2.25, min(2.25, (float(v) - float(center)) / float(scale)))
+        if not higher:
+            z = -z
+        metrics.append((label, float(v), float(z), float(weight)))
+
+    add("B xBA", _mlbs_first(bp, ["xBA", "xba", "est_ba"]), 0.245, 0.045, 0.10, True)
+    add("B xwOBA", _mlbs_first(bp, ["xwOBA", "xwoba", "est_woba"]), 0.320, 0.065, 0.14, True)
+    add("B xSLG", _mlbs_first(bp, ["xSLG", "xslg", "est_slg"]), 0.410, 0.090, 0.09, True)
+    add("B EV", _mlbs_first(bp, ["EV", "Avg EV", "avg_exit_velocity", "exit_velocity_avg"]), 88.5, 3.5, 0.05, True)
+    add("B Barrel", _mlbs_first(bp, ["Barrel%", "barrel_pct", "barrel_batted_rate", "barrel_percent"]), 7.5, 6.0, 0.075, True)
+    add("B HardHit", _mlbs_first(bp, ["Hard-Hit%", "HardHit%", "hard_hit_pct", "hard_hit_percent"]), 40.0, 9.0, 0.075, True)
+    add("B SweetSpot", _mlbs_first(bp, ["SweetSpot%", "Sweet-Spot%", "sweet_spot_percent"]), 33.0, 9.0, 0.04, True)
+    add("B Contact", _mlbs_first(bp, ["Contact%", "contact_pct", "contact_percent"], pdx.get("Contact%")), 76.0, 7.0, 0.09, True)
+    add("B ZoneContact", _mlbs_first(bp, ["Zone Contact%", "ZoneContact%", "z_contact_pct", "zone_contact_percent"]), 83.0, 6.0, 0.055, True)
+    add("B Whiff", _mlbs_first(bp, ["Whiff%", "whiff_pct", "whiff_percent"], pdx.get("Whiff%")), 24.0, 7.0, 0.075, False)
+    # Pitch-level SLG is not part of the original ECQ formula but is a useful fallback
+    # for hitter damage when the richer xSLG profile is missing.
+    if _mlbs_first(bp, ["xSLG", "xslg", "est_slg"], None) in (None, ""):
+        add("B pitch SLG", pdx.get("SLG"), 0.410, 0.100, 0.07, True)
+
+    add("P xwOBA allowed", _mlbs_first(pp, ["xwoba", "Statcast xwOBA", "Official Savant xwOBA", "Savant Custom xwOBA"]), 0.320, 0.065, 0.08, True)
+    add("P HardHit allowed", _mlbs_first(pp, ["hard_hit_pct", "Statcast HardHit%", "Official Savant HardHit%", "Savant Custom HardHit%"]), 40.0, 9.0, 0.055, True)
+    add("P Barrel allowed", _mlbs_first(pp, ["barrel_pct", "Statcast Barrel%", "Official Savant Barrel%", "Savant Custom Barrel%"]), 7.5, 6.0, 0.04, True)
+    add("P EV allowed", _mlbs_first(pp, ["avg_exit_velocity", "Average Exit Velocity", "Official Savant Avg EV", "Savant Custom Avg EV"]), 88.5, 3.5, 0.035, True)
+    add("P Whiff", _mlbs_first(pp, ["statcast_whiff", "Official Savant Whiff%", "Savant Custom Whiff%", "Whiff%"]), 24.5, 8.0, 0.035, False)
+
+    if not metrics:
+        return {"score":50.0, "coverage":0.0, "components":[], "note":"ECQ unavailable"}
+    wsum = sum(w for _,_,_,w in metrics) or 1.0
+    z = sum(zv*w for _,_,zv,w in metrics) / wsum
+    score = _mlbs_clip(50.0 + z*18.0, 8.0, 97.0)
+    # 16 useful opportunities is treated as full coverage for this ML-only port.
+    coverage = _mlbs_clip(len(metrics) / 16.0 * 100.0, 0.0, 100.0)
+    top = sorted(metrics, key=lambda x: abs(x[2]*x[3]), reverse=True)[:3]
+    note = "; ".join(f"{x[0]} {x[1]:.3f}" if abs(x[1]) < 2 else f"{x[0]} {x[1]:.1f}" for x in top)
+    return {"score":round(score,1), "coverage":round(coverage,1), "components":metrics, "note":note or "ECQ neutral"}
+
+
+def _mlbs_pitch_detail_by_batter(pitcher_row):
+    """Collapse Challenger's existing per-batter pitch-type rows into Batter-app-style arsenal reads."""
+    p = pitcher_row if isinstance(pitcher_row, dict) else {}
+    raw = [r for r in (p.get("batter_pitch_profile_rows") or []) if isinstance(r, dict)]
+    grouped = {}
+    for r in raw:
+        name = str(r.get("Batter") or "").strip()
+        if not name:
+            continue
+        grouped.setdefault(_mlbs_norm_name(name), {"name":name, "rows":[]})["rows"].append(r)
+    out = {}
+    for key, rec in grouped.items():
+        rows = rec["rows"]
+        numer = {"contact":0.0, "whiff":0.0, "slg":0.0}
+        denom = {"contact":0.0, "whiff":0.0, "slg":0.0}
+        matched_usage = 0.0
+        total_usage = 0.0
+        pitch_notes = []
+        for r in rows:
+            use = _mlbs_num(r.get("Pitcher Usage %"), 0.0) or 0.0
+            if use <= 0:
+                continue
+            total_usage += use
+            contact = _mlbs_num(r.get("Per-Batter Contact%"), None)
+            whiff = _mlbs_num(r.get("Per-Batter Whiff%"), None)
+            slg = _mlbs_num(r.get("Per-Batter SLG vs Pitch"), None)
+            sample = _mlbs_num(r.get("Pitches Seen"), _mlbs_num(r.get("Swings"), 0.0)) or 0.0
+            reliability = max(0.35, min(1.0, sample / 45.0)) if sample > 0 else 0.35
+            w = use * reliability
+            present = False
+            if contact is not None:
+                numer["contact"] += w*contact; denom["contact"] += w; present = True
+            if whiff is not None:
+                numer["whiff"] += w*whiff; denom["whiff"] += w; present = True
+            if slg is not None:
+                numer["slg"] += w*slg; denom["slg"] += w; present = True
+            if present:
+                matched_usage += use
+            if len(pitch_notes) < 3:
+                pt = str(r.get("Pitch Type") or "").upper()
+                if pt:
+                    pitch_notes.append(f"{pt} {use:.0f}%")
+        contact = numer["contact"]/denom["contact"] if denom["contact"] > 0 else None
+        whiff = numer["whiff"]/denom["whiff"] if denom["whiff"] > 0 else None
+        slg = numer["slg"]/denom["slg"] if denom["slg"] > 0 else None
+        pieces = []
+        if contact is not None:
+            pieces.append((contact-76.0)/7.0*0.42)
+        if whiff is not None:
+            pieces.append((24.0-whiff)/7.0*0.25)
+        if slg is not None:
+            pieces.append((slg-0.410)/0.100*0.33)
+        arsenal_score = 50.0 if not pieces else _mlbs_clip(50.0 + sum(pieces)*12.0, 12.0, 94.0)
+        coverage = 0.0 if total_usage <= 0 else _mlbs_clip(matched_usage/total_usage*100.0, 0.0, 100.0)
+        out[key] = {
+            "Batter":rec["name"], "Contact%":contact, "Whiff%":whiff, "SLG":slg,
+            "Arsenal Score":round(arsenal_score,1), "Coverage":round(coverage,1),
+            "Pitch Note":" · ".join(pitch_notes), "Rows":len(rows),
+        }
+    return out
+
+
+def _mlbs_starter_exposure(pitcher_row):
+    """PA/TTO exposure layer adapted from Batter Fantasy, diagnostic/support-only."""
+    p = pitcher_row if isinstance(pitcher_row, dict) else {}
+    ip = _mlbs_num(_mlbs_first(p, ["projected_ip", "Projected IP", "IP Projection", "IP PROJ"], None), None)
+    bf = _mlbs_num(_mlbs_first(p, ["expected_bf", "Expected BF", "Exp BF", "projected_bf"], None), None)
+    if ip is None and bf is not None:
+        ip = bf / 4.25
+    if ip is None:
+        ip = 5.25
+    ip = max(2.5, min(7.5, float(ip)))
+    # Batter-app style survival by trip through the order.
+    p1 = 0.995
+    p2 = max(0.88, min(0.97, 0.91 + (ip-4.75)*0.035))
+    p3 = max(0.50, min(0.89, 0.64 + (ip-4.75)*0.15))
+    p4 = max(0.02, min(0.30, 0.07 + (ip-4.80)*0.11))
+    hook = str(_mlbs_first(p, ["manager_hook_status", "Manager Hook", "leash_risk", "Leash Risk"], "") or "").upper()
+    if "SHORT" in hook or "QUICK" in hook or "HOOK" in hook and "LONG" not in hook:
+        p2 -= 0.03; p3 -= 0.08; p4 -= 0.03
+    elif "LONG" in hook or "DEEP" in hook:
+        p2 += 0.01; p3 += 0.05; p4 += 0.04
+    p2 = max(0.0,min(0.999,p2)); p3=max(0.0,min(0.999,p3)); p4=max(0.0,min(0.999,p4))
+    # Weighted expected fraction of a typical 4.25 PA hitter's trips against the SP.
+    exposure = (p1 + p2 + p3 + 0.25*p4) / 3.25
+    exposure = _mlbs_clip(exposure*100.0, 45.0, 98.0)
+    third_time = _mlbs_clip(p3*100.0, 0.0, 100.0)
+    return {"Projected IP":round(ip,2), "Starter Exposure %":round(exposure,1), "3rd TTO %":round(third_time,1), "p1":p1, "p2":p2, "p3":p3, "p4":p4}
+
+
+def _mlbs_team_lineup_profile(offense_team, pitcher_row, batter_profiles_df):
+    p = pitcher_row if isinstance(pitcher_row, dict) else {}
+    lineup = [r for r in (p.get("lineup_rows") or []) if isinstance(r, dict)][:9]
+    lineup = sorted(lineup, key=lambda r: _mlbs_num(r.get("Order"), 99) or 99)
+    details = _mlbs_pitch_detail_by_batter(p)
+    confirmed = _mlbs_lineup_confirmed(p)
+    exposure = _mlbs_starter_exposure(p)
+    hitters = []
+    for idx, r in enumerate(lineup, start=1):
+        name = str(r.get("Batter") or r.get("Player") or "").strip()
+        if not name:
+            continue
+        order = int(_mlbs_num(r.get("Order"), idx) or idx)
+        pid = r.get("Player ID") or r.get("player_id") or r.get("mlbam_id")
+        bprof = _mlbs_find_profile(batter_profiles_df, pid, name)
+        pdet = details.get(_mlbs_norm_name(name), {})
+        ecq = _mlbs_contact_score(bprof, p, pdet)
+        arsenal = _mlbs_num(pdet.get("Arsenal Score"), None)
+        arsenal_cov = _mlbs_num(pdet.get("Coverage"), 0.0) or 0.0
+        # Do not invent arsenal information. If it is absent, keep it neutral with zero coverage.
+        if arsenal is None:
+            arsenal = 50.0
+            arsenal_cov = 0.0
+        # Batter-app PA concept: top-order hitters receive slightly more weight only inside
+        # this ML support layer. This does not touch Challenger's K lineup weighting.
+        weight = _mlbs_order_weight(order)
+        hitters.append({
+            "Order":order, "Batter":name, "Player ID":pid, "Weight":weight,
+            "ECQ":float(ecq.get("score",50.0)), "ECQ Coverage":float(ecq.get("coverage",0.0)),
+            "Arsenal":float(arsenal), "Arsenal Coverage":float(arsenal_cov),
+            "Contact%":pdet.get("Contact%"), "Whiff%":pdet.get("Whiff%"), "Pitch SLG":pdet.get("SLG"),
+            "Pitch Note":pdet.get("Pitch Note") or "", "ECQ Note":ecq.get("note") or "",
+        })
+
+    if not hitters:
+        return {
+            "Team":offense_team, "Available":False, "Confirmed":confirmed, "Hitter Count":0,
+            "ECQ":50.0, "Arsenal":50.0, "Starter Exposure %":exposure["Starter Exposure %"],
+            "3rd TTO %":exposure["3rd TTO %"], "Projected SP IP":exposure["Projected IP"],
+            "Matchup Score":50.0, "Coverage":0.0, "Hitters":[], "State":"NO DATA",
+        }
+
+    def wavg(field, coverage_field=None):
+        vals=[]; ws=[]
+        for h in hitters:
+            cov = float(h.get(coverage_field,100.0) if coverage_field else 100.0)
+            if coverage_field and cov <= 0:
+                continue
+            vals.append(float(h.get(field,50.0)))
+            ws.append(float(h.get("Weight",1.0))*max(0.25,cov/100.0))
+        if not vals:
+            return 50.0, 0.0
+        return float(np.average(vals, weights=ws)), float(sum(1 for h in hitters if (not coverage_field or h.get(coverage_field,0)>0))/max(1,len(hitters))*100.0)
+
+    ecq, ecq_hitter_cov = wavg("ECQ", "ECQ Coverage")
+    arsenal, arsenal_hitter_cov = wavg("Arsenal", "Arsenal Coverage")
+    ecq_metric_cov = float(np.mean([h.get("ECQ Coverage",0.0) for h in hitters])) if hitters else 0.0
+    arsenal_metric_cov = float(np.mean([h.get("Arsenal Coverage",0.0) for h in hitters])) if hitters else 0.0
+    # Starter-specific arsenal should matter less when the starter is unlikely to face many PAs.
+    exp_factor = max(0.55, min(0.98, exposure["Starter Exposure %"]/100.0))
+    arsenal_effective = 50.0 + (arsenal-50.0)*exp_factor
+    # Third-time-through is a small offensive aid, mirroring the batter app's TTO direction.
+    tto_bonus = max(0.0, min(2.5, (exposure["3rd TTO %"]-60.0)*0.05))
+    matchup_score = _mlbs_clip(0.58*ecq + 0.42*arsenal_effective + tto_bonus, 10.0, 95.0)
+    lineup_count_cov = min(100.0, len(hitters)/9.0*100.0)
+    coverage = _mlbs_clip(0.35*lineup_count_cov + 0.30*ecq_metric_cov + 0.25*arsenal_metric_cov + (10.0 if confirmed else 3.0), 0.0, 100.0)
+    state = "STRONG" if matchup_score >= 62 else "PLUS" if matchup_score >= 55 else "RISK" if matchup_score <= 42 else "MINUS" if matchup_score <= 47 else "NEUTRAL"
+    return {
+        "Team":offense_team, "Available":len(hitters) >= ML_BATTER_SUPPORT_MIN_HITTERS,
+        "Confirmed":confirmed, "Hitter Count":len(hitters), "ECQ":round(ecq,1),
+        "Arsenal":round(arsenal,1), "Arsenal Effective":round(arsenal_effective,1),
+        "Starter Exposure %":exposure["Starter Exposure %"], "3rd TTO %":exposure["3rd TTO %"],
+        "Projected SP IP":exposure["Projected IP"], "Matchup Score":round(matchup_score,1),
+        "Coverage":round(coverage,1), "Hitters":hitters, "State":state,
+        "ECQ Hitter Coverage":round(ecq_hitter_cov,1), "Arsenal Hitter Coverage":round(arsenal_hitter_cov,1),
+    }
+
+
+def _mlbs_hitter_summary(profile, limit=5):
+    hitters = list((profile or {}).get("Hitters") or [])
+    hitters = sorted(hitters, key=lambda h: int(h.get("Order") or 99))[:max(1,int(limit))]
+    return " | ".join(f"{int(h.get('Order') or 0)} {h.get('Batter')} {h.get('ECQ',50):.0f}/{h.get('Arsenal',50):.0f}" for h in hitters)
+
+
+def _mlbs_append(existing, text):
+    old = str(existing or "").strip()
+    new = str(text or "").strip()
+    if not new:
+        return old
+    if not old:
+        return new
+    if new.lower() in old.lower():
+        return old
+    return f"{old}; {new}"
+
+
+def _mlbs_downgrade(tier, steps=1):
+    if "_ml22_tier_downgrade" in globals():
+        return _ml22_tier_downgrade(tier, steps)
+    order = ["OFFICIAL ML", "PLAYABLE ML", "LEAN / TRACK ML", "MODEL ONLY / TRACK", "PASS ML"]
+    try:
+        idx = order.index(str(tier))
+    except Exception:
+        idx = len(order)-1
+    return order[min(len(order)-1, idx+max(0,int(steps)))]
+
+
+def _impl_ml_build_board_24(board):
+    """Batter Lineup Support V1 on top of Environment V2. Canonical side stays frozen."""
+    df = _impl_ml_build_board_23(board)
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    idx = _mlbs_matchup_pitchers(board)
+    batter_profiles = _mlbs_support_table("savant_batter_profiles.csv", "savant_batter_profiles.last_good.csv")
+
+    for ridx, rr in out.iterrows():
+        row = rr.to_dict()
+        matchup = str(row.get("Matchup") or "")
+        if " @ " not in matchup:
+            continue
+        try:
+            away, home = [_mlbs_team(x) for x in matchup.split(" @ ", 1)]
+        except Exception:
+            continue
+        away_pitcher = idx.get((f"{away} @ {home}", away), {})
+        home_pitcher = idx.get((f"{away} @ {home}", home), {})
+        # Offense is evaluated against the opposing starter row, whose lineup_rows are that offense.
+        away_prof = _mlbs_team_lineup_profile(away, home_pitcher, batter_profiles)
+        home_prof = _mlbs_team_lineup_profile(home, away_pitcher, batter_profiles)
+
+        canonical = _mlbs_team(_mlbs_first(row, ["ML Final Pick", "ML Official Pick", "ML Card Best Play", "Pick"], ""))
+        if canonical not in {away, home}:
+            # Parse strings such as "LAD ML" while preserving the existing side.
+            raw = str(_mlbs_first(row, ["ML Card Best Play", "ML Final Pick", "Pick"], "") or "").upper()
+            canonical = away if away in raw.split() else home if home in raw.split() else canonical
+        pick_prof = away_prof if canonical == away else home_prof
+        opp_prof = home_prof if canonical == away else away_prof
+
+        matchup_edge = float(pick_prof.get("Matchup Score",50.0)) - float(opp_prof.get("Matchup Score",50.0))
+        ecq_edge = float(pick_prof.get("ECQ",50.0)) - float(opp_prof.get("ECQ",50.0))
+        arsenal_edge = float(pick_prof.get("Arsenal Effective",50.0)) - float(opp_prof.get("Arsenal Effective",50.0))
+        coverage = min(float(pick_prof.get("Coverage",0.0)), float(opp_prof.get("Coverage",0.0)))
+        confirmed_both = bool(pick_prof.get("Confirmed")) and bool(opp_prof.get("Confirmed"))
+
+        # One package, not three stacked independent families. This prevents the correlated
+        # ECQ/arsenal/TTO pieces from triple-counting the same matchup advantage.
+        raw_points = max(-22.0, min(22.0, matchup_edge * 1.15))
+        quality_mult = max(0.30, min(1.0, coverage/75.0))
+        if not confirmed_both:
+            quality_mult *= 0.82
+        support_points = raw_points * quality_mult
+        if coverage < 35:
+            support_points = 0.0
+
+        if support_points >= 12:
+            state = "STRONG SUPPORT"
+        elif support_points >= 5:
+            state = "SUPPORT"
+        elif support_points <= -12:
+            state = "HARD CONFLICT"
+        elif support_points <= -5:
+            state = "CONFLICT"
+        else:
+            state = "NEUTRAL"
+
+        # Probability is support-adjusted only; canonical probability and side are untouched.
+        base_adj = _mlbs_num(_mlbs_first(row, ["ML Environment Adjusted Win %", "ML Support Adjusted Win %", "ML Card Best Play Prob %"], None), None)
+        prob_delta = max(-ML_BATTER_SUPPORT_MAX_PROB_DELTA, min(ML_BATTER_SUPPORT_MAX_PROB_DELTA, support_points/18.0*ML_BATTER_SUPPORT_MAX_PROB_DELTA))
+        if coverage < 50:
+            prob_delta *= 0.55
+        final_adj = None if base_adj is None else max(50.0, min(99.0, float(base_adj)+float(prob_delta)))
+
+        original_tier = str(row.get("ML Official Tier") or "PASS ML")
+        tier = original_tier
+        if state == "HARD CONFLICT" and coverage >= 60:
+            tier = _mlbs_downgrade(tier, 2 if support_points <= -17 else 1)
+        elif state == "CONFLICT" and coverage >= 70 and support_points <= -8:
+            tier = _mlbs_downgrade(tier, 1)
+        elif state == "STRONG SUPPORT" and original_tier == "PASS ML" and coverage >= 75:
+            # Never manufacture an official bet. A strong batter matchup can only restore TRACK.
+            tier = "MODEL ONLY / TRACK"
+
+        final_support_score = max(-100.0, min(100.0, (_mlbs_num(row.get("ML Support Score"),0.0) or 0.0) + support_points))
+        final_status = "STRONG ML" if tier == "OFFICIAL ML" else "LEAN ML" if tier == "PLAYABLE ML" else "MODEL LEAN" if tier in {"LEAN / TRACK ML","MODEL ONLY / TRACK"} else "PASS"
+        grade = f"🔥 ML EDGE — {canonical}" if tier == "OFFICIAL ML" else f"✅ ML LEAN — {canonical}" if tier in {"PLAYABLE ML","LEAN / TRACK ML","MODEL ONLY / TRACK"} else f"🚫 PASS ML — {canonical}"
+
+        updates = {
+            "ML Batter Support Version":ML_BATTER_SUPPORT_V1_VERSION,
+            "ML Batter Canonical Pick Preserved":True,
+            "ML Batter Support State":state,
+            "ML Batter Support Points":round(support_points,1),
+            "ML Batter Matchup Edge":round(matchup_edge,1),
+            "ML Batter ECQ Edge":round(ecq_edge,1),
+            "ML Batter Arsenal Edge":round(arsenal_edge,1),
+            "ML Batter Data Coverage %":round(coverage,1),
+            "ML Batter Both Lineups Confirmed":confirmed_both,
+            "ML Batter Probability Delta":round(prob_delta,2),
+            "ML Batter Adjusted Win %":None if final_adj is None else round(final_adj,1),
+            "ML Final Support Score":round(final_support_score,1),
+            "ML Batter Original Tier":original_tier,
+            "ML Official Tier":tier,
+            "Status":final_status,
+            "ML Final Status":final_status,
+            "ML Grade":grade,
+            "ML Away Lineup Matchup Score":away_prof.get("Matchup Score"),
+            "ML Home Lineup Matchup Score":home_prof.get("Matchup Score"),
+            "ML Away Lineup ECQ":away_prof.get("ECQ"),
+            "ML Home Lineup ECQ":home_prof.get("ECQ"),
+            "ML Away Arsenal Score":away_prof.get("Arsenal Effective"),
+            "ML Home Arsenal Score":home_prof.get("Arsenal Effective"),
+            "ML Away Starter Exposure %":away_prof.get("Starter Exposure %"),
+            "ML Home Starter Exposure %":home_prof.get("Starter Exposure %"),
+            "ML Away 3rd TTO %":away_prof.get("3rd TTO %"),
+            "ML Home 3rd TTO %":home_prof.get("3rd TTO %"),
+            "ML Away Opp SP IP":away_prof.get("Projected SP IP"),
+            "ML Home Opp SP IP":home_prof.get("Projected SP IP"),
+            "ML Away Batter Coverage %":away_prof.get("Coverage"),
+            "ML Home Batter Coverage %":home_prof.get("Coverage"),
+            "ML Away Lineup Confirmed":away_prof.get("Confirmed"),
+            "ML Home Lineup Confirmed":home_prof.get("Confirmed"),
+            "ML Away Lineup Hitters JSON":json.dumps(away_prof.get("Hitters") or [], default=str),
+            "ML Home Lineup Hitters JSON":json.dumps(home_prof.get("Hitters") or [], default=str),
+            "ML Away Lineup Summary":_mlbs_hitter_summary(away_prof),
+            "ML Home Lineup Summary":_mlbs_hitter_summary(home_prof),
+        }
+        if state in {"CONFLICT","HARD CONFLICT"}:
+            updates["ML Risk Reasons"] = _mlbs_append(row.get("ML Risk Reasons"), f"BATTER LINEUP {state} {support_points:+.0f} ({coverage:.0f}% data)")
+        else:
+            updates["ML Risk Reasons"] = row.get("ML Risk Reasons")
+        updates["ML Support Signals"] = _mlbs_append(row.get("ML Support Signals"), f"BATTER {state} {support_points:+.0f} · ECQ edge {ecq_edge:+.0f} · arsenal edge {arsenal_edge:+.0f} · exposure {pick_prof.get('Starter Exposure %',0):.0f}% · data {coverage:.0f}%")
+        for key,value in updates.items():
+            out.at[ridx,key] = value
+
+    if not out.empty:
+        order = {"OFFICIAL ML":0,"PLAYABLE ML":1,"LEAN / TRACK ML":2,"MODEL ONLY / TRACK":3,"PASS ML":4}
+        out["_mlbs_sort"] = out["ML Official Tier"].astype(str).map(lambda x:order.get(x,9))
+        out["_mlbs_support"] = pd.to_numeric(out.get("ML Final Support Score"),errors="coerce").fillna(-999)
+        out["_mlbs_prob"] = pd.to_numeric(out.get("ML Card Best Play Prob %"),errors="coerce").fillna(-999)
+        out = out.sort_values(["_mlbs_sort","_mlbs_support","_mlbs_prob"],ascending=[True,False,False]).drop(columns=["_mlbs_sort","_mlbs_support","_mlbs_prob"])
+    return out
+
+
+def _ml18_json_hitters(value):
+    if isinstance(value, list):
+        return value
+    try:
+        arr = json.loads(str(value or "[]"))
+        return arr if isinstance(arr,list) else []
+    except Exception:
+        return []
+
+
+def _ml18_state_class(state):
+    up = str(state or "").upper()
+    if "STRONG" in up or up == "SUPPORT":
+        return "good"
+    if "CONFLICT" in up or "RISK" in up:
+        return "bad"
+    return "neutral"
+
+
+def _ml18_hitter_chips(hitters, limit=5):
+    parts=[]
+    for h in list(hitters or [])[:limit]:
+        name = str(h.get("Batter") or "—")
+        order = int(_mlbs_num(h.get("Order"),0) or 0)
+        ecq = _mlbs_num(h.get("ECQ"),50.0) or 50.0
+        ars = _mlbs_num(h.get("Arsenal"),50.0) or 50.0
+        score = 0.58*ecq + 0.42*ars
+        cls = "hot" if score >= 58 else "cold" if score <= 44 else "mid"
+        parts.append(f'<div class="ml18-hitter {cls}"><span>{order}</span><b>{_mlui_safe(name)}</b><em>{score:.0f}</em></div>')
+    return "".join(parts) if parts else '<div class="ml18-empty">Lineup detail unavailable</div>'
+
+
+def _ml18_row_card(row):
+    row = row.to_dict() if isinstance(row,pd.Series) else dict(row or {})
+    away,home = _mlcard_matchup_teams(row) if "_mlcard_matchup_teams" in globals() else ("AWAY","HOME")
+    away,home = _mlbs_team(away),_mlbs_team(home)
+    away_logo = _visual_team_logo_html(away,"ml18-logo","ml18-logo-fallback")
+    home_logo = _visual_team_logo_html(home,"ml18-logo","ml18-logo-fallback")
+    away_runs = _mlbs_num(_mlbs_first(row,["ML Card Away Projected Runs","Away Projected Runs"],None),None)
+    home_runs = _mlbs_num(_mlbs_first(row,["ML Card Home Projected Runs","Home Projected Runs"],None),None)
+    away_win = _mlbs_num(_mlbs_first(row,["ML Card Away Win %","Away Model %"],50),50) or 50
+    home_win = _mlbs_num(_mlbs_first(row,["ML Card Home Win %","Home Model %"],100-away_win),100-away_win) or (100-away_win)
+    best = str(_mlbs_first(row,["ML Card Best Play","ML Final Pick","Pick"],"—") or "—")
+    base_prob = _mlbs_num(row.get("ML Card Best Play Prob %"),None)
+    final_prob = _mlbs_num(_mlbs_first(row,["ML Batter Adjusted Win %","ML Environment Adjusted Win %","ML Support Adjusted Win %"],base_prob),base_prob)
+    tier = str(row.get("ML Official Tier") or row.get("Status") or "TRACK")
+    state = str(row.get("ML Batter Support State") or "NEUTRAL")
+    points = _mlbs_num(row.get("ML Batter Support Points"),0) or 0
+    coverage = _mlbs_num(row.get("ML Batter Data Coverage %"),0) or 0
+    ecq_edge = _mlbs_num(row.get("ML Batter ECQ Edge"),0) or 0
+    arsenal_edge = _mlbs_num(row.get("ML Batter Arsenal Edge"),0) or 0
+    matchup_edge = _mlbs_num(row.get("ML Batter Matchup Edge"),0) or 0
+    away_match = _mlbs_num(row.get("ML Away Lineup Matchup Score"),50) or 50
+    home_match = _mlbs_num(row.get("ML Home Lineup Matchup Score"),50) or 50
+    away_ecq = _mlbs_num(row.get("ML Away Lineup ECQ"),50) or 50
+    home_ecq = _mlbs_num(row.get("ML Home Lineup ECQ"),50) or 50
+    away_ars = _mlbs_num(row.get("ML Away Arsenal Score"),50) or 50
+    home_ars = _mlbs_num(row.get("ML Home Arsenal Score"),50) or 50
+    away_exp = _mlbs_num(row.get("ML Away Starter Exposure %"),0) or 0
+    home_exp = _mlbs_num(row.get("ML Home Starter Exposure %"),0) or 0
+    away_tto = _mlbs_num(row.get("ML Away 3rd TTO %"),0) or 0
+    home_tto = _mlbs_num(row.get("ML Home 3rd TTO %"),0) or 0
+    away_hitters = _ml18_json_hitters(row.get("ML Away Lineup Hitters JSON"))
+    home_hitters = _ml18_json_hitters(row.get("ML Home Lineup Hitters JSON"))
+    away_price = _mlui_price(_mlbs_first(row,["ML Card Away Price","Away Price"],None))
+    home_price = _mlui_price(_mlbs_first(row,["ML Card Home Price","Home Price"],None))
+    market = "AGREE" if bool(row.get("ML Market Available")) and bool(row.get("ML Market Agreement")) else "OPPOSE" if bool(row.get("ML Market Available")) else "NO DATA"
+    park = str(row.get("Ballpark") or "")
+    weather = str(row.get("ML Weather Summary") or "")
+    risk = str(row.get("ML Risk Reasons") or "")
+    support_score = _mlbs_num(_mlbs_first(row,["ML Final Support Score","ML Support Score"],0),0) or 0
+    badge_cls = "official" if tier == "OFFICIAL ML" else "playable" if tier == "PLAYABLE ML" else "track" if "TRACK" in tier else "pass"
+    state_cls = _ml18_state_class(state)
+    pick_team = _mlbs_team(best.split()[0] if best else "")
+    pick_logo = _visual_team_logo_html(pick_team,"ml18-pick-logo","ml18-pick-fallback") if pick_team else ""
+    a_run = "—" if away_runs is None else f"{away_runs:.1f}"
+    h_run = "—" if home_runs is None else f"{home_runs:.1f}"
+    bprob = "—" if base_prob is None else f"{base_prob:.1f}%"
+    fprob = "—" if final_prob is None else f"{final_prob:.1f}%"
+    return f'''
+    <article class="ml18-card {badge_cls}">
+      <div class="ml18-glow"></div>
+      <header class="ml18-head">
+        <div><span class="ml18-kicker">CHALLENGER MONEYLINE</span><strong>{_mlui_safe(row.get('Start Time') or row.get('Game Time') or row.get('Matchup') or '')}</strong></div>
+        <div class="ml18-tier">{_mlui_safe(tier)}</div>
+      </header>
+      <section class="ml18-matchup">
+        <div class="ml18-team">{away_logo}<b>{_mlui_safe(away)}</b><span>{_mlui_safe(row.get('Away SP') or '—')}</span><em>{away_win:.1f}%</em></div>
+        <div class="ml18-center"><span>PROJECTED</span><div><b>{a_run}</b><i>–</i><b>{h_run}</b></div><small>{_mlui_safe(park)}</small><small>{_mlui_safe(weather)}</small></div>
+        <div class="ml18-team right">{home_logo}<b>{_mlui_safe(home)}</b><span>{_mlui_safe(row.get('Home SP') or '—')}</span><em>{home_win:.1f}%</em></div>
+      </section>
+      <section class="ml18-hero">
+        <div class="ml18-picklogo">{pick_logo}</div>
+        <div class="ml18-herotxt"><span>🔥 CANONICAL BEST PLAY</span><strong>{_mlui_safe(best)}</strong><small>Side protected · batter layer cannot flip it</small></div>
+        <div class="ml18-probs"><span>BASE <b>{bprob}</b></span><span>FINAL SUPPORT <b>{fprob}</b></span></div>
+      </section>
+      <section class="ml18-batter {state_cls}">
+        <div class="ml18-batter-head"><div><span>BATTER LINEUP ENGINE V1</span><strong>{_mlui_safe(state)}</strong></div><div class="ml18-points">{points:+.1f}<small>support pts</small></div></div>
+        <div class="ml18-meter"><div style="width:{max(3,min(97,50+points*2)):.1f}%"></div></div>
+        <div class="ml18-metrics">
+          <div><span>LINEUP EDGE</span><b>{matchup_edge:+.1f}</b><small>PA-weighted 1–9</small></div>
+          <div><span>CONTACT EDGE</span><b>{ecq_edge:+.1f}</b><small>Expected quality</small></div>
+          <div><span>ARSENAL EDGE</span><b>{arsenal_edge:+.1f}</b><small>vs exact starter</small></div>
+          <div><span>DATA LOCK</span><b>{coverage:.0f}%</b><small>{'confirmed' if bool(row.get('ML Batter Both Lineups Confirmed')) else 'projected/mixed'}</small></div>
+        </div>
+      </section>
+      <section class="ml18-sides">
+        <div class="ml18-sidebox"><div class="ml18-side-title"><b>{_mlui_safe(away)}</b><span>ML {_mlui_safe(away_price)}</span></div><div class="ml18-scoreline"><strong>{away_match:.0f}</strong><span>matchup</span><b>ECQ {away_ecq:.0f}</b><b>ARS {away_ars:.0f}</b><b>SP EXP {away_exp:.0f}%</b><b>3TTO {away_tto:.0f}%</b></div><div class="ml18-hitters">{_ml18_hitter_chips(away_hitters)}</div></div>
+        <div class="ml18-sidebox"><div class="ml18-side-title"><b>{_mlui_safe(home)}</b><span>ML {_mlui_safe(home_price)}</span></div><div class="ml18-scoreline"><strong>{home_match:.0f}</strong><span>matchup</span><b>ECQ {home_ecq:.0f}</b><b>ARS {home_ars:.0f}</b><b>SP EXP {home_exp:.0f}%</b><b>3TTO {home_tto:.0f}%</b></div><div class="ml18-hitters">{_ml18_hitter_chips(home_hitters)}</div></div>
+      </section>
+      <section class="ml18-footgrid"><div><span>COMPOSITE SUPPORT</span><b>{support_score:+.0f}</b></div><div><span>MARKET</span><b>{_mlui_safe(market)}</b></div><div><span>BLOWOUT</span><b>{_mlui_safe(row.get('ML Blowout Tier') or row.get('ML Environment Support State') or '—')}</b></div></section>
+      <footer><span>{_mlui_safe(row.get('ML Support Signals') or '')}</span>{f'<strong>⚠ {_mlui_safe(risk)}</strong>' if risk else ''}</footer>
+    </article>
+    '''
+
+
+def _render_moneyline_visual_cards_v18(df, max_cards=None):
+    if df is None or not isinstance(df,pd.DataFrame) or df.empty:
+        return
+    import streamlit.components.v1 as components
+    css = '''
+    <style>
+    *{box-sizing:border-box}body{margin:0;background:transparent;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f4f8ff}.ml18-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(390px,1fr));gap:16px;padding:4px 2px 18px}.ml18-card{position:relative;overflow:hidden;background:linear-gradient(165deg,#050914 0%,#08111f 52%,#050a13 100%);border:1px solid #183d76;border-radius:24px;padding:17px;box-shadow:0 18px 45px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.04)}.ml18-card.official{border-color:#d3ae39;box-shadow:0 0 0 1px rgba(255,221,91,.08),0 18px 55px rgba(219,173,41,.13)}.ml18-card.playable{border-color:#296fff}.ml18-card.pass{border-color:#583145}.ml18-glow{position:absolute;right:-90px;top:-100px;width:240px;height:240px;border-radius:50%;background:radial-gradient(circle,rgba(32,99,255,.18),transparent 68%);pointer-events:none}.ml18-head{position:relative;display:flex;justify-content:space-between;gap:12px;align-items:center}.ml18-head>div:first-child{display:grid;gap:3px}.ml18-kicker{font-size:9px;letter-spacing:.16em;font-weight:900;color:#5d8fff}.ml18-head strong{font-size:12px;color:#93a7c6}.ml18-tier{padding:6px 10px;border-radius:999px;border:1px solid #2e5ba2;background:#0c1830;font-size:10px;font-weight:900;color:#b9d0ff;white-space:nowrap}.official .ml18-tier{border-color:#b7912f;color:#ffe889;background:#2b240c}.ml18-matchup{display:grid;grid-template-columns:1fr 120px 1fr;gap:8px;align-items:center;margin:16px 0 13px}.ml18-team{display:grid;justify-items:start;min-width:0}.ml18-team.right{justify-items:end;text-align:right}.ml18-logo{width:68px;height:68px;object-fit:contain;filter:drop-shadow(0 4px 13px rgba(255,255,255,.12))}.ml18-logo-fallback,.ml18-pick-fallback{display:grid;place-items:center;width:64px;height:64px;border-radius:50%;background:#10192a;border:1px solid #284269;font-weight:900}.ml18-team b{font-size:18px}.ml18-team span{max-width:130px;font-size:10px;color:#8190a9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ml18-team em{font-style:normal;font-size:11px;font-weight:900;color:#b9d1ff;margin-top:3px}.ml18-center{text-align:center}.ml18-center>span{font-size:8px;font-weight:900;letter-spacing:.16em;color:#657993}.ml18-center>div{display:flex;justify-content:center;align-items:center;gap:8px}.ml18-center b{font-size:32px;line-height:1.05}.ml18-center i{font-style:normal;color:#40516d}.ml18-center small{display:block;color:#6e7f98;font-size:8px;margin-top:2px;line-height:1.25}.ml18-hero{display:grid;grid-template-columns:45px 1fr auto;gap:10px;align-items:center;padding:12px;border-radius:16px;background:linear-gradient(90deg,#0a1832,#0b1021);border:1px solid #265aa9}.ml18-pick-logo{display:grid;place-items:center}.ml18-pick-logo{width:42px;height:42px}.ml18-pick-fallback{width:40px;height:40px;font-size:11px}.ml18-herotxt{display:grid}.ml18-herotxt span{font-size:8px;font-weight:900;letter-spacing:.12em;color:#5f93ff}.ml18-herotxt strong{font-size:22px;line-height:1.1}.ml18-herotxt small{font-size:8px;color:#7587a3}.ml18-probs{display:grid;gap:4px;text-align:right}.ml18-probs span{display:flex;gap:7px;justify-content:flex-end;font-size:8px;color:#7587a3}.ml18-probs b{font-size:12px;color:#eef5ff}.ml18-batter{margin-top:11px;border:1px solid #253b5c;background:#07101d;border-radius:16px;padding:11px}.ml18-batter.good{border-color:#17654d}.ml18-batter.bad{border-color:#713147}.ml18-batter-head{display:flex;justify-content:space-between;align-items:center}.ml18-batter-head>div:first-child{display:grid}.ml18-batter-head span{font-size:8px;letter-spacing:.13em;color:#6983a8;font-weight:900}.ml18-batter-head strong{font-size:14px}.good .ml18-batter-head strong{color:#55e3a8}.bad .ml18-batter-head strong{color:#ff839d}.ml18-points{font-size:25px;font-weight:950;text-align:right}.ml18-points small{display:block;font-size:7px;color:#6f8099;text-transform:uppercase}.ml18-meter{height:5px;background:#152238;border-radius:99px;overflow:hidden;margin:9px 0 10px}.ml18-meter div{height:100%;background:linear-gradient(90deg,#ff3e69,#365cff 50%,#35df9f);border-radius:99px}.ml18-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.ml18-metrics>div{background:#0b1728;border:1px solid #172b48;border-radius:10px;padding:7px;min-width:0}.ml18-metrics span{display:block;font-size:7px;color:#7488a6;font-weight:900}.ml18-metrics b{display:block;font-size:16px;margin-top:2px}.ml18-metrics small{display:block;font-size:7px;color:#697c98}.ml18-sides{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:10px}.ml18-sidebox{border:1px solid #172d4b;border-radius:14px;background:#07101c;padding:9px}.ml18-side-title{display:flex;justify-content:space-between;align-items:center}.ml18-side-title b{font-size:14px}.ml18-side-title span{font-size:9px;color:#4ce2a3}.ml18-scoreline{display:grid;grid-template-columns:auto 1fr 1fr;gap:2px 7px;align-items:end;margin:5px 0 7px}.ml18-scoreline strong{grid-row:1/3;font-size:30px;line-height:1}.ml18-scoreline span{font-size:7px;color:#70819c;align-self:start}.ml18-scoreline b{font-size:8px;color:#9db0cc}.ml18-hitters{display:grid;gap:3px}.ml18-hitter{display:grid;grid-template-columns:16px 1fr 24px;gap:4px;align-items:center;border-radius:7px;background:#0b1626;padding:4px 5px;border-left:2px solid #324b73}.ml18-hitter.hot{border-left-color:#35d99a}.ml18-hitter.cold{border-left-color:#ee5577}.ml18-hitter span,.ml18-hitter em{font-size:8px;color:#6f839f;font-style:normal}.ml18-hitter b{font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.ml18-hitter em{text-align:right;font-weight:900;color:#b8c9e2}.ml18-empty{font-size:8px;color:#697a94;padding:6px}.ml18-footgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:10px}.ml18-footgrid div{border:1px solid #17335c;background:#091426;border-radius:10px;padding:7px}.ml18-footgrid span{display:block;font-size:7px;color:#7184a3}.ml18-footgrid b{display:block;font-size:12px;margin-top:2px}.ml18-card footer{display:grid;gap:4px;border-top:1px solid #14243c;margin-top:10px;padding-top:8px}.ml18-card footer span{font-size:8px;color:#6c7f9c;line-height:1.35}.ml18-card footer strong{font-size:8px;color:#ff8da5;line-height:1.35}@media(max-width:600px){.ml18-wrap{grid-template-columns:1fr}.ml18-card{padding:13px;border-radius:20px}.ml18-matchup{grid-template-columns:1fr 100px 1fr}.ml18-logo{width:56px;height:56px}.ml18-center b{font-size:27px}.ml18-hero{grid-template-columns:38px 1fr}.ml18-probs{grid-column:1/3;grid-template-columns:1fr 1fr;text-align:left}.ml18-probs span{justify-content:flex-start}.ml18-metrics{grid-template-columns:1fr 1fr}.ml18-sides{grid-template-columns:1fr}.ml18-sidebox{padding:10px}}
+    </style>
+    '''
+    d=df.copy()
+    if "ML Official Tier" in d.columns:
+        order={"OFFICIAL ML":0,"PLAYABLE ML":1,"LEAN / TRACK ML":2,"MODEL ONLY / TRACK":3,"PASS ML":4}
+        d["_u1"]=d["ML Official Tier"].astype(str).map(lambda x:order.get(x,9))
+        d["_u2"]=pd.to_numeric(d.get("ML Final Support Score"),errors="coerce").fillna(-999)
+        d=d.sort_values(["_u1","_u2"],ascending=[True,False]).drop(columns=["_u1","_u2"])
+    card_count=len(d) if max_cards is None else min(len(d),max(0,int(max_cards)))
+    cards="\n".join(_ml18_row_card(r) for _,r in d.head(card_count).iterrows())
+    components.html(f'{css}<div class="ml18-wrap">{cards}</div>',height=max(1100,min(40000,930*max(1,card_count)+240)),scrolling=True)
+
+
+def _impl_render_moneyline_edge_tab_18(board, dates=None):
+    st.markdown('<div class="section-title-pro">🔥 Challenger Moneyline · Batter Lineup Edge</div>', unsafe_allow_html=True)
+    st.caption("Canonical ML side stays protected. New V1 matchup support uses PA-weighted 1–9 Expected Contact Quality + exact starter arsenal + starter PA/TTO exposure, then only strengthens or downgrades playability.")
+    try:
+        df=ml_build_board(board)
+        if not isinstance(df,pd.DataFrame) or df.empty:
+            st.info("No ML board yet. Refresh the K board first.")
+            return
+        playable=int(df.get("ML Official Tier",pd.Series(dtype=str)).astype(str).isin(["OFFICIAL ML","PLAYABLE ML"]).sum())
+        supported=int(df.get("ML Batter Support State",pd.Series(dtype=str)).astype(str).isin(["STRONG SUPPORT","SUPPORT"]).sum()) if "ML Batter Support State" in df else 0
+        conflicts=int(df.get("ML Batter Support State",pd.Series(dtype=str)).astype(str).isin(["CONFLICT","HARD CONFLICT"]).sum()) if "ML Batter Support State" in df else 0
+        avg_cov=pd.to_numeric(df.get("ML Batter Data Coverage %",pd.Series(dtype=float)),errors="coerce").dropna()
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric("Official / Playable",playable); c2.metric("Batter Supported",supported); c3.metric("Batter Conflicts",conflicts); c4.metric("Avg Batter Data",f"{avg_cov.mean():.0f}%" if not avg_cov.empty else "—")
+        _render_moneyline_visual_cards_v18(df,max_cards=None)
+        st.markdown('<div class="section-title-pro">Batter Lineup Support Audit</div>',unsafe_allow_html=True)
+        cols=[c for c in ["Matchup","ML Card Best Play","ML Card Best Play Prob %","ML Batter Adjusted Win %","ML Official Tier","ML Batter Support State","ML Batter Support Points","ML Final Support Score","ML Batter Matchup Edge","ML Batter ECQ Edge","ML Batter Arsenal Edge","ML Batter Data Coverage %","ML Batter Both Lineups Confirmed","ML Away Lineup Matchup Score","ML Home Lineup Matchup Score","ML Away Starter Exposure %","ML Home Starter Exposure %","ML Risk Reasons","ML Support Signals","ML Batter Version"] if c in df.columns]
+        st.dataframe(df[cols] if cols else df,use_container_width=True,hide_index=True)
+        with st.expander("Full Moneyline debug",expanded=False):
+            st.dataframe(df,use_container_width=True,hide_index=True)
+    except Exception as e:
+        st.info(f"Moneyline Batter Support unavailable: {e}")
+
+
 # Public-path rebinding. K/Challenger and every non-Moneyline engine remain untouched.
-ml_build_board = _impl_ml_build_board_23
-render_moneyline_edge_tab = _impl_render_moneyline_edge_tab_17
+ml_build_board = _impl_ml_build_board_24
+render_moneyline_edge_tab = _impl_render_moneyline_edge_tab_18
 
 
 
