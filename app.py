@@ -139307,6 +139307,751 @@ render_moneyline_edge_tab = _impl_render_moneyline_edge_tab_18
 
 
 
+# =============================================================================
+# CHALLENGER PITCHING OUTS V5 — REAL WORKLOAD DATA + SINGLE PUBLIC PROJECTION
+# Added 2026-08-27.
+# Scope guard:
+#   * PITCHING OUTS only for projection/UI/public PO decision fields.
+#   * Moneyline only receives a missing-data starter-workload fallback through the
+#     existing Phase 2.1 SP-IP reconciliation path. Canonical ML side protection,
+#     run model, market logic, batter support, and probabilities stay intact.
+#   * K projection formulas / side / confidence / BF-IP / opponent K logic are not
+#     rebound or modified anywhere in this block.
+# =============================================================================
+PO_REAL_WORKLOAD_V5_VERSION = "PO_REAL_WORKLOAD_V5_2026_08_27"
+PO_REAL_WORKLOAD_V5_MAX_MOVE_OUTS = 2.4
+
+
+def _po_v5_valid_num(v, lo=None, hi=None):
+    try:
+        if v in (None, "", "—", "-", "nan", "NaN"):
+            return np.nan
+        x = float(str(v).replace("%", "").replace(",", "").strip())
+        if not np.isfinite(x):
+            return np.nan
+        if lo is not None and x < lo:
+            return np.nan
+        if hi is not None and x > hi:
+            return np.nan
+        return float(x)
+    except Exception:
+        return np.nan
+
+
+def _po_v5_parse_ip(v):
+    """Accept baseball notation (6.1/6.2) or already-normalized decimal IP."""
+    try:
+        if v in (None, "", "—", "-", "nan", "NaN"):
+            return np.nan
+        s = str(v).strip()
+        if "." in s:
+            whole, frac = s.split(".", 1)
+            if frac in {"1", "2"}:
+                return float(int(whole or 0) + (1.0 / 3.0 if frac == "1" else 2.0 / 3.0))
+        x = float(s)
+        return x if np.isfinite(x) and 0 <= x <= 12 else np.nan
+    except Exception:
+        return np.nan
+
+
+def _po_v5_norm_name(v):
+    try:
+        return _po_fill_norm_name(v)
+    except Exception:
+        return re.sub(r"[^a-z0-9]+", "", str(v or "").lower())
+
+
+def _po_v5_file_pitch_logs():
+    """Load repo/local Pitch*.csv files, including the root-level GitHub CSV."""
+    frames = []
+    seen = set()
+    roots = []
+    try:
+        roots.extend([Path.cwd(), Path(__file__).resolve().parent])
+    except Exception:
+        roots.append(Path.cwd())
+    roots += [Path.cwd() / "learning_data"]
+    try:
+        roots.append(Path(__file__).resolve().parent / "learning_data")
+    except Exception:
+        pass
+    for root in roots:
+        try:
+            if not root.exists():
+                continue
+            candidates = list(root.glob("Pitch*.csv")) + list(root.glob("pitch*.csv"))
+            for fp in candidates:
+                key = str(fp.resolve())
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    d = pd.read_csv(fp, low_memory=False)
+                    if isinstance(d, pd.DataFrame) and not d.empty:
+                        has_name = any(c in d.columns for c in ["Pitcher", "Player", "Name", "pitcher"])
+                        has_workload = any(c in d.columns for c in ["IP", "IP_float", "inningsPitched", "BF", "TBF", "battersFaced", "Pitch Count", "Pitches", "numberOfPitches", "pitchCount"])
+                        if not (has_name and has_workload):
+                            continue
+                        d["_po_v5_file_source"] = fp.name
+                        frames.append(d)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    try:
+        return pd.concat(frames, ignore_index=True, sort=False)
+    except Exception:
+        return pd.DataFrame()
+
+
+# Rebind only the PO workload log loader. The old loader ignored root-level
+# Pitch (3) (1) (1).csv, which is why real IP/BF/pitch-count rows could exist in
+# the repo while the PO card still showed dashes / 10% data.
+def _po_fill_pitch_logs():
+    frames = []
+    try:
+        for key in ["pitcher_season_logs", "pitcher_30_day_logs"]:
+            d = st.session_state.get(key)
+            if isinstance(d, pd.DataFrame) and not d.empty:
+                frames.append(d.copy())
+    except Exception:
+        pass
+    try:
+        embedded = _tpc_load_embedded_pitch_logs() if "_tpc_load_embedded_pitch_logs" in globals() else pd.DataFrame()
+        if isinstance(embedded, pd.DataFrame) and not embedded.empty:
+            frames.append(embedded.copy())
+    except Exception:
+        pass
+    file_df = _po_v5_file_pitch_logs()
+    if isinstance(file_df, pd.DataFrame) and not file_df.empty:
+        frames.append(file_df.copy())
+    if not frames:
+        return pd.DataFrame()
+    try:
+        df = pd.concat(frames, ignore_index=True, sort=False)
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+        pcol = next((c for c in ["Pitcher", "Player", "Name", "pitcher"] if c in df.columns), None)
+        if pcol:
+            df["_po_fill_name"] = df[pcol].map(_po_v5_norm_name)
+        date_col = next((c for c in ["Date", "date", "Game Date", "game_date"] if c in df.columns), None)
+        df["_po_fill_date"] = pd.to_datetime(df[date_col], errors="coerce") if date_col else pd.NaT
+        dedup_cols = [c for c in ["GamePk", "gamePk", "game_pk", pcol, date_col] if c]
+        if dedup_cols:
+            df = df.drop_duplicates(subset=dedup_cols, keep="first")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _po_v5_board_player_id(board, pitcher):
+    key = _po_v5_norm_name(pitcher)
+    for p in board or []:
+        try:
+            nm = p.get("pitcher") or p.get("Pitcher") or p.get("name") or ""
+            if _po_v5_norm_name(nm) != key:
+                continue
+            if "_app97_pitcher_id" in globals():
+                pid = _app97_pitcher_id(p)
+                if pid:
+                    return int(pid)
+            for k in ["player_id", "playerId", "mlbam_id", "mlb_id", "pitcher_id", "id"]:
+                x = _po_v5_valid_num(p.get(k), 1, None)
+                if np.isfinite(x):
+                    return int(x)
+        except Exception:
+            continue
+    return None
+
+
+def _po_v5_name_player_id(pitcher):
+    try:
+        if "_mlb_search_player_id_by_name" in globals():
+            pid = _mlb_search_player_id_by_name(str(pitcher or "").strip())
+            return int(pid) if pid else None
+    except Exception:
+        pass
+    return None
+
+
+def _po_v5_game_profile(games, source=""):
+    if not games:
+        return {}
+    games = [g for g in games if isinstance(g, dict)]
+    games = sorted(games, key=lambda g: str(g.get("date") or ""), reverse=True)
+    games = games[:12]
+    if not games:
+        return {}
+
+    def vals(key, n=None):
+        arr = []
+        use = games[:n] if n else games
+        for g in use:
+            x = _po_v5_valid_num(g.get(key), None, None)
+            if np.isfinite(x):
+                arr.append(float(x))
+        return arr
+
+    def avg(a):
+        return float(np.mean(a)) if a else np.nan
+
+    def med(a):
+        return float(np.median(a)) if a else np.nan
+
+    ip3, ip5, ip10 = vals("ip", 3), vals("ip", 5), vals("ip", 10)
+    bf3, bf5, bf10 = vals("bf", 3), vals("bf", 5), vals("bf", 10)
+    pc3, pc5, pc10 = vals("pitches", 3), vals("pitches", 5), vals("pitches", 10)
+    all_ip, all_bf, all_pc = vals("ip"), vals("bf"), vals("pitches")
+    outs = [int(round(x * 3.0)) for x in all_ip]
+    ppi = float(sum(all_pc[:len(all_ip)]) / max(sum(all_ip[:len(all_pc)]), 0.1)) if all_pc and all_ip else np.nan
+    ppbf = float(sum(all_pc[:len(all_bf)]) / max(sum(all_bf[:len(all_pc)]), 0.1)) if all_pc and all_bf else np.nan
+
+    latest = None
+    try:
+        dd = pd.to_datetime([g.get("date") for g in games], errors="coerce")
+        dd = pd.Series(dd).dropna()
+        if not dd.empty:
+            latest = dd.max()
+    except Exception:
+        latest = None
+    age = np.nan
+    if latest is not None:
+        try:
+            age = float((pd.Timestamp.today().normalize() - pd.Timestamp(latest).normalize()).days)
+        except Exception:
+            age = np.nan
+
+    ip_sorted = np.array(all_ip, dtype=float) if all_ip else np.array([], dtype=float)
+    return {
+        "available": bool(all_ip or all_bf or all_pc),
+        "sample": int(len(games)),
+        "l3_ip_avg": avg(ip3),
+        "l5_ip_avg": avg(ip5),
+        "l10_ip_avg": avg(ip10),
+        "l5_ip_median": med(ip5),
+        "l3_bf_avg": avg(bf3),
+        "l5_bf_median": med(bf5),
+        "l10_bf_median": med(bf10),
+        "l3_pitch_avg": avg(pc3),
+        "l5_pitch_avg": avg(pc5),
+        "l10_pitch_avg": avg(pc10),
+        "l5_pitch_median": med(pc5),
+        "l10_pitch_median": med(pc10),
+        "season_pitch_avg": avg(all_pc),
+        "last_pitch": all_pc[0] if all_pc else np.nan,
+        "max_pitch_l10": max(pc10) if pc10 else np.nan,
+        "last_ip": all_ip[0] if all_ip else np.nan,
+        "last_bf": all_bf[0] if all_bf else np.nan,
+        "p_ip": ppi,
+        "p_bf": ppbf,
+        "hook_rate": float(np.mean([o <= 14 for o in outs]) * 100.0) if outs else np.nan,
+        "deep6_rate": float(np.mean([o >= 18 for o in outs]) * 100.0) if outs else np.nan,
+        "deep7_rate": float(np.mean([o >= 21 for o in outs]) * 100.0) if outs else np.nan,
+        "early_exit_rate": float(np.mean([o <= 12 for o in outs]) * 100.0) if outs else np.nan,
+        "ip_p25": float(np.percentile(ip_sorted, 25)) if ip_sorted.size else np.nan,
+        "ip_p50": float(np.percentile(ip_sorted, 50)) if ip_sorted.size else np.nan,
+        "ip_p75": float(np.percentile(ip_sorted, 75)) if ip_sorted.size else np.nan,
+        "latest_date": "" if latest is None else pd.Timestamp(latest).strftime("%Y-%m-%d"),
+        "age_days": age,
+        "source": source,
+    }
+
+
+try:
+    @st.cache_data(ttl=15 * 60, show_spinner=False)
+    def _po_v5_live_profile_by_pid(player_id, season):
+        if not player_id:
+            return {}
+        games = []
+        try:
+            payload = safe_get_json(
+                f"{MLB_BASE}/people/{int(player_id)}/stats",
+                params={"stats": "gameLog", "group": "pitching", "season": int(season)},
+                timeout=12,
+            ) or {}
+            splits = []
+            for block in payload.get("stats", []) or []:
+                splits.extend(block.get("splits") or [])
+            for sp in splits:
+                stat = sp.get("stat") or {}
+                gs = _po_v5_valid_num(stat.get("gamesStarted"), None, None)
+                bf = _po_v5_valid_num(stat.get("battersFaced"), None, None)
+                if np.isfinite(gs) and gs < 1:
+                    continue
+                if not np.isfinite(gs) and (not np.isfinite(bf) or bf < 9):
+                    continue
+                ip = _app97_parse_ip(stat.get("inningsPitched")) if "_app97_parse_ip" in globals() else _po_v5_parse_ip(stat.get("inningsPitched"))
+                pc = _po_v5_valid_num(stat.get("numberOfPitches"), 20, 140)
+                games.append({
+                    "date": str(sp.get("date") or ""),
+                    "ip": ip,
+                    "bf": bf,
+                    "pitches": pc,
+                    "er": _po_v5_valid_num(stat.get("earnedRuns"), 0, 20),
+                    "h": _po_v5_valid_num(stat.get("hits"), 0, 30),
+                    "bb": _po_v5_valid_num(stat.get("baseOnBalls"), 0, 15),
+                    "hr": _po_v5_valid_num(stat.get("homeRuns"), 0, 10),
+                })
+        except Exception:
+            games = []
+        prof = _po_v5_game_profile(games, "MLB StatsAPI live gameLog")
+        if prof:
+            prof["player_id"] = int(player_id)
+        return prof
+except Exception:
+    def _po_v5_live_profile_by_pid(player_id, season):
+        return {}
+
+
+def _po_v5_local_profile(pitcher):
+    try:
+        df = _po_fill_pitch_logs()
+        if df is None or df.empty or "_po_fill_name" not in df.columns:
+            return {}
+        key = _po_v5_norm_name(pitcher)
+        d = df[df["_po_fill_name"].eq(key)].copy()
+        if d.empty:
+            return {}
+        if "_po_fill_date" in d.columns:
+            d = d.sort_values("_po_fill_date", ascending=False)
+        games = []
+        ipcol = next((c for c in ["IP", "IP_float", "inningsPitched"] if c in d.columns), None)
+        bfcol = next((c for c in ["BF", "TBF", "battersFaced"] if c in d.columns), None)
+        pccol = next((c for c in ["Pitch Count", "Pitches", "numberOfPitches", "pitchCount"] if c in d.columns), None)
+        datecol = "_po_fill_date" if "_po_fill_date" in d.columns else next((c for c in ["Date", "date"] if c in d.columns), None)
+        for _, rr in d.head(20).iterrows():
+            ip = _po_v5_parse_ip(rr.get(ipcol)) if ipcol else np.nan
+            bf = _po_v5_valid_num(rr.get(bfcol), 3, 45) if bfcol else np.nan
+            pc = _po_v5_valid_num(rr.get(pccol), 20, 140) if pccol else np.nan
+            if not np.isfinite(ip) and not np.isfinite(bf) and not np.isfinite(pc):
+                continue
+            if np.isfinite(bf) and bf < 9:
+                continue
+            dt = rr.get(datecol) if datecol else ""
+            try:
+                dt = pd.to_datetime(dt, errors="coerce")
+                ds = "" if pd.isna(dt) else pd.Timestamp(dt).strftime("%Y-%m-%d")
+            except Exception:
+                ds = str(dt or "")
+            games.append({"date": ds, "ip": ip, "bf": bf, "pitches": pc})
+        src = "Repo Pitch*.csv game logs"
+        try:
+            fs = d.get("_po_v5_file_source")
+            if fs is not None and fs.dropna().astype(str).size:
+                src = "Repo " + str(fs.dropna().astype(str).iloc[0])
+        except Exception:
+            pass
+        return _po_v5_game_profile(games, src)
+    except Exception:
+        return {}
+
+
+def _po_v5_workload_profile(pitcher, board=None):
+    season = _okr_mlb_season() if "_okr_mlb_season" in globals() else datetime.now().year
+    pid = _po_v5_board_player_id(board, pitcher)
+    if not pid:
+        pid = _po_v5_name_player_id(pitcher)
+    live = _po_v5_live_profile_by_pid(pid, season) if pid else {}
+    local = _po_v5_local_profile(pitcher)
+
+    merged = dict(local or {})
+    # Live MLB game logs are authoritative when present; local repo data fills only
+    # holes and is retained as an explicit fallback/source audit.
+    if live and live.get("available"):
+        for k, v in live.items():
+            if v not in (None, "") and not (isinstance(v, float) and not np.isfinite(v)):
+                merged[k] = v
+        merged["source"] = "MLB StatsAPI LIVE"
+        if local and local.get("available"):
+            merged["fallback_source"] = local.get("source", "Repo Pitch*.csv")
+    elif local and local.get("available"):
+        merged["source"] = local.get("source", "Repo Pitch*.csv")
+    merged["player_id"] = pid or merged.get("player_id")
+    return merged
+
+
+def _po_v5_apply_profile_to_row(row, prof):
+    row = dict(row or {})
+    if not prof or not prof.get("available"):
+        row["PO V5 Data Source"] = "NO REAL GAME LOG MATCH"
+        return row
+
+    mapping = {
+        "APP97 Live L5 IP Avg": "l5_ip_avg",
+        "L5 IP Avg": "l5_ip_avg",
+        "APP97 Live L5 BF Median": "l5_bf_median",
+        "APP97 Live L10 BF Median": "l10_bf_median",
+        "Pitch Count Avg L3": "l3_pitch_avg",
+        "Pitch Count Avg L5": "l5_pitch_avg",
+        "Pitch Count Avg L10": "l10_pitch_avg",
+        "Season Avg Pitch Count": "season_pitch_avg",
+        "Last Start Pitch Count": "last_pitch",
+        "Max Pitch Count L10": "max_pitch_l10",
+        "Pitch Efficiency P/IP": "p_ip",
+        "Pitch Efficiency P/BF": "p_bf",
+        "Recent Hook Rate": "hook_rate",
+        "Deep Start Rate": "deep6_rate",
+    }
+    for dst, src in mapping.items():
+        v = prof.get(src)
+        if v not in (None, ""):
+            try:
+                if np.isfinite(float(v)):
+                    row[dst] = float(v)
+            except Exception:
+                pass
+
+    row.update({
+        "PO V5 Data Source": prof.get("source", ""),
+        "PO V5 Fallback Source": prof.get("fallback_source", ""),
+        "PO V5 Sample Starts": prof.get("sample", 0),
+        "PO V5 Latest Start": prof.get("latest_date", ""),
+        "PO V5 Data Age Days": prof.get("age_days", ""),
+        "PO V5 Recent IP L3": prof.get("l3_ip_avg", ""),
+        "PO V5 Recent IP L5": prof.get("l5_ip_avg", ""),
+        "PO V5 Recent IP Median L5": prof.get("l5_ip_median", ""),
+        "PO V5 Recent BF L5": prof.get("l5_bf_median", ""),
+        "PO V5 Pitch Count L3": prof.get("l3_pitch_avg", ""),
+        "PO V5 Pitch Count L5": prof.get("l5_pitch_avg", ""),
+        "PO V5 Pitch Count L10": prof.get("l10_pitch_avg", ""),
+        "PO V5 Last Pitch Count": prof.get("last_pitch", ""),
+        "PO V5 Max Pitch Count L10": prof.get("max_pitch_l10", ""),
+        "PO V5 Pitches/IP": prof.get("p_ip", ""),
+        "PO V5 Pitches/BF": prof.get("p_bf", ""),
+        "PO V5 IP P25": prof.get("ip_p25", ""),
+        "PO V5 IP P50": prof.get("ip_p50", ""),
+        "PO V5 IP P75": prof.get("ip_p75", ""),
+        "PO V5 6+ IP Rate": prof.get("deep6_rate", ""),
+        "PO V5 7+ IP Rate": prof.get("deep7_rate", ""),
+        "PO V5 Early Exit Rate": prof.get("early_exit_rate", ""),
+        "PO V5 Player ID": prof.get("player_id", ""),
+    })
+    return row
+
+
+def _po_v5_coverage(row, raw_complete, prof):
+    raw = float(raw_complete if np.isfinite(_po_v5_valid_num(raw_complete)) else 0.0)
+    sample = int(_po_v5_valid_num((prof or {}).get("sample"), 0, 100) if np.isfinite(_po_v5_valid_num((prof or {}).get("sample"), 0, 100)) else 0)
+    sample_cap = 35 + min(sample, 8) * 8.0
+    cap = min(100.0, sample_cap)
+    age = _po_v5_valid_num((prof or {}).get("age_days"), 0, 9999)
+    source = str((prof or {}).get("source") or "").upper()
+    if np.isfinite(age):
+        if age > 45:
+            cap = min(cap, 45.0)
+        elif age > 21:
+            cap = min(cap, 60.0)
+        elif age > 12:
+            cap = min(cap, 78.0)
+    if "MLB STATSAPI" in source and (not np.isfinite(age) or age <= 12):
+        cap = max(cap, min(100.0, 55.0 + min(sample, 6) * 7.5))
+    return round(min(raw, cap), 1)
+
+
+def _po_v5_tier(side, edge, prob, coverage, hard_restriction=False):
+    if side not in {"OVER", "UNDER"}:
+        return "PASS / NO EDGE"
+    ae = abs(float(edge)) if np.isfinite(edge) else 0.0
+    p = float(prob) if np.isfinite(prob) else 0.0
+    cov = float(coverage) if np.isfinite(coverage) else 0.0
+    if cov < 50:
+        return "TRACK · LOW DATA"
+    if hard_restriction and side == "OVER" and ae < 2.5:
+        return "TRACK · ROLE RISK"
+    if cov >= 75 and ae >= 2.5 and p >= 62:
+        return "OFFICIAL PO"
+    if cov >= 65 and ae >= 1.6 and p >= 58:
+        return "PLAYABLE PO"
+    if cov >= 55 and ae >= 0.9 and p >= 54:
+        return "LEAN / TRACK"
+    return "TRACK ONLY"
+
+
+_PO_V5_PREV_ROWS = _impl_beta_projection_rows_po_v3
+
+
+def _impl_beta_projection_rows_po_v5(board, market_kind="OUTS"):
+    df = _PO_V5_PREV_ROWS(board, market_kind)
+    if not isinstance(df, pd.DataFrame) or df.empty or str(market_kind or "").upper() != "OUTS":
+        return df
+    out_rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        pitcher = str(row.get("Pitcher") or row.get("pitcher") or "").strip()
+        prof = _po_v5_workload_profile(pitcher, board)
+        row = _po_v5_apply_profile_to_row(row, prof)
+
+        # Recompute the existing V3 workload model AFTER authoritative recent
+        # IP/BF/pitch-count fields are populated, so pitch count truly participates.
+        try:
+            row.update(_po_v3_profile(row))
+        except Exception as exc:
+            row["PO V5 Error"] = f"workload profile: {str(exc)[:120]}"
+
+        line = _po_v3_num(row, ["UD Line", "Line", "Outs Line"], np.nan)
+        v2_proj = _po_v3_num(row, ["PO Active Projection", "PO Workload V2 Projection", "Beta Projection"], np.nan)
+        v3_proj = _po_v3_num(row, ["PO V3 Projection"], np.nan)
+        raw_complete = _po_v3_num(row, ["PO V3 Data Completeness %"], 0.0)
+        coverage = _po_v5_coverage(row, raw_complete, prof)
+        hard = str(row.get("PO V3 Hard Restriction") or "").upper() == "YES"
+
+        age = _po_v5_valid_num((prof or {}).get("age_days"), 0, 9999)
+        live = "MLB STATSAPI" in str((prof or {}).get("source") or "").upper()
+        if live and (not np.isfinite(age) or age <= 12):
+            v3_weight = 0.72 if coverage >= 80 else 0.62 if coverage >= 65 else 0.48
+        elif np.isfinite(age) and age <= 21:
+            v3_weight = 0.58 if coverage >= 65 else 0.42
+        else:
+            v3_weight = 0.38 if coverage >= 50 else 0.25
+        if hard:
+            v3_weight = max(v3_weight, 0.72)
+
+        if np.isfinite(v2_proj) and np.isfinite(v3_proj):
+            candidate = float(v2_proj + v3_weight * (v3_proj - v2_proj))
+            candidate = float(np.clip(candidate, v2_proj - PO_REAL_WORKLOAD_V5_MAX_MOVE_OUTS, v2_proj + PO_REAL_WORKLOAD_V5_MAX_MOVE_OUTS))
+        elif np.isfinite(v3_proj):
+            candidate = float(v3_proj)
+        else:
+            candidate = float(v2_proj) if np.isfinite(v2_proj) else np.nan
+
+        final_proj = round(candidate, 1) if np.isfinite(candidate) else np.nan
+        final_ip = round(final_proj / 3.0, 2) if np.isfinite(final_proj) else np.nan
+        edge = final_proj - line if np.isfinite(final_proj) and np.isfinite(line) else np.nan
+        side = "OVER" if np.isfinite(edge) and edge > 0 else "UNDER" if np.isfinite(edge) and edge < 0 else "PASS"
+        rconf = _po_v3_num(row, ["PO V3 Restriction Confidence %"], 0.0)
+        prob, over_p, under_p, sd = _po_v3_candidate_probability(row, final_proj, line, side, coverage, rconf)
+        tier = _po_v5_tier(side, edge, prob, coverage, hard)
+
+        # Preserve internal model audit, but expose exactly one public PO decision.
+        row["PO V5 Legacy Active Projection"] = v2_proj if np.isfinite(v2_proj) else ""
+        row["PO V5 Real Workload Projection"] = v3_proj if np.isfinite(v3_proj) else ""
+        row["PO V5 Real Workload Weight"] = round(v3_weight, 2)
+        row["PO V5 Final Projection"] = final_proj if np.isfinite(final_proj) else ""
+        row["PO V5 Final IP"] = final_ip if np.isfinite(final_ip) else ""
+        row["PO V5 Final Side"] = side
+        row["PO V5 Final Edge"] = round(edge, 2) if np.isfinite(edge) else ""
+        row["PO V5 Final Probability %"] = prob if np.isfinite(_po_v5_valid_num(prob)) else ""
+        row["PO V5 Over %"] = over_p if np.isfinite(_po_v5_valid_num(over_p)) else ""
+        row["PO V5 Under %"] = under_p if np.isfinite(_po_v5_valid_num(under_p)) else ""
+        row["PO V5 SD Outs"] = sd
+        row["PO V5 Data Coverage %"] = coverage
+        row["PO V5 Tier"] = tier
+        row["PO V5 Version"] = PO_REAL_WORKLOAD_V5_VERSION
+
+        # Active/public fields intentionally become the single V5 answer for PO.
+        row["PO Active Model"] = "REAL WORKLOAD V5"
+        row["PO Active Projection"] = row["PO V5 Final Projection"]
+        row["PO Active IP"] = row["PO V5 Final IP"]
+        row["PO Active Lean"] = side
+        row["PO Active Edge"] = row["PO V5 Final Edge"]
+        row["PO Active Hit %"] = row["PO V5 Final Probability %"]
+        row["PO Official Tier"] = tier
+        out_rows.append(row)
+    return pd.DataFrame(out_rows)
+
+
+# Public PO data path now includes real workload V5.
+_beta_projection_rows = _impl_beta_projection_rows_po_v5
+
+
+def _po_v5_card_logo(pitcher, matchup, row, board):
+    team = ""
+    try:
+        lookup = _kcard_board_lookup(board) if "_kcard_board_lookup" in globals() else {}
+        key = _tpl_norm_name(pitcher) if "_tpl_norm_name" in globals() else pitcher.lower().strip()
+        p = lookup.get(key, {})
+        team = _kcard_pitcher_team(row, p) if "_kcard_pitcher_team" in globals() else ""
+    except Exception:
+        team = ""
+    if not team:
+        try:
+            away, home = _po_card_matchup_teams(matchup)
+            team = away or home
+        except Exception:
+            team = ""
+    try:
+        url = _po_card_team_logo(team)
+    except Exception:
+        url = ""
+    if url:
+        return f"<img class='pov5-logo' src='{html.escape(url)}'/>", team
+    return f"<div class='pov5-logo pov5-fallback'>{html.escape((team or 'MLB')[:3])}</div>", team
+
+
+def _po_render_player_cards(df, board=None, limit=None):
+    """Elite single-projection PO cards. V2/V3 remain audit-only under the hood."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return 0
+    show = df.head(int(limit)) if limit else df
+    cards = []
+
+    def n(row, keys):
+        return _po_v3_num(row, keys, np.nan)
+
+    def t(row, keys, default="—"):
+        return _po_v3_text(row, keys, default)
+
+    def fmt(v, d=1, suffix=""):
+        return "—" if not np.isfinite(v) else f"{v:.{d}f}{suffix}"
+
+    for _, rr in show.iterrows():
+        row = rr.to_dict()
+        pitcher = t(row, ["Pitcher"], "Pitcher")
+        matchup = t(row, ["Matchup"], "")
+        logo_html, team = _po_v5_card_logo(pitcher, matchup, row, board)
+        line = n(row, ["UD Line", "Line"])
+        proj = n(row, ["PO V5 Final Projection", "PO Active Projection"])
+        ip = n(row, ["PO V5 Final IP", "PO Active IP"])
+        side = t(row, ["PO V5 Final Side", "PO Active Lean"], "PASS").upper()
+        edge = n(row, ["PO V5 Final Edge", "PO Active Edge"])
+        prob = n(row, ["PO V5 Final Probability %", "PO Active Hit %"])
+        tier = t(row, ["PO V5 Tier", "PO Official Tier"], "TRACK")
+        coverage = n(row, ["PO V5 Data Coverage %", "PO V3 Data Completeness %"])
+        source = t(row, ["PO V5 Data Source"], "NO REAL DATA")
+        latest = t(row, ["PO V5 Latest Start"], "—")
+        sample = n(row, ["PO V5 Sample Starts"])
+        rip = n(row, ["PO V5 Recent IP L5", "PO V3 Recent IP Baseline", "PO Fill IP L5"])
+        rbf = n(row, ["PO V5 Recent BF L5", "PO V3 Recent BF Baseline", "PO Fill BF L5"])
+        pc3 = n(row, ["PO V5 Pitch Count L3", "Pitch Count Avg L3"])
+        pc5 = n(row, ["PO V5 Pitch Count L5", "Pitch Count Avg L5", "PO V3 Recent PC Baseline"])
+        pclast = n(row, ["PO V5 Last Pitch Count", "Last Start Pitch Count"])
+        pcmax = n(row, ["PO V5 Max Pitch Count L10", "Max Pitch Count L10"])
+        ppi = n(row, ["PO V5 Pitches/IP", "Pitch Efficiency P/IP"])
+        p25 = n(row, ["PO V5 IP P25"])
+        p50 = n(row, ["PO V5 IP P50"])
+        p75 = n(row, ["PO V5 IP P75"])
+        deep6 = n(row, ["PO V5 6+ IP Rate", "Deep Start Rate"])
+        deep7 = n(row, ["PO V5 7+ IP Rate"])
+        early = n(row, ["PO V5 Early Exit Rate"])
+        capip = n(row, ["PO V3 Capacity IP"])
+        restriction = t(row, ["PO V3 Restriction Type"], "NONE")
+        reason = t(row, ["PO V3 Workload Reason"], "")
+        age = n(row, ["PO V5 Data Age Days"])
+        data_state = "LIVE" if "MLB STATSAPI" in source.upper() and (not np.isfinite(age) or age <= 12) else "CURRENT" if np.isfinite(age) and age <= 21 else "HISTORICAL" if np.isfinite(age) else "FALLBACK"
+        cls = "over" if side == "OVER" else "under" if side == "UNDER" else "track"
+        edge_txt = "—" if not np.isfinite(edge) else f"{edge:+.2f} outs"
+        sample_txt = "—" if not np.isfinite(sample) else str(int(sample))
+        cards.append(f"""
+        <article class='pov5-card {cls}'>
+          <div class='pov5-glow'></div>
+          <header class='pov5-head'>
+            <div class='pov5-id'>{logo_html}<div><span>CHALLENGER · PITCHING OUTS</span><h3>{html.escape(pitcher)}</h3><p>{html.escape(matchup)}</p></div></div>
+            <div class='pov5-tier'>{html.escape(tier)}</div>
+          </header>
+          <section class='pov5-hero'>
+            <div><span>FINAL PROJECTED OUTS</span><strong>{fmt(proj)}</strong><small>{fmt(ip,2)} projected IP</small></div>
+            <div class='pov5-pick'><span>ONE FINAL PICK</span><b>{html.escape(side)} {fmt(line)}</b><small>{fmt(prob,1,'%')} · {html.escape(edge_txt)}</small></div>
+          </section>
+          <section class='pov5-source'><div><span>REAL WORKLOAD DATA</span><b>{html.escape(data_state)}</b><small>{html.escape(source)} · latest {html.escape(latest)} · {sample_txt} starts</small></div><div class='pov5-cov'><span>DATA COVERAGE</span><strong>{fmt(coverage,0,'%')}</strong></div></section>
+          <section class='pov5-grid'>
+            <div><span>RECENT L5 IP</span><b>{fmt(rip,2)}</b></div>
+            <div><span>RECENT L5 BF</span><b>{fmt(rbf,1)}</b></div>
+            <div class='hot'><span>PITCH COUNT L5</span><b>{fmt(pc5,0)}</b></div>
+            <div><span>PITCH COUNT L3</span><b>{fmt(pc3,0)}</b></div>
+            <div><span>LAST START PC</span><b>{fmt(pclast,0)}</b></div>
+            <div><span>MAX PC L10</span><b>{fmt(pcmax,0)}</b></div>
+          </section>
+          <section class='pov5-dist'>
+            <div><span>IP P25</span><b>{fmt(p25,2)}</b></div><div><span>IP P50</span><b>{fmt(p50,2)}</b></div><div><span>IP P75</span><b>{fmt(p75,2)}</b></div>
+            <div><span>6+ IP</span><b>{fmt(deep6,0,'%')}</b></div><div><span>7+ IP</span><b>{fmt(deep7,0,'%')}</b></div><div><span>EARLY EXIT</span><b>{fmt(early,0,'%')}</b></div>
+          </section>
+          <section class='pov5-bottom'><div><span>PITCH EFFICIENCY</span><b>{fmt(ppi,1)} P/IP</b></div><div><span>PC CAPACITY</span><b>{fmt(capip,2)} IP</b></div><div><span>ROLE / LIMIT</span><b>{html.escape(restriction)}</b></div></section>
+          <footer>{html.escape(reason[:340]) if reason else 'Real recent workload + pitch-count distribution reconciled into one final projection.'}</footer>
+        </article>""")
+
+    css = r"""
+    <style>
+    .pov5-wrap{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px;margin:10px 0 18px}.pov5-card{position:relative;overflow:hidden;background:linear-gradient(160deg,#06111f 0%,#0a1528 52%,#08101d 100%);border:1px solid #244d7e;border-radius:22px;padding:16px;color:#f4f8ff;box-shadow:0 16px 38px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.04)}.pov5-card.over{border-top:3px solid #37dfa0}.pov5-card.under{border-top:3px solid #ffcb57}.pov5-card.track{border-top:3px solid #ff7d70}.pov5-glow{position:absolute;right:-80px;top:-90px;width:220px;height:220px;border-radius:50%;background:radial-gradient(circle,rgba(43,113,255,.22),transparent 67%);pointer-events:none}.pov5-head{position:relative;display:flex;align-items:center;justify-content:space-between;gap:10px}.pov5-id{display:flex;align-items:center;gap:11px;min-width:0}.pov5-logo{width:46px;height:46px;object-fit:contain;border-radius:50%;background:#0b1727;border:1px solid #31527a;padding:4px}.pov5-fallback{display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:950}.pov5-id span{display:block;font-size:8px;letter-spacing:.14em;color:#5e91df;font-weight:900}.pov5-id h3{margin:2px 0 0;font-size:19px;line-height:1.05}.pov5-id p{margin:4px 0 0;color:#8293aa;font-size:9px}.pov5-tier{font-size:9px;font-weight:950;color:#dce9ff;border:1px solid #345b8d;background:#0d1d34;border-radius:999px;padding:6px 9px;white-space:nowrap}.pov5-hero{position:relative;display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:13px}.pov5-hero>div{background:linear-gradient(145deg,#0b1c35,#0a1426);border:1px solid #285c9c;border-radius:16px;padding:13px}.pov5-hero span,.pov5-grid span,.pov5-dist span,.pov5-bottom span,.pov5-source span{display:block;color:#7890ac;font-size:8px;font-weight:900;letter-spacing:.09em}.pov5-hero strong{display:block;font-size:35px;line-height:1;color:#ff4c8a;margin:7px 0 3px;font-weight:950}.pov5-hero small{font-size:9px;color:#92a5bd}.pov5-pick b{display:block;font-size:22px;margin:8px 0 5px}.over .pov5-pick b{color:#44e7a5}.under .pov5-pick b{color:#ffd566}.track .pov5-pick b{color:#ff8f82}.pov5-source{display:grid;grid-template-columns:1fr auto;gap:9px;align-items:center;margin-top:9px;background:#081421;border:1px solid #1e3d5e;border-radius:13px;padding:9px}.pov5-source b{font-size:12px;color:#65dcb1}.pov5-source small{display:block;font-size:8px;color:#74879f;margin-top:3px}.pov5-cov{text-align:right}.pov5-cov strong{display:block;font-size:22px;color:#eaf2ff}.pov5-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:9px}.pov5-grid>div,.pov5-dist>div,.pov5-bottom>div{background:#091524;border:1px solid #19334f;border-radius:11px;padding:8px;min-width:0}.pov5-grid>div.hot{border-color:#8d6b25;background:#18180d}.pov5-grid b,.pov5-dist b,.pov5-bottom b{display:block;font-size:14px;margin-top:4px;white-space:nowrap}.pov5-grid .hot b{color:#ffdf72}.pov5-dist{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:6px;margin-top:7px}.pov5-dist b{font-size:11px}.pov5-bottom{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:7px}.pov5-bottom b{font-size:10px}.pov5-card footer{border-top:1px solid #17304a;margin-top:9px;padding-top:8px;color:#7890aa;font-size:8.5px;line-height:1.4}.pov5-debug{margin-top:8px}
+    @media(max-width:900px){.pov5-wrap{grid-template-columns:1fr}}@media(max-width:520px){.pov5-card{padding:12px;border-radius:18px}.pov5-hero{grid-template-columns:1fr 1fr}.pov5-hero strong{font-size:31px}.pov5-pick b{font-size:19px}.pov5-grid{grid-template-columns:repeat(3,1fr)}.pov5-dist{grid-template-columns:repeat(3,1fr)}.pov5-bottom{grid-template-columns:1fr 1fr 1fr}.pov5-tier{font-size:8px;padding:5px 7px}}
+    </style>"""
+    full = css + "<div class='pov5-wrap'>" + "".join(cards) + "</div>"
+    if hasattr(st, "html"):
+        st.html(full)
+    else:
+        st.markdown(full, unsafe_allow_html=True)
+    return len(cards)
+
+
+def _impl_render_beta_pitching_outs_tab_po_v5(board):
+    try:
+        df = _beta_projection_rows(board, "OUTS")
+    except Exception as exc:
+        st.info(f"Pitching Outs board unavailable: {exc}")
+        df = pd.DataFrame()
+    st.markdown('<div class="section-title-pro">🔥 Challenger Pitching Outs · Real Workload V5</div>', unsafe_allow_html=True)
+    st.caption("One public projection and one OVER/UNDER choice. Current MLB game logs are preferred; repo Pitch*.csv is the fallback. Recent IP, BF, pitch count, pitch efficiency, workload distribution, deep-start rate, and early-exit risk feed the PO projection. K projections are untouched.")
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No Pitching Outs rows yet. Refresh the board first.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pitchers", int(len(df)))
+    c2.metric("Real-data matches", int(df.get("PO V5 Data Source", pd.Series(dtype=str)).astype(str).ne("NO REAL GAME LOG MATCH").sum()))
+    cov = pd.to_numeric(df.get("PO V5 Data Coverage %"), errors="coerce")
+    c3.metric("Avg data coverage", "—" if cov.dropna().empty else f"{cov.mean():.0f}%")
+    plays = df.get("PO V5 Tier", pd.Series(dtype=str)).astype(str).str.contains("OFFICIAL|PLAYABLE", regex=True).sum()
+    c4.metric("Official / Playable", int(plays))
+    _po_render_player_cards(df, board=board)
+    with st.expander("Pitching Outs V5 audit · real inputs + internal model comparison", expanded=False):
+        cols = [c for c in [
+            "Pitcher", "Matchup", "UD Line", "PO V5 Final Projection", "PO V5 Final Side", "PO V5 Final Probability %", "PO V5 Tier",
+            "PO V5 Data Source", "PO V5 Latest Start", "PO V5 Sample Starts", "PO V5 Data Coverage %",
+            "PO V5 Recent IP L3", "PO V5 Recent IP L5", "PO V5 Recent BF L5", "PO V5 Pitch Count L3", "PO V5 Pitch Count L5", "PO V5 Pitch Count L10", "PO V5 Last Pitch Count", "PO V5 Max Pitch Count L10",
+            "PO V5 Pitches/IP", "PO V5 Pitches/BF", "PO V5 IP P25", "PO V5 IP P50", "PO V5 IP P75", "PO V5 6+ IP Rate", "PO V5 7+ IP Rate", "PO V5 Early Exit Rate",
+            "PO V5 Legacy Active Projection", "PO V5 Real Workload Projection", "PO V5 Real Workload Weight", "PO V3 Capacity IP", "PO V3 Restriction Type", "PO V3 Workload Reason", "PO V5 Version"
+        ] if c in df.columns]
+        st.dataframe(df[cols] if cols else df, use_container_width=True, hide_index=True)
+    # Keep save/grade/loss-lab tools available without adding a second public card set.
+    if _PO_CAL_PREV_RENDER_PO is not None:
+        with st.expander("Advanced PO tools · save/grade, loss lab, simulation", expanded=False):
+            _PO_CAL_PREV_RENDER_PO(board)
+
+
+render_beta_pitching_outs_tab = _impl_render_beta_pitching_outs_tab_po_v5
+
+
+# -----------------------------------------------------------------------------
+# MONEYLINE: data-completeness repair only.
+# Existing Phase 2.1 already reconciles starter IP with recent full-start usage.
+# If its normal history fields are missing, feed the same live MLB recent workload
+# center into that existing capped reconciliation. This does NOT change the ML side
+# protection or create a new independent scoring family.
+# -----------------------------------------------------------------------------
+_ML_PHASE21_RECENT_IP_PRE_V5 = _ml_phase21_recent_full_starter_ip
+
+
+def _ml_phase21_recent_full_starter_ip(row):
+    base = _ML_PHASE21_RECENT_IP_PRE_V5(row)
+    if isinstance(base, dict) and base.get("available"):
+        return base
+    row = row if isinstance(row, dict) else {}
+    name = str(row.get("Pitcher") or row.get("pitcher") or row.get("Starter") or row.get("Starting Pitcher") or "").strip()
+    if not name:
+        return base
+    prof = _po_v5_workload_profile(name, None)
+    if not prof or not prof.get("available"):
+        return base
+    center = _po_v5_valid_num(prof.get("l5_ip_avg"), 1.0, 9.0)
+    if not np.isfinite(center):
+        center = _po_v5_valid_num(prof.get("ip_p50"), 1.0, 9.0)
+    if not np.isfinite(center):
+        return base
+    sample = int(_po_v5_valid_num(prof.get("sample"), 0, 100) if np.isfinite(_po_v5_valid_num(prof.get("sample"), 0, 100)) else 0)
+    authority = 0.42 if sample >= 5 else 0.34 if sample >= 3 else 0.25
+    # A genuinely low recent pitch-count center reduces how much the recent-IP
+    # fallback can claim, but never creates a side flip by itself.
+    pc = _po_v5_valid_num(prof.get("l5_pitch_median"), 20, 140)
+    if np.isfinite(pc) and pc < 78:
+        authority = min(authority, 0.28)
+    return {
+        "available": True,
+        "center": round(float(center), 3),
+        "authority": float(authority),
+        "source": "MLB_REAL_WORKLOAD_FALLBACK",
+        "sample": sample,
+    }
+
+
 tab_kproj, tab_brain, tab_beta_outs, tab_first_inning_k, tab_beta_ip_debug, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
     "K PROJ / UPSIDE",
