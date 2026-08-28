@@ -3,14 +3,15 @@ from __future__ import annotations
 import argparse, py_compile, re, tempfile
 from pathlib import Path
 
-MARKER = "CHALLENGER_UD2_MANUAL_REFRESH_STATE_V2_2026_08_28"
+MARKER = "CHALLENGER_UD2_MANUAL_REFRESH_STATE_V2_1_2026_08_28"
 STATE_ANCHOR = "dates = target_dates(day_mode)"
 
 BLOCK = r'''
 # =============================================================================
-# CHALLENGER_UD2_MANUAL_REFRESH_STATE_V2_2026_08_28
+# CHALLENGER_UD2_MANUAL_REFRESH_STATE_V2_1_2026_08_28
 # Runtime/state only. Projection math is untouched.
 # Savant network work is tied to explicit board refresh, never Save/passive reruns.
+# The current live board is persisted so Save/widget reruns cannot blank the slate.
 # =============================================================================
 try:
     MERGE_V254_ENABLE_AUTO_LINEUP_REFRESH = False
@@ -31,7 +32,10 @@ def _state_v2_cache_path():
             candidates.append(Path(mount) / "mlb_live_board_state_v2.pkl")
     except Exception:
         pass
-    candidates += [Path("/data/mlb_live_board_state_v2.pkl"), Path(__file__).resolve().parent / "learning_data" / ".mlb_live_board_state_v2.pkl"]
+    candidates += [
+        Path("/data/mlb_live_board_state_v2.pkl"),
+        Path(__file__).resolve().parent / "learning_data" / ".mlb_live_board_state_v2.pkl",
+    ]
     for p in candidates:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +54,11 @@ def _state_v2_save_board(picks):
             return False
         p = _state_v2_cache_path()
         tmp = p.with_suffix(p.suffix + ".tmp")
-        payload = {"saved_epoch": _state_v2_time.time(), "last_refresh_time": st.session_state.get("last_refresh_time"), "board": list(picks)}
+        payload = {
+            "saved_epoch": _state_v2_time.time(),
+            "last_refresh_time": st.session_state.get("last_refresh_time"),
+            "board": list(picks),
+        }
         with tmp.open("wb") as fh:
             _state_v2_pickle.dump(payload, fh, protocol=_state_v2_pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, p)
@@ -78,7 +86,10 @@ def _state_v2_restore_board(target_dates_value=None):
         board_dates = set()
         for row in board:
             if isinstance(row, dict):
-                raw = row.get("Slate Date") or row.get("slate_date") or row.get("Game Date") or row.get("Date")
+                raw = (
+                    row.get("Slate Date") or row.get("slate_date") or
+                    row.get("Game Date") or row.get("Date") or row.get("date")
+                )
                 if raw not in (None, ""):
                     board_dates.add(str(raw)[:10])
         if wanted and board_dates and wanted.isdisjoint(board_dates):
@@ -89,21 +100,36 @@ def _state_v2_restore_board(target_dates_value=None):
 
 
 def _state_v2_refresh_savant_for_board():
+    """The only automatic Savant network path: explicit REFRESH LIVE BOARD."""
     result = {"mode": "CACHE_ONLY", "ok": True}
     try:
         ud_sync = Path(__file__).resolve().parent / "tools" / "sync_savant_ud20.py"
         if ud_sync.exists():
-            proc = _state_v2_subprocess.run([_state_v2_sys.executable, str(ud_sync)], cwd=str(Path(__file__).resolve().parent), capture_output=True, text=True, timeout=180)
-            result = {"mode": "UD20_SYNC_ON_BOARD_REFRESH", "ok": proc.returncode == 0}
+            proc = _state_v2_subprocess.run(
+                [_state_v2_sys.executable, str(ud_sync)],
+                cwd=str(Path(__file__).resolve().parent),
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            result = {
+                "mode": "UD20_SYNC_ON_BOARD_REFRESH",
+                "ok": proc.returncode == 0,
+                "detail": (proc.stdout or proc.stderr or "")[-500:],
+            }
         else:
             svc = globals().get("_v269_savant_service")
             aux = globals().get("_v2610_savant_aux_service")
             if callable(svc):
-                try: svc().refresh(force=False)
-                except Exception: pass
+                try:
+                    svc().refresh(force=False)
+                except Exception:
+                    pass
             if callable(aux):
-                try: aux().refresh(force=False)
-                except Exception: pass
+                try:
+                    aux().refresh(force=False)
+                except Exception:
+                    pass
             result = {"mode": "CHALLENGER_SAVANT_ON_BOARD_REFRESH", "ok": True}
         for name in ("_v269_load_savant_platoon", "_savant_aux_bundle_cached"):
             obj = globals().get(name)
@@ -142,23 +168,49 @@ def patch_text(text: str) -> str:
     text = _sub_once(init_pat, init_repl, text, "loaded_picks init")
 
     clear_pat = r'(if st\.button\("🧹 Clear Streamlit Cache \+ Reload Live Lines", use_container_width=True\):\s+st\.cache_data\.clear\(\)\s+st\.session_state\.loaded_picks = \[\]\s+st\.session_state\.last_refresh_time = None)'
-    text, _ = re.subn(clear_pat, r'\1\n        st.session_state["_manual_refresh_v2_skip_restore_once"] = True', text, count=1, flags=re.MULTILINE)
+    text, _ = re.subn(
+        clear_pat,
+        r'\1\n        st.session_state["_manual_refresh_v2_skip_restore_once"] = True',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
 
+    # Disable EVERY passive/timed Savant refresh copy in this very large app.
+    # Explicit Refresh Savant Data buttons remain intact, and board refresh below
+    # performs one controlled refresh before projections are built.
     due_pat = r'due\s*=\s*bool\(\s*unresolved\s*or\s*health\.get\("status"\)\s*not\s*in\s*\{"CURRENT"\}\s*or\s*not\s*all_aux_current\s*or\s*due_by_time\s*\)'
-    text, due_count = re.subn(due_pat, 'due = False  # Manual Refresh V2: no passive/background Savant refresh', text, count=1, flags=re.MULTILINE)
+    text, due_count = re.subn(
+        due_pat,
+        'due = False  # Manual Refresh V2.1: no passive/background Savant refresh',
+        text,
+        flags=re.MULTILINE,
+    )
     if due_count == 0:
-        text = text.replace('"v112_savant_refresh_minutes": 30,', '"v112_savant_refresh_minutes": 52560000,', 1)
+        text = text.replace('"v112_savant_refresh_minutes": 30,', '"v112_savant_refresh_minutes": 52560000,')
 
     refresh_pat = r'if refresh_btn:\s+all_rows = \[\]'
-    text = _sub_once(refresh_pat, 'if refresh_btn:\n    _state_v2_refresh_savant_for_board()\n    all_rows = []', text, "refresh")
+    text = _sub_once(
+        refresh_pat,
+        'if refresh_btn:\n    _state_v2_refresh_savant_for_board()\n    all_rows = []',
+        text,
+        "refresh",
+    )
 
     seq_pat = r'st\.session_state\.loaded_picks = projections\s+st\.session_state\.last_refresh_time = now_iso\(\)'
-    text = _sub_once(seq_pat, 'st.session_state.loaded_picks = projections\n    st.session_state.last_refresh_time = now_iso()\n    _state_v2_save_board(st.session_state.loaded_picks)', text, "successful refresh state")
+    text = _sub_once(
+        seq_pat,
+        'st.session_state.loaded_picks = projections\n    st.session_state.last_refresh_time = now_iso()\n    _state_v2_save_board(st.session_state.loaded_picks)',
+        text,
+        "successful refresh state",
+    )
 
     save_pat = r'if save_btn:\s+if not st\.session_state\.get\("loaded_picks"\):\s+st\.warning\("Refresh the live board first, inspect the lines, then save the official before-game snapshot\."\)\s+else:\s+added = save_many_once\(st\.session_state\.loaded_picks\)'
     save_repl = '''if save_btn:\n    if not st.session_state.get("loaded_picks"):\n        st.warning("Refresh the live board first, inspect the lines, then save the official before-game snapshot.")\n    else:\n        _state_v2_save_board(st.session_state.loaded_picks)\n        added = save_many_once(st.session_state.loaded_picks)'''
     text = _sub_once(save_pat, save_repl, text, "official save")
 
+    # This assignment appears in more than one historical block in some builds.
+    # Replace all copies so a Save/widget rerun can never silently become Refresh.
     text = text.replace("MERGE_V254_ENABLE_AUTO_LINEUP_REFRESH = True", "MERGE_V254_ENABLE_AUTO_LINEUP_REFRESH = False")
     return text
 
@@ -174,7 +226,7 @@ def main():
         path.write_text(patched, encoding="utf-8")
     with tempfile.TemporaryDirectory() as td:
         py_compile.compile(str(path), cfile=str(Path(td) / "app.pyc"), doraise=True)
-    print(f"Manual Refresh / Board State V2 READY: {path}")
+    print(f"Manual Refresh / Board State V2.1 READY: {path}")
 
 if __name__ == "__main__":
     main()
