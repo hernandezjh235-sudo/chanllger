@@ -28,6 +28,7 @@ PATCHES = [
     "tools/apply_manual_refresh_state_v2.py",
     "tools/apply_challenger_recency_shadow_v1.py",
     "tools/apply_challenger_recency_history_feed_v2.py",
+    "tools/apply_recency_cache_guard_v3.py",
     "tools/apply_recency_lazy_guard_v2.py",
     "tools/apply_opponent_k_pipeline_cleanup_v1.py",
 ]
