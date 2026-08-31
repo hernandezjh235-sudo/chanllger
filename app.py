@@ -1,3 +1,4 @@
+# CHALLENGER_V5_ROLE_STARTER_INTEGRITY_FIXES
 # UI_ONLY_COPY_PASTE_PO_CARD_FIX_2026_08_23
 # CHALLENGER_SAVANT_BATTER_DISPLAY_V6_2026_08_23
 # CHALLENGER_SAVANT_BATTER_DISPLAY_V7_2026_08_23
@@ -141541,6 +141542,253 @@ else:
         st.data_editor = st._challenger_audit_original_data_editor
 
 
+
+
+# ==========================================================================
+# CHALLENGER V5 — CROSS-MARKET ROLE + STARTER INTEGRITY FIXES (2026-08-31)
+# ==========================================================================
+# Scope is intentionally narrow:
+#   1) Pitching Outs: when real workload logs are absent/very thin, do not
+#      erase an already-computed explicit short-role signal by applying a
+#      generic normal-starter floor.
+#   2) Moneyline: never assign a pitcher to the opposite team simply because
+#      one side's starter row is missing.
+#   3) K: keep raw lean and public PASS/play side explicitly separated in the
+#      export contract. No K projection/probability formula is changed here.
+# V4's pitch-limit-watch fix and ML incremental-score calibration stay intact.
+# ==========================================================================
+CHALLENGER_V5_ROLE_STARTER_INTEGRITY_VERSION = "CHALLENGER_V5_ROLE_STARTER_INTEGRITY_2026_08_31"
+
+
+def _challenger_v5_norm_name(value):
+    try:
+        import re as _re
+        return _re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    except Exception:
+        return str(value or "").lower().strip()
+
+
+def _challenger_v5_board_pitcher_row(board_obj, pitcher):
+    key = _challenger_v5_norm_name(pitcher)
+    if not key:
+        return {}
+    for item in (board_obj or []):
+        if not isinstance(item, dict):
+            continue
+        nm = item.get("pitcher") or item.get("Pitcher") or item.get("player") or item.get("Player")
+        if _challenger_v5_norm_name(nm) == key:
+            return item
+    return {}
+
+
+def _challenger_v5_num(value, default=np.nan):
+    try:
+        if value in (None, "", "—", "-", "nan", "NaN"):
+            return default
+        x = float(str(value).replace("%", "").replace(",", "").strip())
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _challenger_v5_short_role_context(board_row):
+    """Use existing Challenger role/workload evidence; never infer from a watch flag.
+
+    This deliberately does NOT inspect PITCH_LIMIT_RISK / WATCH text. Those are
+    diagnostic-only under V4. It only trusts structural role fields already
+    computed by Challenger and, when present, the board's own role-aware IP.
+    """
+    b = board_row if isinstance(board_row, dict) else {}
+    role_bits = [
+        str(b.get("workload_v23_role") or ""),
+        str(b.get("role_status") or ""),
+        str(b.get("profile_role_status") or ""),
+        str(b.get("Pitcher Class") or b.get("pitcher_class") or ""),
+        str(b.get("Role/Pitch Limit Flag") or ""),
+    ]
+    blob = " | ".join(role_bits).upper()
+    role = ""
+    cap = np.nan
+    if "OPENER" in blob or "OPENING PITCHER" in blob:
+        role = "OPENER"
+        cap = 3.0
+    elif any(tok in blob for tok in ("BULK", "TANDEM", "PIGGYBACK")):
+        role = "BULK_TANDEM"
+        cap = 4.5
+    elif "SHORT_ROLE" in blob or "SHORT ROLE" in blob:
+        role = "SHORT_ROLE"
+
+    board_ip = _challenger_v5_num(
+        b.get("projected_ip") if b.get("projected_ip") not in (None, "") else b.get("profile_projected_ip"),
+        np.nan,
+    )
+    expected_bf = _challenger_v5_num(
+        b.get("expected_bf") if b.get("expected_bf") not in (None, "") else b.get("profile_expected_BF"),
+        np.nan,
+    )
+    bf_ip = expected_bf / 4.25 if np.isfinite(expected_bf) and expected_bf > 0 else np.nan
+
+    # The canonical board IP is the primary cross-market workload fallback.
+    # BF-derived IP is audit/support only because some K engines use BF for
+    # strikeout opportunity rather than literal innings conversion.
+    role_ip = board_ip if np.isfinite(board_ip) and 0.1 <= board_ip <= 8.5 else np.nan
+    if np.isfinite(cap):
+        role_ip = min(role_ip, cap) if np.isfinite(role_ip) else cap
+    elif role and not np.isfinite(role_ip) and np.isfinite(bf_ip):
+        role_ip = min(max(bf_ip, 0.1), 4.5)
+
+    return {
+        "role": role,
+        "role_blob": blob,
+        "role_ip": role_ip,
+        "role_cap": cap,
+        "board_projected_ip": board_ip,
+        "board_expected_bf": expected_bf,
+        "bf_implied_ip": bf_ip,
+        "authority": str(b.get("workload_v23_role") or b.get("role_status") or ""),
+    }
+
+
+# --------------------------------------------------------------------------
+# MONEYLINE — strict starter/team assignment
+# --------------------------------------------------------------------------
+def _ml_pick_pitchers_clean(ps, away_abbr, home_abbr):
+    """Return only pitchers whose canonical team matches the requested side.
+
+    V4/earlier fallback behavior could assign ps[0] to a missing away side and
+    then use that same pitcher for home. That creates a fake duplicate-starter
+    score. Missing starter data must stay missing so the existing ML integrity
+    gate can PASS the game instead of calculating with a wrong-team starter.
+    """
+    rows = [p for p in (ps or []) if isinstance(p, dict)]
+    canon = globals().get("ml_canonical_abbr")
+
+    def _team(p):
+        raw = p.get("team") or p.get("Team") or p.get("Pitcher Team") or ""
+        try:
+            return str(canon(raw) if callable(canon) else raw).upper().strip()
+        except Exception:
+            return str(raw).upper().strip()
+
+    try:
+        away = str(canon(away_abbr) if callable(canon) else away_abbr or "").upper().strip()
+    except Exception:
+        away = str(away_abbr or "").upper().strip()
+    try:
+        home = str(canon(home_abbr) if callable(canon) else home_abbr or "").upper().strip()
+    except Exception:
+        home = str(home_abbr or "").upper().strip()
+
+    ap = next((p for p in rows if away and _team(p) == away), None)
+    hp = next((p for p in rows if home and _team(p) == home), None)
+    return (ap or {}), (hp or {})
+
+
+# --------------------------------------------------------------------------
+# PITCHING OUTS — low-data explicit-role fallback/cap
+# --------------------------------------------------------------------------
+_CHALLENGER_V5_PREV_PO_ROWS = _impl_beta_projection_rows_po_v5
+
+
+def _challenger_v5_apply_low_data_role_guard(row, board_obj):
+    out = dict(row or {})
+    pitcher = str(out.get("Pitcher") or out.get("pitcher") or "").strip()
+    b = _challenger_v5_board_pitcher_row(board_obj, pitcher)
+    ctx = _challenger_v5_short_role_context(b)
+
+    source = str(out.get("PO V5 Data Source") or "").upper()
+    coverage = _challenger_v5_num(out.get("PO V5 Data Coverage %"), 0.0)
+    no_real_log = ("NO REAL GAME LOG" in source) or not source.strip()
+    low_data = bool(no_real_log or (np.isfinite(coverage) and coverage < 45.0))
+    role = str(ctx.get("role") or "").upper()
+    role_ip = _challenger_v5_num(ctx.get("role_ip"), np.nan)
+
+    out["PO V5 Cross-Market Role"] = role or "NONE"
+    out["PO V5 Cross-Market Role Authority"] = ctx.get("authority") or ""
+    out["PO V5 Cross-Market Board IP"] = round(float(ctx.get("board_projected_ip")), 2) if np.isfinite(_challenger_v5_num(ctx.get("board_projected_ip"), np.nan)) else ""
+    out["PO V5 Cross-Market Expected BF"] = round(float(ctx.get("board_expected_bf")), 1) if np.isfinite(_challenger_v5_num(ctx.get("board_expected_bf"), np.nan)) else ""
+    out["PO V5 Role Fallback Applied"] = "NO"
+    out["PO V5 Role Fallback Reason"] = ""
+    out["PO V5 Pre Role-Fallback Projection"] = out.get("PO V5 Final Projection", "")
+    out["PO V5 Pre Role-Fallback IP"] = out.get("PO V5 Final IP", "")
+
+    if not (low_data and role in {"OPENER", "SHORT_ROLE", "BULK_TANDEM"} and np.isfinite(role_ip)):
+        return out
+
+    current_ip = _challenger_v5_num(out.get("PO V5 Final IP"), np.nan)
+    if not np.isfinite(current_ip):
+        current_proj = _challenger_v5_num(out.get("PO V5 Final Projection"), np.nan)
+        current_ip = current_proj / 3.0 if np.isfinite(current_proj) else np.nan
+    guarded_ip = min(current_ip, role_ip) if np.isfinite(current_ip) else role_ip
+    guarded_ip = float(np.clip(guarded_ip, 0.1, 8.2))
+    guarded_proj = round(guarded_ip * 3.0, 1)
+
+    line = _po_v3_num(out, ["UD Line", "Line", "Outs Line"], np.nan)
+    edge = guarded_proj - line if np.isfinite(line) else np.nan
+    side = "OVER" if np.isfinite(edge) and edge > 0 else "UNDER" if np.isfinite(edge) and edge < 0 else "PASS"
+    rconf = _po_v3_num(out, ["PO V3 Restriction Confidence %"], 0.0)
+    prob, over_p, under_p, sd = _po_v3_candidate_probability(out, guarded_proj, line, side, coverage, rconf)
+    tier = _po_v5_tier(side, edge, prob, coverage, hard_restriction=True)
+
+    out["PO V5 Role Fallback Applied"] = "YES"
+    out["PO V5 Role Fallback Reason"] = f"LOW_DATA_{role}_USES_EXISTING_CHALLENGER_ROLE_IP"
+    out["PO V5 Role-Aware IP Cap"] = round(role_ip, 2)
+    out["PO V5 Final Projection"] = guarded_proj
+    out["PO V5 Final IP"] = round(guarded_ip, 2)
+    out["PO V5 Final Side"] = side
+    out["PO V5 Final Edge"] = round(edge, 2) if np.isfinite(edge) else ""
+    out["PO V5 Final Probability %"] = prob if np.isfinite(_challenger_v5_num(prob, np.nan)) else ""
+    out["PO V5 Over %"] = over_p if np.isfinite(_challenger_v5_num(over_p, np.nan)) else ""
+    out["PO V5 Under %"] = under_p if np.isfinite(_challenger_v5_num(under_p, np.nan)) else ""
+    out["PO V5 SD Outs"] = sd
+    out["PO V5 Tier"] = tier
+    out["PO Active Model"] = "REAL WORKLOAD V5 + LOW-DATA ROLE INTEGRITY"
+    out["PO Active Projection"] = guarded_proj
+    out["PO Active IP"] = round(guarded_ip, 2)
+    out["PO Active Lean"] = side
+    out["PO Active Edge"] = round(edge, 2) if np.isfinite(edge) else ""
+    out["PO Active Hit %"] = out["PO V5 Final Probability %"]
+    out["PO Official Tier"] = tier
+    out["PO Active Role"] = role
+    return out
+
+
+def _impl_beta_projection_rows_po_v5(board, market_kind="OUTS"):
+    df = _CHALLENGER_V5_PREV_PO_ROWS(board, market_kind)
+    if not isinstance(df, pd.DataFrame) or df.empty or str(market_kind or "").upper() != "OUTS":
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        rows.append(_challenger_v5_apply_low_data_role_guard(rr.to_dict(), board))
+    return pd.DataFrame(rows)
+
+
+# Rebind only the public PO data path. All earlier V4 internals remain available.
+_beta_projection_rows = _impl_beta_projection_rows_po_v5
+
+
+# --------------------------------------------------------------------------
+# K export contract clarity — raw lean != official decision
+# --------------------------------------------------------------------------
+_CHALLENGER_V5_PREV_ACTIVATE_PATTERN_V2 = globals().get("activate_pattern_v2_candidate")
+if callable(_CHALLENGER_V5_PREV_ACTIVATE_PATTERN_V2):
+    def activate_pattern_v2_candidate(control_row, pitcher=None):
+        out = _CHALLENGER_V5_PREV_ACTIVATE_PATTERN_V2(control_row, pitcher)
+        if not isinstance(out, dict):
+            return out
+        raw = str(out.get("CK V2 Final Side") or out.get("UB Final Side") or "").upper().strip()
+        decision = str(out.get("pick_side") or out.get("Final Decision Side") or out.get("CK V2 Final Decision") or "PASS").upper().strip()
+        if decision not in {"OVER", "UNDER", "PASS"}:
+            decision = "PASS"
+        out["K Raw Lean Side"] = raw if raw in {"OVER", "UNDER"} else ""
+        out["Public Canonical Side"] = decision
+        out["Public Decision Side"] = decision
+        out["K Raw Lean Is Official"] = bool(decision in {"OVER", "UNDER"} and raw == decision)
+        # Preserve UB Final Side / Final Resolved Side as raw-model audit fields;
+        # pick_side + Public Canonical Side remain the official grading contract.
+        return out
+
+
 tab_kproj, tab_brain, tab_beta_outs, tab_first_inning_k, tab_beta_ip_debug, tab_moneyline, tab_loss_lab, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
     "K PROJ / UPSIDE",
@@ -143576,6 +143824,60 @@ def _build_full_live_audit_zip(model_id):
                 })
 
         _zip_df(_zf, "08_consistency_checks/CROSS_MARKET_SIDE_AND_WORKFLOW_AUDIT.csv", _audit_pd.DataFrame(_consistency_rows))
+
+
+        # V5: explicit cross-market role/IP and ML starter integrity diagnostics.
+        _v5_role_rows = []
+        _v5_starter_rows = []
+        _board_role_map = {}
+        for _bp in (globals().get("board") or []):
+            if not isinstance(_bp, dict):
+                continue
+            _bn = _challenger_v5_norm_name(_bp.get("pitcher") or _bp.get("Pitcher"))
+            if _bn:
+                _board_role_map[_bn] = _bp
+
+        _podf_v5 = _snapshots.get("PITCHING_OUTS_V5")
+        if isinstance(_podf_v5, _audit_pd.DataFrame):
+            for _, _r in _podf_v5.iterrows():
+                _nm = str(_r.get("Pitcher") or "")
+                _bp = _board_role_map.get(_challenger_v5_norm_name(_nm), {})
+                _ctx = _challenger_v5_short_role_context(_bp)
+                _v5_role_rows.append({
+                    "pitcher": _nm,
+                    "k_board_role": _ctx.get("role") or _bp.get("workload_v23_role") or "",
+                    "k_board_role_authority": _ctx.get("authority") or "",
+                    "k_board_projected_ip": _ctx.get("board_projected_ip"),
+                    "k_board_expected_bf": _ctx.get("board_expected_bf"),
+                    "po_data_source": _r.get("PO V5 Data Source"),
+                    "po_data_coverage_pct": _r.get("PO V5 Data Coverage %"),
+                    "po_active_role": _r.get("PO Active Role"),
+                    "po_final_ip": _r.get("PO V5 Final IP"),
+                    "po_final_projection": _r.get("PO V5 Final Projection"),
+                    "role_fallback_applied": _r.get("PO V5 Role Fallback Applied"),
+                    "role_fallback_reason": _r.get("PO V5 Role Fallback Reason"),
+                    "status": "ROLE_FALLBACK_APPLIED" if str(_r.get("PO V5 Role Fallback Applied") or "").upper() == "YES" else "OBSERVE",
+                })
+        _zip_df(_zf, "08_consistency_checks/CROSS_MARKET_WORKLOAD_ROLE_AUDIT.csv", _audit_pd.DataFrame(_v5_role_rows))
+
+        _mldf_v5 = _snapshots.get("MONEYLINE")
+        if isinstance(_mldf_v5, _audit_pd.DataFrame):
+            for _, _r in _mldf_v5.iterrows():
+                _away_sp = str(_r.get("Away SP") or "").strip()
+                _home_sp = str(_r.get("Home SP") or "").strip()
+                _missing = str(_r.get("ML Missing Data") or "")
+                _dup = bool(_r.get("ML VNext Duplicate Starter") is True) or bool(_away_sp and _home_sp and _away_sp == _home_sp and _away_sp != "—")
+                _v5_starter_rows.append({
+                    "matchup": _r.get("Matchup"),
+                    "away_sp": _away_sp,
+                    "home_sp": _home_sp,
+                    "missing_data": _missing,
+                    "duplicate_starter": _dup,
+                    "integrity_pass": _r.get("ML VNext Integrity Pass"),
+                    "data_lock_pct": _r.get("ML VNext Data Lock %"),
+                    "status": "ERROR_DUPLICATE_STARTER" if _dup else "MISSING_STARTER" if "starter" in _missing.lower() else "OK",
+                })
+        _zip_df(_zf, "08_consistency_checks/MONEYLINE_STARTER_INTEGRITY_AUDIT.csv", _audit_pd.DataFrame(_v5_starter_rows))
 
         # Pitcher-hand and component-chain audit are high-priority K plumbing checks.
         _board_obj = globals().get("board")
