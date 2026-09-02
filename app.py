@@ -142410,7 +142410,7 @@ if callable(_ML_V8_PREV_RENDER):
             st.info(f"ML tail simulation support unavailable: {exc}")
 
 # =============================================================================
-# CHALLENGER V8.2 — MONEYLINE REPRESENTATIVE GAME THEATER
+# CHALLENGER V8.3 — MONEYLINE REPRESENTATIVE GAME THEATER — TOP-VISIBLE UI
 # 2026-09-02
 #
 # VISUAL-ONLY POLICY:
@@ -142420,7 +142420,7 @@ if callable(_ML_V8_PREV_RENDER):
 # - Builds one deterministic representative 9-inning path so the user can see
 #   starter -> bullpen transitions and where the simulated scoring is concentrated.
 # =============================================================================
-CHALLENGER_V82_ML_THEATER_VERSION = "CHALLENGER_V8_2_ML_REPRESENTATIVE_GAME_THEATER_2026_09_02"
+CHALLENGER_V82_ML_THEATER_VERSION = "CHALLENGER_V8_3_ML_REPRESENTATIVE_GAME_THEATER_TOP_VISIBLE_2026_09_02"
 
 
 def _v82_rep_score(row):
@@ -142699,13 +142699,163 @@ def _v82_render_game_theater_selector(df):
 _ML_V82_PREV_RENDER = globals().get("render_moneyline_edge_tab")
 if callable(_ML_V82_PREV_RENDER):
     def render_moneyline_edge_tab(board, dates):
+        # Reserve the top of the Moneyline tab BEFORE the existing ML renderer runs.
+        # The existing renderer builds the V8 simulation board; once it is available,
+        # fill this reserved slot so Game Theater is visible immediately at the top
+        # instead of being buried below all matchup cards/debug tables.
+        _v82_top_slot = st.empty()
         _ML_V82_PREV_RENDER(board, dates)
         try:
             df = st.session_state.get("challenger_ml_v8_sim_board")
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                _v82_render_game_theater_selector(df)
+            with _v82_top_slot.container():
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    st.markdown("## 🎮 Representative Game Theater")
+                    st.caption("Tap a matchup below to open one representative game path from Challenger's 5,000-game support simulation.")
+                    _v82_render_game_theater_selector(df)
+                else:
+                    st.info("🎮 Representative Game Theater is waiting for the Moneyline simulation board. Refresh/load the Moneyline board once, then it will appear here.")
         except Exception as exc:
-            st.info(f"ML representative game theater unavailable: {exc}")
+            with _v82_top_slot.container():
+                st.info(f"ML representative game theater unavailable: {exc}")
+
+
+# =============================================================================
+# CHALLENGER V8.4 — ML OFFENSIVE EXPLOSION + CLEAN STARTER STATS UI
+# SUPPORT-ONLY: canonical ML side/probability/projected runs are never overwritten.
+# =============================================================================
+CHALLENGER_V84_ML_VERSION = "CHALLENGER_V8_4_ML_EXPLOSION_PITCHER_UI_SAFE_2026_09_02"
+
+def _v84_nf(d, keys, default=None):
+    d=d if isinstance(d,dict) else {}
+    for k in keys:
+        v=d.get(k)
+        if v not in (None,"","—"):
+            try:return float(v)
+            except:pass
+    return default
+
+def _v84_pf(d, keys, default=None):
+    v=_v84_nf(d,keys,default)
+    if v is None:return None
+    return v*100.0 if 0<=v<=1 else v
+
+def _v84_find_pitcher(board,name,team=None):
+    nm=str(name or '').strip().lower(); tm=str(team or '').strip().upper()
+    for p in board or []:
+        if not isinstance(p,dict):continue
+        pn=str(p.get('pitcher') or p.get('Pitcher') or p.get('Player') or p.get('name') or '').strip().lower()
+        pt=str(p.get('team') or p.get('Team') or p.get('Pitcher Team') or '').strip().upper()
+        if pn==nm and (not tm or pt==tm):return p
+    return {}
+
+def _v84_attack_score(p):
+    era=_v84_nf(p,['APP100 Pitcher ERA','APP97 Live Pitcher ERA','Pitcher ERA Used','ERA'],4.20)
+    whip=_v84_nf(p,['APP100 Pitcher WHIP','APP97 Live Pitcher WHIP','Pitcher WHIP','WHIP'],1.28)
+    h9=_v84_nf(p,['H9','H/9','Pitcher H9'],8.3)
+    hr9=_v84_nf(p,['HR9','HR/9','Pitcher HR9'],1.10)
+    hard=_v84_pf(p,['HardHit% Allowed','HardHit%','Pitcher HardHit%'],39.0)
+    barrel=_v84_pf(p,['Barrel% Allowed','Barrel%','Pitcher Barrel%'],8.0)
+    xw=_v84_nf(p,['xwOBA Allowed','Pitcher xwOBA Allowed','xwOBA'],.320)
+    s=50+(era-4.2)*4+(whip-1.28)*24+(h9-8.3)*2.4+(hr9-1.1)*7+(hard-39)*.5+(barrel-8)*1.2+(xw-.320)*85
+    return round(max(10,min(95,s)),1)
+
+def _v84_bp_attack(row,prefix):
+    ra9=_v84_nf(row,[f'{prefix} Bullpen RA9'],4.10)
+    usage=str(row.get(f'{prefix} Bullpen Usage') or '').upper()
+    fatigue=8 if any(x in usage for x in ['HEAVY','TIRED','FATIGUE']) else 4 if 'MED' in usage else -3 if any(x in usage for x in ['FRESH','LOW']) else 0
+    return round(max(10,min(95,50+(ra9-4.1)*6+fatigue)),1)
+
+def _v84_off_score(row,prefix):
+    runs=_v84_nf(row,[f'{prefix} Projected Runs',f'{prefix} Expected Runs'],4.45)
+    wrc=_v84_nf(row,[f'{prefix} Team wRC+'],100)
+    br=_v84_nf(row,[f'{prefix} BaseRuns/G'],4.45)
+    lineup=_v84_nf(row,[f'{prefix} Lineup Strength'],50)
+    return round(max(10,min(95,50+(runs-4.45)*8+(wrc-100)*.22+(br-4.45)*5+(lineup-50)*.18)),1)
+
+def _v84_game_profile(row,ap,hp):
+    away_off=_v84_off_score(row,'Away'); home_off=_v84_off_score(row,'Home')
+    away_attack=_v84_attack_score(hp); home_attack=_v84_attack_score(ap)
+    away_bp=_v84_bp_attack(row,'Home'); home_bp=_v84_bp_attack(row,'Away')
+    away_power=_v84_pf(hp,['Barrel% Allowed','Barrel%','Pitcher Barrel%'],8.0)
+    home_power=_v84_pf(ap,['Barrel% Allowed','Barrel%','Pitcher Barrel%'],8.0)
+    away_exp=.34*away_off+.36*away_attack+.22*away_bp+.08*max(10,min(95,50+(away_power-8)*2))
+    home_exp=.34*home_off+.36*home_attack+.22*home_bp+.08*max(10,min(95,50+(home_power-8)*2))
+    game=(away_exp+home_exp)/2; gap=abs(away_exp-home_exp)
+    if away_exp>=72 and home_exp>=72:label='TWO-SIDED SHOOTOUT'
+    elif max(away_exp,home_exp)>=76 and gap>=12:label='ONE-SIDED BLOWOUT RISK'
+    elif max(away_exp,home_exp)>=69:label='OFFENSIVE EXPLOSION RISK'
+    elif game>=62:label='HIGH-SCORING LEAN'
+    elif game<=42:label='RUN-SUPPRESSION LEAN'
+    else:label='NORMAL/MIXED'
+    return dict(away=round(away_exp,1),home=round(home_exp,1),game=round(game,1),gap=round(gap,1),label=label)
+
+def _v84_env_display(row):
+    explicit=str(row.get('ML V8.4 Game Environment Label') or '').upper()
+    hi=_v84_nf(row,['ML V8 High Run 10+ %'],0) or 0; bo=_v84_nf(row,['ML V8 Blowout 4+ %'],0) or 0; sh=_v84_nf(row,['ML V8 Shootout %'],0) or 0
+    if 'SHOOTOUT' in explicit or sh>=22:return '⚡ SHOOTOUT'
+    if 'BLOWOUT' in explicit or bo>=38:return '🔥 BLOWOUT RISK'
+    if 'EXPLOSION' in explicit or hi>=42:return '🔥 HIGH-RUN RISK'
+    if bo>=27:return '🟢 BLOWOUT LEAN'
+    if hi>=30:return '🟢 HIGH-RUN LEAN'
+    if hi<=18 and sh<=10:return '⚖️ LOWER-RUN / TIGHT'
+    return '🟡 NORMAL / MIXED'
+
+_ML_V84_PREV_BUILD=globals().get('ml_build_board')
+if callable(_ML_V84_PREV_BUILD):
+    def ml_build_board(board):
+        df=_ML_V84_PREV_BUILD(board)
+        if not isinstance(df,pd.DataFrame) or df.empty:return df
+        out=df.copy()
+        for idx,rr in out.iterrows():
+            r=rr.to_dict(); m=str(r.get('Matchup') or '')
+            if ' @ ' not in m:continue
+            away,home=[x.strip().upper() for x in m.split(' @ ',1)]
+            ap=_v84_find_pitcher(board,r.get('Away SP'),away); hp=_v84_find_pitcher(board,r.get('Home SP'),home)
+            prof=_v84_game_profile(r,ap,hp)
+            vals={
+              'ML V8.4 Version':CHALLENGER_V84_ML_VERSION,'ML V8.4 Canonical ML Changed':False,
+              'ML V8.4 Away Explosion Score':prof['away'],'ML V8.4 Home Explosion Score':prof['home'],'ML V8.4 Game Explosion Score':prof['game'],'ML V8.4 Explosion Gap':prof['gap'],'ML V8.4 Game Environment Label':prof['label'],
+              'Away SP ERA':_v84_nf(ap,['APP100 Pitcher ERA','APP97 Live Pitcher ERA','Pitcher ERA Used','ERA'],None),'Home SP ERA':_v84_nf(hp,['APP100 Pitcher ERA','APP97 Live Pitcher ERA','Pitcher ERA Used','ERA'],None),
+              'Away SP WHIP':_v84_nf(ap,['APP100 Pitcher WHIP','APP97 Live Pitcher WHIP','Pitcher WHIP','WHIP'],None),'Home SP WHIP':_v84_nf(hp,['APP100 Pitcher WHIP','APP97 Live Pitcher WHIP','Pitcher WHIP','WHIP'],None),
+              'Away SP K%':_v84_pf(ap,['Pitcher K%','K%','K Pct','K_pct','Season K%','APP100 Pitcher K%'],None),'Home SP K%':_v84_pf(hp,['Pitcher K%','K%','K Pct','K_pct','Season K%','APP100 Pitcher K%'],None),
+              'Away SP HR9':_v84_nf(ap,['HR9','HR/9','Pitcher HR9'],None),'Home SP HR9':_v84_nf(hp,['HR9','HR/9','Pitcher HR9'],None),
+              'Away SP HardHit% Allowed':_v84_pf(ap,['HardHit% Allowed','HardHit%','Pitcher HardHit%'],None),'Home SP HardHit% Allowed':_v84_pf(hp,['HardHit% Allowed','HardHit%','Pitcher HardHit%'],None),
+              'Away SP Barrel% Allowed':_v84_pf(ap,['Barrel% Allowed','Barrel%','Pitcher Barrel%'],None),'Home SP Barrel% Allowed':_v84_pf(hp,['Barrel% Allowed','Barrel%','Pitcher Barrel%'],None),
+              'Away SP xwOBA Allowed':_v84_nf(ap,['xwOBA Allowed','Pitcher xwOBA Allowed','xwOBA'],None),'Home SP xwOBA Allowed':_v84_nf(hp,['xwOBA Allowed','Pitcher xwOBA Allowed','xwOBA'],None),
+            }
+            for k,v in vals.items():out.at[idx,k]=v
+            out.at[idx,'ML V8.4 Environment Display']=_v84_env_display({**r,**vals})
+        try:st.session_state['challenger_ml_v8_sim_board']=out.copy(deep=True)
+        except:pass
+        return out
+
+# UI-only wrapper around the existing card HTML: inject starter ERA/WHIP/K% and replace stale NO_BLOWOUT_EDGE label.
+_ML_V84_OLD_ROW_CARD=globals().get('_ml18_row_card')
+if callable(_ML_V84_OLD_ROW_CARD):
+    def _ml18_row_card(row):
+        r=row.to_dict() if isinstance(row,pd.Series) else dict(row or {})
+        html=_ML_V84_OLD_ROW_CARD(r)
+        tier=str(r.get('ML Official Tier') or '')
+        if tier=='MODEL ONLY / TRACK':
+            html=html.replace('MODEL ONLY / TRACK','LEAN ML')
+        env=_v84_env_display(r)
+        old=str(r.get('ML Blowout Tier') or 'NO_BLOWOUT_EDGE')
+        html=html.replace(old,env)
+        def stats(prefix):
+            era=_v84_nf(r,[f'{prefix} SP ERA'],None); wh=_v84_nf(r,[f'{prefix} SP WHIP'],None); kp=_v84_nf(r,[f'{prefix} SP K%'],None)
+            p=[]
+            if era is not None:p.append(f'ERA {era:.2f}')
+            if wh is not None:p.append(f'WHIP {wh:.2f}')
+            if kp is not None:p.append(f'K% {kp:.1f}')
+            return ' · '.join(p)
+        for prefix in ['Away','Home']:
+            nm=str(r.get(f'{prefix} SP') or '')
+            stxt=stats(prefix)
+            if nm and stxt:
+                html=html.replace(f'<span>{_mlui_safe(nm)}</span>',f'<span>{_mlui_safe(nm)}</span><small style="font-size:8px;color:#9eb2cb;margin-top:2px">{_mlui_safe(stxt)}</small>',1)
+        html=html.replace('NO DATA</b></div><div><span>BLOWOUT','PENDING</b></div><div><span>GAME ENVIRONMENT')
+        html=html.replace('<span>BLOWOUT</span>','<span>GAME ENVIRONMENT</span>')
+        return html
 
 
 CHALLENGER_V8_DISABLED_UI_MODULES = {
