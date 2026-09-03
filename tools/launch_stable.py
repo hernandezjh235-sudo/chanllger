@@ -32,6 +32,7 @@ PATCHES = [
     "tools/apply_recency_lazy_guard_v2.py",
     "tools/apply_opponent_k_pipeline_cleanup_v1.py",
     "tools/apply_challenger_research_ml_v3.py",
+    "tools/apply_ml_card_starter_f5_v1.py",
     # IMPORTANT: runtime stability must wrap the FINAL function bindings.
     # Keeping it last prevents later PO/ML/Savant patches from bypassing
     # lazy loading, same-board caches, and hidden-heavy-tab guards.
@@ -63,6 +64,12 @@ required_runtime_markers = [
     "ML Bullpen Hold Score V3",
     "ML Full Game Strength Score V3",
     "ML V3 Canonical Side Preserved",
+    "CHALLENGER_ML_CARD_STARTER_F5_V1_2026_09_02",
+    "ML F5 Projected Winner V3",
+    "ML F5 Win Prob V3",
+    "Pitcher K%",
+    "WHIP",
+    "K/9",
     "CHALLENGER_UD2_RUNTIME_STABILITY_V1_2026_08_28",
 ]
 missing = [m for m in required_runtime_markers if m not in runtime_text]
