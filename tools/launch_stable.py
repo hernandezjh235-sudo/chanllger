@@ -50,6 +50,25 @@ for rel in PATCHES:
 
 py_compile.compile(str(RUNTIME), doraise=True)
 
+# Deployment smoke checks: never launch a partially-patched runtime.
+runtime_text = RUNTIME.read_text(encoding="utf-8")
+required_runtime_markers = [
+    "CHALLENGER_UD2_MANUAL_REFRESH_STATE_V2_1_2026_08_28",
+    "CHALLENGER_RESEARCH_ML_V3_2026_09_02",
+    "ml_build_board = _impl_ml_build_board_research_v3",
+    "K Shadow P(<5 IP) %",
+    "K Shadow P(6+ IP) %",
+    "K Shadow P(7+ IP) %",
+    "ML F5 Strength Score V3",
+    "ML Bullpen Hold Score V3",
+    "ML Full Game Strength Score V3",
+    "ML V3 Canonical Side Preserved",
+    "CHALLENGER_UD2_RUNTIME_STABILITY_V1_2026_08_28",
+]
+missing = [m for m in required_runtime_markers if m not in runtime_text]
+if missing:
+    raise RuntimeError("Runtime integration verification failed; missing: " + ", ".join(missing))
+
 # Streamlit source watching is disabled in production. Data/CSV changes remain
 # usable when the user explicitly refreshes the board, but file writes cannot
 # cause an application-source reload loop.
