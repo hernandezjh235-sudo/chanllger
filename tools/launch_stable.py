@@ -24,7 +24,6 @@ PATCHES = [
     "tools/apply_po_single_projection_v4_patch.py",
     "tools/apply_po_data_ui_v5_patch.py",
     "tools/apply_savant_display_bridge_v8.py",
-    "tools/apply_runtime_stability_v1.py",
     "tools/apply_manual_refresh_state_v2.py",
     "tools/apply_savant_manual_only_v3.py",
     "tools/apply_challenger_recency_shadow_v1.py",
@@ -32,6 +31,11 @@ PATCHES = [
     "tools/apply_recency_cache_guard_v3.py",
     "tools/apply_recency_lazy_guard_v2.py",
     "tools/apply_opponent_k_pipeline_cleanup_v1.py",
+    "tools/apply_challenger_research_ml_v3.py",
+    # IMPORTANT: runtime stability must wrap the FINAL function bindings.
+    # Keeping it last prevents later PO/ML/Savant patches from bypassing
+    # lazy loading, same-board caches, and hidden-heavy-tab guards.
+    "tools/apply_runtime_stability_v1.py",
 ]
 
 for rel in PATCHES:
