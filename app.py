@@ -75629,6 +75629,10 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
 
     k_overall, r_overall, so_overall, so_rank_overall, pa_overall = [], [], [], [], []
 
+    k_l5_overall, r_l5_overall, so_l5_overall, so_rank_l5_overall, pa_l5_overall = [], [], [], [], []
+
+    k_l10_overall, r_l10_overall, so_l10_overall, so_rank_l10_overall, pa_l10_overall = [], [], [], [], []
+
     k_l30_overall, r_l30_overall, so_l30_overall, so_rank_l30_overall, pa_l30_overall = [], [], [], [], []
 
     top5_note = []
@@ -75737,6 +75741,14 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
 
         so_overall.append(rec.get("SO Overall", "")); so_rank_overall.append(rec.get("SO Rank Overall", "")); pa_overall.append(rec.get("PA Overall", ""))
 
+        k_l5_overall.append(rec.get("K% L5 Overall", "")); r_l5_overall.append(rec.get("K Rank L5 Overall", ""))
+
+        so_l5_overall.append(rec.get("SO L5 Overall", "")); so_rank_l5_overall.append(rec.get("SO Rank L5 Overall", "")); pa_l5_overall.append(rec.get("PA L5 Overall", ""))
+
+        k_l10_overall.append(rec.get("K% L10 Overall", "")); r_l10_overall.append(rec.get("K Rank L10 Overall", ""))
+
+        so_l10_overall.append(rec.get("SO L10 Overall", "")); so_rank_l10_overall.append(rec.get("SO Rank L10 Overall", "")); pa_l10_overall.append(rec.get("PA L10 Overall", ""))
+
         k_l30_overall.append(rec.get("K% L30 Overall", "")); r_l30_overall.append(rec.get("K Rank L30 Overall", ""))
 
         so_l30_overall.append(rec.get("SO L30 Overall", "")); so_rank_l30_overall.append(rec.get("SO Rank L30 Overall", "")); pa_l30_overall.append(rec.get("PA L30 Overall", ""))
@@ -75816,6 +75828,26 @@ def _okr_apply_team_k_ranks_to_df(df, board=None):
     d["Team Batter SO Rank Overall Official"] = so_rank_overall
 
     d["Team Batter PA Overall Official"] = pa_overall
+
+    d["Team Batter K% L5 Overall Official"] = k_l5_overall
+
+    d["Team Batter K% Rank L5 Overall Official"] = r_l5_overall
+
+    d["Team Batter SO L5 Overall Official"] = so_l5_overall
+
+    d["Team Batter SO Rank L5 Overall Official"] = so_rank_l5_overall
+
+    d["Team Batter PA L5 Overall Official"] = pa_l5_overall
+
+    d["Team Batter K% L10 Overall Official"] = k_l10_overall
+
+    d["Team Batter K% Rank L10 Overall Official"] = r_l10_overall
+
+    d["Team Batter SO L10 Overall Official"] = so_l10_overall
+
+    d["Team Batter SO Rank L10 Overall Official"] = so_rank_l10_overall
+
+    d["Team Batter PA L10 Overall Official"] = pa_l10_overall
 
     d["Team Batter K% L30 Overall Official"] = k_l30_overall
 
@@ -108352,15 +108384,25 @@ def _kclean_render_player_cards(df, board=None, limit=None):
 
             _opp_lines = []
 
-            if opp_k != "—": _opp_lines.append(f"Exposure {opp_k}%")
+            _opp_hand_label = hand_window if hand_window in {"RHP", "LHP"} else "HAND"
 
-            if opp_l10 != "—": _opp_lines.append(f"L10 {opp_l10}%")
+            _opp_overall_l10 = _kclean_fmt(_kclean_pick(row, ["Team Batter K% L10 Overall Official"], ""), 1)
 
-            if opp_l5 != "—": _opp_lines.append(f"L5 {opp_l5}%")
+            _opp_overall_l5 = _kclean_fmt(_kclean_pick(row, ["Team Batter K% L5 Overall Official"], ""), 1)
 
-            if _savant_simple != "—": _opp_lines.append(f"Savant {_savant_simple}%")
+            if opp_k != "—": _opp_lines.append(f"Season vs {_opp_hand_label} {opp_k}%")
 
-            if _savant_order != "—": _opp_lines.append(f"Order {_savant_order}%")
+            if opp_l10 != "—": _opp_lines.append(f"Last 10 vs {_opp_hand_label} {opp_l10}%")
+
+            if opp_l5 != "—": _opp_lines.append(f"Last 5 vs {_opp_hand_label} {opp_l5}%")
+
+            if _opp_overall_l10 != "—" and _opp_overall_l10 != opp_l10: _opp_lines.append(f"Overall L10 {_opp_overall_l10}% · secondary")
+
+            if _opp_overall_l5 != "—" and _opp_overall_l5 != opp_l5: _opp_lines.append(f"Overall L5 {_opp_overall_l5}% · secondary")
+
+            if _savant_order != "—": _opp_lines.append(f"Lineup order {_savant_order}%")
+
+            if _savant_simple != "—": _opp_lines.append(f"Savant lineup {_savant_simple}%")
 
             opp_k_context = "<br><small>" + "<br>".join(_opp_lines) + "</small>" if _opp_lines else "—"
 
@@ -143034,7 +143076,7 @@ def _app130_parse_runs(value):
     if isinstance(value, (list, tuple, np.ndarray)):
         vals = [int(round(float(x))) for x in list(value)[:9]]
         return (vals + [0]*9)[:9]
-    nums = [int(x) for x in _app130_re.findall(r"-?\d+", str(value or ""))]
+    nums = [int(x) for x in _app130_re.findall(r"\d+", str(value or ""))]
     return (nums + [0]*9)[:9]
 
 def _app130_f5_from_row(row):
@@ -143402,6 +143444,1002 @@ if callable(_CHML_PREV_CARD):
 
 try:
     st.caption("✅ Challenger ML final layer active · F5 winner visible · starter K%/ERA/WHIP/K9/IP · selective environment labels · date-gated tracking support · canonical ML/K core preserved.")
+except Exception:
+    pass
+
+
+
+# =============================================================================
+# CHALLENGER K V9 — HAND-SPLIT DISPLAY + FALSE-UNDER CEILING SAFETY
+# 2026-09-04
+#
+# Policy:
+# - NO raw K projection move.
+# - NO raw side flip.
+# - Uses opponent recent K% vs the pitcher's hand for audit/playability only.
+# - Overall recent K% is preserved as secondary context, never the primary hand split.
+# - Thin UNDERs with Brown/Tidwell/Perkins-style ceiling evidence are downgraded
+#   to PASS/TRACK instead of being globally boosted.
+# =============================================================================
+CHALLENGER_K_V9_HAND_SPLIT_FALSE_UNDER_VERSION = "CHALLENGER_K_V9_HAND_SPLIT_FALSE_UNDER_SAFETY_2026_09_04"
+
+
+def _chv9_text(v):
+    s = str(v or "").strip()
+    return "" if s.upper() in {"", "NAN", "NONE", "NULL", "<NA>", "—", "-"} else s
+
+
+def _chv9_num(v, default=None):
+    try:
+        s = _chv9_text(v).replace("%", "").replace(",", "").strip()
+        if not s:
+            return default
+        x = float(s)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _chv9_pct(v, default=None):
+    x = _chv9_num(v, default)
+    if x is None:
+        return default
+    return float(x) * 100.0 if abs(float(x)) <= 1.0 else float(x)
+
+
+def _chv9_pick(row, keys, default=None):
+    row = row or {}
+    for k in keys:
+        try:
+            v = row.get(k)
+        except Exception:
+            v = None
+        if _chv9_text(v):
+            return v
+    return default
+
+
+def _chv9_side(v):
+    s = _chv9_text(v).upper().replace("_", " ")
+    if "OVER" in s or s == "O":
+        return "OVER"
+    if "UNDER" in s or s == "U":
+        return "UNDER"
+    if "PASS" in s:
+        return "PASS"
+    return ""
+
+
+def _chv9_hand(row, pitcher=None):
+    h = _chv9_text(
+        _chv9_pick(row, ["Pitcher Hand", "Hand", "Throws"], None)
+        or ((pitcher or {}).get("hand") if isinstance(pitcher, dict) else None)
+        or ((pitcher or {}).get("throws") if isinstance(pitcher, dict) else None)
+    ).upper()
+    return "LHP" if h.startswith("L") else "RHP" if h.startswith("R") else "UNK"
+
+
+def _chv9_gate_profile(row, pitcher=None):
+    row = row or {}
+    hand = _chv9_hand(row, pitcher)
+    proj = _chv9_num(_chv9_pick(row, ["Challenger K VNext Projection", "CK V2 K Final Projection", "Undefeated Beta Projection", "Canonical Final K Projection", "K PROJ"], None), None)
+    line = _chv9_num(_chv9_pick(row, ["Line", "UD/Line", "Canonical Line", "Underdog Line", "Strikeout Line"], None), None)
+    raw_side = _chv9_side(_chv9_pick(row, ["K Raw Lean Side", "CK V2 Final Side", "Challenger K VNext Side", "UB Final Side", "Undefeated Beta Side"], ""))
+    if raw_side not in {"OVER", "UNDER"} and proj is not None and line is not None:
+        raw_side = "OVER" if proj > line else "UNDER" if proj < line else ""
+    edge = None if proj is None or line is None else round(float(proj) - float(line), 3)
+
+    season_key = f"Opp K% vs {hand} Official" if hand in {"RHP", "LHP"} else "Opponent K% vs Pitcher Hand"
+    l5_key = f"Opp L5 K% vs {hand} Official" if hand in {"RHP", "LHP"} else "Team K% L5 vs Hand"
+    l10_key = f"Opp L10 K% vs {hand} Official" if hand in {"RHP", "LHP"} else "Team K% L10 vs Hand"
+    l15_key = f"Opp L15 K% vs {hand} Official" if hand in {"RHP", "LHP"} else "Team K% L15 vs Hand"
+
+    season_hand = _chv9_pct(_chv9_pick(row, ["Opponent K% vs Pitcher Hand", season_key, "Team K% Season vs Hand"], None), None)
+    l5_hand = _chv9_pct(_chv9_pick(row, [l5_key, "Team K% L5 vs Hand"], None), None)
+    l10_hand = _chv9_pct(_chv9_pick(row, [l10_key, "Team K% L10 vs Hand"], None), None)
+    l15_hand = _chv9_pct(_chv9_pick(row, [l15_key, "Team K% L15 vs Hand"], None), None)
+    overall_l5 = _chv9_pct(_chv9_pick(row, ["Team Batter K% L5 Overall Official", "Team Batter K% L30 Overall Official"], None), None)
+    lineup_order = _chv9_pct(_chv9_pick(row, ["Savant Raw Order-Weighted K%", "UB Lineup Exposure K%", "Lineup Exposure K%", "APP88 Batter Lineup K%", "Opponent K% vs Pitcher Hand"], None), None)
+    lineup_simple = _chv9_pct(_chv9_pick(row, ["Savant Raw Simple K%"], None), None)
+
+    pitcher_k = _chv9_pct(_chv9_pick(row, ["UB Pitcher K% Used", "Pitcher K% Used", "APP97 Raw MLB Season Pitcher K%", "APP97 Live Pitcher K%", "Pitcher K%", "Official Savant K%"], None), None)
+    whiff = _chv9_pct(_chv9_pick(row, ["UB Whiff% Used", "Official Savant Whiff%", "Savant Custom Whiff%", "Whiff%", "APP85 PutAway Rate"], None), None)
+    csw = _chv9_pct(_chv9_pick(row, ["UB CSW% Used", "Official Savant CSW%", "Savant Custom CSW%", "CSW%", "CSW %"], None), None)
+    putaway = _chv9_pct(_chv9_pick(row, ["UB PutAway% Used", "PutAway%", "Put Away %"], None), None)
+    arsenal = _chv9_num(_chv9_pick(row, ["Pitch Arsenal Matchup Score", "Arsenal Matchup Score", "Arsenal", "Arsenal Score", "APP100 Arsenal Score"], None), None)
+    p75 = _chv9_num(_chv9_pick(row, ["CK V2 K P75", "UB K P75", "UB Under Ceiling P75 K"], None), None)
+    p90 = _chv9_num(_chv9_pick(row, ["CK V2 K P90", "UB K P90", "UB Under Ceiling P90 K"], None), None)
+    ceiling = _chv9_num(_chv9_pick(row, ["Ceiling", "K Ceiling", "K Ceiling Projection"], None), None)
+    bf = _chv9_num(_chv9_pick(row, ["UB BF P50", "APP97 Reconciled Expected BF", "Exp BF", "Projected BF"], None), None)
+    ip = _chv9_num(_chv9_pick(row, ["UB IP P50", "Projected IP", "IP PROJ", "IP Projection"], None), None)
+    v6_risk = _chv9_text(row.get("K V6 Under Ceiling Risk")).upper()
+    v8_score = int(_chv9_num(row.get("K V8 Under Ceiling Tail Score"), 0) or 0)
+    v8_risk = _chv9_text(row.get("K V8 Under Ceiling Tail Risk")).upper()
+
+    reasons = []
+    families = 0
+    if raw_side == "UNDER" and edge is not None and -0.35 <= edge < 0:
+        families += 1; reasons.append(f"THIN_UNDER_EDGE_{edge:+.2f}")
+    process_support = False
+    if pitcher_k is not None and pitcher_k >= 24.5:
+        families += 1; process_support = True; reasons.append(f"PITCHER_K_{pitcher_k:.1f}%")
+    if (whiff is not None and whiff >= 29.0) or (csw is not None and csw >= 29.0) or (putaway is not None and putaway >= 23.0) or (arsenal is not None and arsenal >= 58.0):
+        families += 1; process_support = True; reasons.append("SWING_MISS_OR_ARSENAL_SUPPORT")
+    hand_support = False
+    hand_vals = [v for v in (l5_hand, l10_hand, l15_hand, season_hand) if v is not None]
+    if hand_vals and max(hand_vals) >= 24.0:
+        families += 1; hand_support = True; reasons.append(f"OPP_RECENT_OR_SEASON_VS_{hand}_K")
+    if lineup_order is not None and lineup_order >= 23.5:
+        families += 1; reasons.append(f"LINEUP_ORDER_K_{lineup_order:.1f}%")
+    if line is not None and ((p75 is not None and p75 > line) or (p90 is not None and p90 >= line + 0.35) or (ceiling is not None and ceiling >= line + 1.25)):
+        families += 1; reasons.append("DISTRIBUTION_CEILING_CROSSES_LINE")
+    if (bf is not None and bf >= 19.0) or (ip is not None and ip >= 4.7):
+        families += 1; reasons.append("WORKLOAD_CAN_STILL_REACH_LINE")
+    if v6_risk in {"WATCH", "HIGH"} or v8_risk in {"WATCH", "HIGH"} or v8_score >= 3:
+        families += 1; reasons.append(f"EXISTING_UNDER_CEILING_RISK_{v6_risk or v8_risk or v8_score}")
+
+    active = bool(raw_side == "UNDER" and edge is not None and -0.35 <= edge < 0 and line is not None and line <= 6.5)
+    high = bool(active and families >= 4 and (hand_support or (lineup_order is not None and lineup_order >= 23.5)) and process_support)
+    watch = bool(active and not high and families >= 3)
+    label = "HIGH_PASS" if high else "WATCH_TRACK" if watch else "CLEAR"
+    return {
+        "version": CHALLENGER_K_V9_HAND_SPLIT_FALSE_UNDER_VERSION,
+        "hand": hand,
+        "raw_side": raw_side,
+        "projection": proj,
+        "line": line,
+        "edge": edge,
+        "families": int(families),
+        "label": label,
+        "high": high,
+        "watch": watch,
+        "reasons": "; ".join(dict.fromkeys(reasons)) if reasons else "NONE",
+        "season_hand": season_hand,
+        "l5_hand": l5_hand,
+        "l10_hand": l10_hand,
+        "l15_hand": l15_hand,
+        "overall_l5": overall_l5,
+        "lineup_order": lineup_order,
+        "lineup_simple": lineup_simple,
+        "pitcher_k": pitcher_k,
+        "whiff": whiff,
+        "csw": csw,
+        "putaway": putaway,
+        "arsenal": arsenal,
+    }
+
+
+def _chv9_apply_public_safety(out, pitcher=None):
+    if not isinstance(out, dict):
+        return out
+    prof = _chv9_gate_profile(out, pitcher)
+    out.update({
+        "K V9 Version": prof["version"],
+        "K V9 Policy": "RAW_K_PROJECTION_AND_RAW_SIDE_FROZEN_PLAYABILITY_ONLY",
+        "K V9 Projection Changed": False,
+        "K V9 Raw Side Changed": False,
+        "K V9 Hand Window": prof["hand"],
+        "K V9 Opp Season vs Hand %": None if prof["season_hand"] is None else round(prof["season_hand"], 1),
+        "K V9 Opp L15 vs Hand %": None if prof["l15_hand"] is None else round(prof["l15_hand"], 1),
+        "K V9 Opp L10 vs Hand %": None if prof["l10_hand"] is None else round(prof["l10_hand"], 1),
+        "K V9 Opp L5 vs Hand %": None if prof["l5_hand"] is None else round(prof["l5_hand"], 1),
+        "K V9 Opp Overall L5 %": None if prof["overall_l5"] is None else round(prof["overall_l5"], 1),
+        "K V9 Lineup Order K%": None if prof["lineup_order"] is None else round(prof["lineup_order"], 1),
+        "K V9 False Under Families": prof["families"],
+        "K V9 False Under Gate": prof["label"],
+        "K V9 False Under Reasons": prof["reasons"],
+    })
+    if prof["high"]:
+        old_decision = _chv9_side(out.get("UB Final Decision") or out.get("Public Canonical Side") or out.get("pick_side"))
+        raw_side = prof["raw_side"] or "UNDER"
+        old_reason = _chv9_text(out.get("UB Final Decision Reason") or out.get("K V6 Decision Reason") or out.get("Challenger K VNext Reason"))
+        reason = (old_reason + "; " if old_reason else "") + "K_V9_FALSE_UNDER_CEILING_PASS_HAND_SPLIT"
+        out["K Raw Lean Side"] = raw_side
+        out["Final Resolved Side"] = raw_side
+        out["UB Final Side"] = raw_side
+        out["Challenger K VNext Side"] = raw_side
+        for k in ("Public Canonical Side", "Public Decision Side", "Challenger K VNext Decision", "UB Final Decision", "Resolver Decision", "Canonical Side", "Final Decision Side", "pick_side", "K Sim Pick", "Sports Brain Side", "Sports Brain Decision"):
+            out[k] = "PASS"
+        for k in ("Undefeated Beta Playability", "K V6 Action Tier", "K V8 Action Tier", "Best Play Tier", "Sports Brain Verdict"):
+            out[k] = "PASS"
+        for k in ("Undefeated Beta Decision State", "Canonical Decision", "Final Decision State"):
+            out[k] = "PASS"
+        out["UB Final Support State"] = "FALSE_UNDER_CEILING_PASS"
+        for k in ("UB Final Decision Reason", "Undefeated Beta Decision Reason", "K V6 Decision Reason", "Challenger K VNext Reason", "Brain Main Risk"):
+            out[k] = reason
+        current_conf = _chv9_num(out.get("Confidence %"), _chv9_num(out.get("UB Final Probability %"), 54.0)) or 54.0
+        capped = round(min(float(current_conf), 52.0), 1)
+        for k in ("K V9 Confidence Cap %", "K V8 Calibrated Confidence %", "K V6 Calibrated Confidence %", "Final Decision Confidence %", "Challenger K VNext Probability %", "UB Final Probability %", "UB Calibrated Clear Probability %", "K Sim True Prob %", "K Sim Current Side Prob %", "Current Side Prob %", "Confidence %", "Best Play Score", "Sports Brain Score"):
+            out[k] = capped
+        out["K V9 Previous Decision"] = old_decision
+        out["K Raw Lean Is Official"] = False
+    elif prof["watch"]:
+        old_reason = _chv9_text(out.get("UB Final Decision Reason") or out.get("K V6 Decision Reason") or out.get("Challenger K VNext Reason"))
+        reason = (old_reason + "; " if old_reason else "") + "K_V9_FALSE_UNDER_CEILING_WATCH_HAND_SPLIT"
+        for k in ("Undefeated Beta Playability", "K V6 Action Tier", "K V8 Action Tier"):
+            if str(out.get(k) or "").upper() in {"OFFICIAL_PLAY", "LEAN", ""}:
+                out[k] = "TRACK"
+        out["UB Final Support State"] = "FALSE_UNDER_CEILING_TRACK"
+        for k in ("UB Final Decision Reason", "Undefeated Beta Decision Reason", "K V6 Decision Reason", "Challenger K VNext Reason", "Brain Main Risk"):
+            out[k] = reason
+        current_conf = _chv9_num(out.get("Confidence %"), _chv9_num(out.get("UB Final Probability %"), 58.0)) or 58.0
+        capped = round(min(float(current_conf), 56.0), 1)
+        for k in ("K V9 Confidence Cap %", "K V8 Calibrated Confidence %", "K V6 Calibrated Confidence %", "Final Decision Confidence %", "Challenger K VNext Probability %", "UB Final Probability %", "UB Calibrated Clear Probability %", "K Sim True Prob %", "K Sim Current Side Prob %", "Current Side Prob %", "Confidence %", "Best Play Score", "Sports Brain Score"):
+            out[k] = capped
+        out["K Raw Lean Is Official"] = False
+    return out
+
+
+_CHALLENGER_K_V9_PREV_ACTIVATE_PATTERN_V2 = globals().get("activate_pattern_v2_candidate")
+if callable(_CHALLENGER_K_V9_PREV_ACTIVATE_PATTERN_V2):
+    def activate_pattern_v2_candidate(control_row, pitcher=None):
+        return _chv9_apply_public_safety(_CHALLENGER_K_V9_PREV_ACTIVATE_PATTERN_V2(control_row, pitcher), pitcher)
+
+
+
+# =============================================================================
+# CHALLENGER FULL REPAIR — K GRADING CONTRACT V9 + ML RUN-FLOW TAGS
+# 2026-09-04
+#
+# K policy:
+# - K projection formula remains protected/frozen.
+# - K side math remains protected/frozen.
+# - BEFORE GAMES save now persists the exact public K board even if the session
+#   did not keep challenger_public_k_contract_v8.
+# - AFTER GAMES grades only frozen saved K rows; it does not rebuild from current
+#   postgame board. Missing V8 contract rows can be repaired ONLY from saved
+#   public/snapshot fields that already contain pitcher, game, line, projection,
+#   side, and identity.
+# - Manual actual import no longer blocks valid saved snapshots just because the
+#   older rendered-public-contract key is missing.
+#
+# ML policy:
+# - Canonical ML side/probability are preserved.
+# - Adds Sept. 3 run-flow research tags as grading/explanation fields only.
+# - Adds clean control / starter-collapse / late bullpen / suppression / traffic
+#   conversion / lead-hold / comeback tags without flipping sides.
+# =============================================================================
+CHALLENGER_FULL_REPAIR_VERSION = "CHALLENGER_FULL_K_GRADING_ML_REPAIR_2026_09_04"
+CHALLENGER_K_GRADING_V9_VERSION = "CHALLENGER_K_GRADING_CONTRACT_REPAIR_V9_2026_09_04"
+K_GRADING_V9_SNAPSHOT_FILE = os.path.join(STORAGE_DIR, "k_rendered_public_grading_snapshot_v9.json")
+K_GRADING_V9_REPAIR_FILE = os.path.join(STORAGE_DIR, "k_grading_contract_repair_v9.json")
+
+# Let the existing status panel look at the V9 snapshot path without rewriting UI.
+try:
+    K_GRADING_V8_SNAPSHOT_FILE = K_GRADING_V9_SNAPSHOT_FILE
+except Exception:
+    pass
+
+
+def _v9_text(value):
+    s = str(value or "").strip()
+    return "" if s.upper() in {"", "NAN", "NONE", "NULL", "<NA>", "—", "-"} else s
+
+
+def _v9_num(value, default=None):
+    try:
+        s = _v9_text(value).replace("%", "").replace(",", "").strip()
+        if not s:
+            return default
+        x = float(s)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _v9_side(value):
+    try:
+        return _v7_first_side({"x": value}, ["x"])
+    except Exception:
+        s = _v9_text(value).upper().replace("_", " ")
+        if "OVER" in s or s == "O":
+            return "OVER"
+        if "UNDER" in s or s == "U":
+            return "UNDER"
+        if "PASS" in s:
+            return "PASS"
+        return ""
+
+
+def _v9_first(row, keys, default=None):
+    row = row or {}
+    for key in keys:
+        try:
+            value = row.get(key)
+        except Exception:
+            value = None
+        if _v9_text(value):
+            return value
+    return default
+
+
+def _v9_pick_projection(row):
+    # Prefer the public/final K decision fields over internal merge/raw saved rows.
+    return _v9_num(_v9_first(row, [
+        "grading_contract_projection",
+        "Challenger K VNext Projection", "CK V2 K Final Projection",
+        "Canonical Final K Projection", "Final Resolved Projection",
+        "K PROJ", "K Projection", "Proj SO", "Projection", "projection",
+    ]), None)
+
+
+def _v9_pick_line(row):
+    return _v9_num(_v9_first(row, [
+        "grading_contract_line", "UD/Line", "Line", "Canonical Line", "UD Line",
+        "line", "underdog_line", "Strikeout Line",
+    ]), None)
+
+
+def _v9_pick_side(row):
+    side = _v9_side(_v9_first(row, [
+        "grading_contract_side", "Public Canonical Side", "Final Resolved Side",
+        "Final Decision Side", "K V6 Decision", "Public Decision Side", "Decision",
+        "Challenger K VNext Decision", "CK V2 Final Side", "Undefeated Beta Side", "pick_side",
+    ]))
+    if side in {"OVER", "UNDER", "PASS"}:
+        return side
+    proj = _v9_pick_projection(row); line = _v9_pick_line(row)
+    if proj is not None and line is not None:
+        return "OVER" if proj > line else "UNDER" if proj < line else "PASS"
+    return ""
+
+
+def _v9_pick_conf(row):
+    return _v9_num(_v9_first(row, [
+        "grading_contract_confidence", "K V8 Calibrated Confidence %",
+        "K V6 Calibrated Confidence %", "Final Decision Confidence %", "Confidence %",
+        "UB Final Probability %", "Challenger K VNext Probability %", "confidence",
+    ]), None)
+
+
+def _v9_contract_fingerprint(rows):
+    import hashlib, json
+    payload = []
+    for r in rows or []:
+        payload.append({
+            "pitcher": _v7_norm_name((r or {}).get("pitcher") or (r or {}).get("Pitcher")),
+            "game_pk": str((r or {}).get("game_pk") or (r or {}).get("GamePk") or ""),
+            "pitcher_id": str((r or {}).get("pitcher_id") or (r or {}).get("Pitcher ID") or (r or {}).get("player_id") or ""),
+            "line": _v9_pick_line(r or {}),
+            "projection": _v9_pick_projection(r or {}),
+            "side": _v9_pick_side(r or {}),
+            "confidence": _v9_pick_conf(r or {}),
+        })
+    payload = sorted(payload, key=lambda x: (x["pitcher"], x["game_pk"], x["pitcher_id"], str(x["line"])))
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _v9_public_contract_df_from_board(board=None):
+    """Return public K table without requiring a same-session V8 cache.
+
+    At BEFORE-GAMES save time, rebuilding the public table from the current board
+    is allowed because it is immediately frozen and persisted. AFTER-GAMES grading
+    does not call this unless the user explicitly freezes again.
+    """
+    try:
+        df = _v8_public_contract_df() if "_v8_public_contract_df" in globals() else pd.DataFrame()
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df.copy(deep=True), "SESSION_RENDERED_PUBLIC_K_TABLE"
+    except Exception:
+        pass
+    try:
+        raw_rows = [dict(x) for x in (board or []) if isinstance(x, dict)]
+        if raw_rows and "build_kproj_table" in globals():
+            df = build_kproj_table(raw_rows)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                if "_owp_one_final_row_per_pitcher" in globals():
+                    try:
+                        df = _owp_one_final_row_per_pitcher(df)
+                    except Exception:
+                        pass
+                if "_owp_apply_pitcher_k_board_ranks_display_only" in globals():
+                    try:
+                        df = _owp_apply_pitcher_k_board_ranks_display_only(df)
+                    except Exception:
+                        pass
+                try:
+                    st.session_state["challenger_public_k_contract_v8"] = df.copy(deep=True)
+                    st.session_state["challenger_public_k_contract_v8_captured_at"] = now_iso()
+                    st.session_state["challenger_public_k_contract_v8_source"] = "V9_BUILT_AT_FREEZE"
+                except Exception:
+                    pass
+                return df.copy(deep=True), "BUILT_PUBLIC_K_TABLE_AT_FREEZE"
+    except Exception as exc:
+        try:
+            st.session_state["challenger_k_v9_public_build_error"] = str(exc)[:180]
+        except Exception:
+            pass
+    return pd.DataFrame(), "NO_PUBLIC_K_TABLE_AVAILABLE"
+
+
+def _v9_public_contract_rows(board=None):
+    public_df, df_source = _v9_public_contract_df_from_board(board)
+    if not isinstance(public_df, pd.DataFrame) or public_df.empty:
+        return [], {"rows": 0, "verified": 0, "blocked": 0, "source": df_source, "error": "NO_PUBLIC_K_TABLE_AVAILABLE"}
+    raw_rows = [dict(x) for x in (board or []) if isinstance(x, dict)]
+    raw_by_name = {}
+    for raw in raw_rows:
+        nm = _v7_norm_name(raw.get("pitcher") or raw.get("Pitcher"))
+        if nm:
+            raw_by_name.setdefault(nm, []).append(raw)
+    out = []
+    blocked = []
+    for _, rr in public_df.iterrows():
+        d = rr.to_dict()
+        name = _v9_text(d.get("Pitcher") or d.get("pitcher"))
+        norm = _v7_norm_name(name)
+        line = _v9_pick_line(d)
+        proj = _v9_pick_projection(d)
+        side = _v9_pick_side(d)
+        conf = _v9_pick_conf(d)
+        candidates = raw_by_name.get(norm, [])
+        raw = None
+        if line is not None:
+            exact = [r for r in candidates if _v9_pick_line(r) is not None and abs(float(_v9_pick_line(r)) - float(line)) <= 1e-9]
+            if exact:
+                raw = exact[-1]
+        if raw is None and len(candidates) == 1:
+            raw = candidates[0]
+        identity_ok = bool(raw and (raw.get("game_pk") or raw.get("GamePk")) and (raw.get("pitcher_id") or raw.get("Pitcher ID") or raw.get("player_id")))
+        complete = bool(name and line is not None and proj is not None and side in {"OVER", "UNDER", "PASS"} and identity_ok)
+        if not complete:
+            blocked.append({"pitcher": name or "UNKNOWN", "line": line, "projection": proj, "side": side, "identity_ok": identity_ok})
+            continue
+        snap = dict(raw)
+        for k, v in d.items():
+            if isinstance(v, np.generic):
+                v = v.item()
+            try:
+                if isinstance(v, float) and pd.isna(v):
+                    continue
+            except Exception:
+                pass
+            snap[k] = v
+        snap.update({
+            "pitcher": name or snap.get("pitcher") or snap.get("Pitcher"),
+            "Pitcher": name or snap.get("Pitcher") or snap.get("pitcher"),
+            "pitcher_id": raw.get("pitcher_id") or raw.get("Pitcher ID") or raw.get("player_id"),
+            "game_pk": raw.get("game_pk") or raw.get("GamePk"),
+            "projection": round(float(proj), 4),
+            "decision_projection": round(float(proj), 4),
+            "final_projection": round(float(proj), 4),
+            "line": float(line),
+            "final_line": float(line),
+            "pick_side": side,
+            "confidence": None if conf is None else round(float(conf), 2),
+            "grading_contract_version": CHALLENGER_K_GRADING_V9_VERSION,
+            "grading_contract_source": "EXACT_RENDERED_PUBLIC_K_TABLE_V9" if df_source == "SESSION_RENDERED_PUBLIC_K_TABLE" else "BUILT_PUBLIC_K_TABLE_AT_FREEZE_V9",
+            "grading_contract_frozen_at": now_iso(),
+            "grading_contract_projection": round(float(proj), 4),
+            "grading_contract_line": float(line),
+            "grading_contract_side": side,
+            "grading_contract_confidence": None if conf is None else round(float(conf), 2),
+            "grading_contract_verified": True,
+            "snapshot_schema": "CHALLENGER_K_V9_EXACT_PUBLIC_GRADING",
+            "grading_contract_repair_policy": "PUBLIC_TABLE_FROZEN_BEFORE_GAMES_NO_POSTGAME_REBUILD",
+        })
+        out.append(snap)
+    fp = _v9_contract_fingerprint(out)
+    for snap in out:
+        snap["grading_contract_fingerprint"] = fp
+    return out, {"rows": len(out), "verified": len(out), "blocked": len(blocked), "blocked_pitchers": blocked[:50], "source": df_source, "fingerprint": fp}
+
+
+def _v9_repair_contract_from_saved_pick(p, repair_source="SAVED_SNAPSHOT_FALLBACK_V9"):
+    """Repair only already-saved rows with enough frozen fields; never use live board."""
+    if not isinstance(p, dict):
+        return p, False, "NOT_DICT"
+    try:
+        if _v8_contract_is_verified_original_v9(p):
+            return p, False, "ALREADY_V8_VERIFIED"
+    except Exception:
+        pass
+    proj = _v9_pick_projection(p)
+    line = _v9_pick_line(p)
+    side = _v9_pick_side(p)
+    conf = _v9_pick_conf(p)
+    pitcher = _v9_text(p.get("pitcher") or p.get("Pitcher"))
+    gid = p.get("game_pk") or p.get("GamePk")
+    pid = p.get("pitcher_id") or p.get("Pitcher ID") or p.get("player_id")
+    if not (pitcher and gid and pid and proj is not None and line is not None and side in {"OVER", "UNDER", "PASS"}):
+        return p, False, "MISSING_REQUIRED_SAVED_FIELDS"
+    p = dict(p)
+    p.update({
+        "pitcher": pitcher,
+        "Pitcher": pitcher,
+        "game_pk": gid,
+        "pitcher_id": pid,
+        "projection": round(float(proj), 4),
+        "decision_projection": round(float(proj), 4),
+        "final_projection": round(float(proj), 4),
+        "line": float(line),
+        "final_line": float(line),
+        "pick_side": side,
+        "confidence": None if conf is None else round(float(conf), 2),
+        "grading_contract_version": CHALLENGER_K_GRADING_V9_VERSION,
+        "grading_contract_source": repair_source,
+        "grading_contract_frozen_at": p.get("official_snapshot_saved_at") or p.get("created_at") or now_iso(),
+        "grading_contract_projection": round(float(proj), 4),
+        "grading_contract_line": float(line),
+        "grading_contract_side": side,
+        "grading_contract_confidence": None if conf is None else round(float(conf), 2),
+        "grading_contract_verified": True,
+        "grading_contract_repaired_v9": True,
+        "grading_contract_repair_policy": "SAVED_FIELDS_ONLY_NO_LIVE_REBUILD",
+        "snapshot_schema": "CHALLENGER_K_V9_SAVED_SNAPSHOT_REPAIR",
+    })
+    p["grading_contract_fingerprint"] = _v9_contract_fingerprint([p])
+    return p, True, "REPAIRED"
+
+
+# Save original verifier, then broaden it to accept V9 contracts.
+_v8_contract_is_verified_original_v9 = globals().get("_v8_contract_is_verified")
+
+def _v8_contract_is_verified(p):
+    if not isinstance(p, dict):
+        return False
+    ver = str(p.get("grading_contract_version") or "")
+    src = str(p.get("grading_contract_source") or "")
+    if p.get("grading_contract_verified") is True and ver == CHALLENGER_K_GRADING_V9_VERSION and p.get("grading_contract_fingerprint"):
+        return src in {"EXACT_RENDERED_PUBLIC_K_TABLE_V9", "BUILT_PUBLIC_K_TABLE_AT_FREEZE_V9", "SAVED_SNAPSHOT_FALLBACK_V9", "MANUAL_PUBLIC_CONTRACT_REPAIR_V9"}
+    if callable(_v8_contract_is_verified_original_v9):
+        try:
+            return bool(_v8_contract_is_verified_original_v9(p))
+        except Exception:
+            return False
+    return False
+
+
+def _v9_save_k_public_grading_snapshot(board=None):
+    rows, diag = _v9_public_contract_rows(board)
+    if not rows:
+        return {"saved": 0, "updated": 0, **diag, "safe_to_grade": False, "version": CHALLENGER_K_GRADING_V9_VERSION}
+    picks = load_json(PICK_LOG, []) or []
+    if not isinstance(picks, list):
+        picks = []
+    def key(p):
+        return (str(p.get("game_pk") or ""), str(p.get("pitcher_id") or ""), None if _v9_pick_line(p) is None else round(float(_v9_pick_line(p)), 3))
+    idx = {key(p): i for i, p in enumerate(picks) if isinstance(p, dict) and not p.get("graded")}
+    saved = updated = 0
+    now = now_iso()
+    for snap in rows:
+        k = key(snap)
+        i = idx.get(k)
+        snap["official_snapshot_saved_at"] = snap.get("official_snapshot_saved_at") or now
+        snap["official_snapshot_resynced_at"] = now
+        snap["graded"] = False
+        if i is None:
+            picks.append(snap); idx[k] = len(picks) - 1; saved += 1
+        else:
+            picks[i] = snap; updated += 1
+    save_json(PICK_LOG, picks[-10000:])
+    save_json(K_GRADING_V9_SNAPSHOT_FILE, rows)
+    try:
+        save_json(K_GRADING_CANONICAL_SNAPSHOT_FILE, rows)
+    except Exception:
+        pass
+    try:
+        save_frozen_pregame_snapshot_v254(rows)
+    except Exception:
+        pass
+    return {"saved": saved, "updated": updated, "rows": len(rows), "verified": len(rows), "blocked": diag.get("blocked", 0), "safe_to_grade": len(rows) > 0, "path": PICK_LOG, "canonical_snapshot": K_GRADING_V9_SNAPSHOT_FILE, "version": CHALLENGER_K_GRADING_V9_VERSION, **diag}
+
+
+def _v9_finalize_k_grade(p, actual, workload=None, source="MLB_AUTO_FINAL_V9"):
+    # Repair saved contract fields before using the same downstream learning code.
+    if not _v8_contract_is_verified(p):
+        p, repaired, reason = _v9_repair_contract_from_saved_pick(p)
+        if not repaired and not _v8_contract_is_verified(p):
+            p["v9_grade_blocked"] = True
+            p["v9_grade_block_reason"] = reason
+            p["learning_eligible"] = False
+            return p
+    if workload:
+        for k, v in workload.items():
+            if v is not None:
+                p[k] = v
+    p["actual"] = actual
+    p["actual_k"] = actual
+    p["graded"] = True
+    p["graded_at"] = now_iso()
+    p["grading_source"] = source
+    p["actual_result_source"] = source
+    proj = _v9_num(p.get("grading_contract_projection"), None)
+    line = _v9_num(p.get("grading_contract_line"), None)
+    side = _v9_side(p.get("grading_contract_side"))
+    p["projection"] = proj
+    p["final_projection"] = proj
+    p["line"] = line
+    p["final_line"] = line
+    p["pick_side"] = side
+    p["graded_projection"] = proj
+    p["graded_line"] = line
+    p["graded_side"] = side
+    p["projection_drift"] = 0.0
+    p["final_projection_error"] = None if proj is None else round(float(actual) - float(proj), 2)
+    p["opening_projection_error"] = p["final_projection_error"]
+    p["line_miss_margin"] = None if line is None else round(float(actual) - float(line), 2)
+    result, win = _v7_grade_side(side, line, actual)
+    p["graded_result"] = result
+    p["win"] = win
+    p["learning_eligible"] = result in {"WIN", "LOSS"}
+    bf = _v9_num(p.get("actual_bf"), None)
+    ip = _v9_num(p.get("actual_ip"), None)
+    pitches = _v9_num(p.get("actual_pitches"), None)
+    p["actual_k_per_bf"] = None if bf in (None, 0) else round(float(actual) / float(bf), 5)
+    p["actual_bf_per_ip"] = None if ip in (None, 0) else round(float(bf) / float(ip), 3)
+    p["actual_pitches_per_bf"] = None if bf in (None, 0) or pitches is None else round(float(pitches) / float(bf), 3)
+    # Thin-under forensic classification for Brown/Tidwell/Perkins style misses.
+    edge = None if proj is None or line is None else float(proj) - float(line)
+    if side == "UNDER" and result == "LOSS" and edge is not None:
+        if -0.40 <= edge < 0 and float(actual) <= float(line) + 1.0:
+            p["K V9 Miss Class"] = "FALSE_UNDER_THIN_EDGE_LOST_BY_ONE"
+        elif -0.80 <= edge < 0 and float(actual) <= float(line) + 1.75:
+            p["K V9 Miss Class"] = "FALSE_UNDER_CEILING_K_RATE"
+        else:
+            p["K V9 Miss Class"] = "UNDER_LOSS_NON_THIN"
+    elif side == "OVER" and result == "LOSS":
+        p["K V9 Miss Class"] = "FALSE_OVER_WORKLOAD_OR_CONVERSION"
+    else:
+        p["K V9 Miss Class"] = "WIN_OR_PUSH"
+    if result not in {"WIN", "LOSS"}:
+        p["learning_skip_reason"] = f"{result}_NOT_A_WIN_LOSS"
+        p["new_learning_scale"] = None
+        return p
+    try:
+        p["new_learning_scale"] = round(update_learning(p["pitcher_id"], proj, actual), 3) if p.get("pitcher_id") else None
+    except Exception as exc:
+        p["new_learning_scale"] = None
+        p["learning_update_error"] = str(exc)[:120]
+    for fn_name, err_key in [("update_deep_context_learning_after_grade", "deep_learning_update_error"), ("update_k_miss_reason_learning", "miss_reason_detail"), ("update_volume_miss_learning_after_grade", "volume_learning_detail"), ("update_manager_pull_learning_after_grade", "manager_pull_learning_error")]:
+        fn = globals().get(fn_name)
+        if callable(fn):
+            try:
+                info = fn(p)
+                if isinstance(info, dict):
+                    p.update(info)
+            except Exception as exc:
+                p[err_key] = str(exc)[:120]
+    return p
+
+
+def _v9_grade_finished_games_with_diagnostics():
+    picks = load_json(PICK_LOG, []) or []
+    results = load_json(RESULT_LOG, []) or []
+    if not isinstance(picks, list):
+        picks = []
+    if not isinstance(results, list):
+        results = []
+    result_ids = set(_grade_result_key(r) for r in results if isinstance(r, dict))
+    before = len(results)
+    graded = pushes = no_action = missing_ids = not_final = missing_actual = blocked = repaired = 0
+    blocked_pitchers = []
+    for i, p in enumerate(list(picks)):
+        if not isinstance(p, dict) or p.get("graded") or p.get("v8_quarantined"):
+            continue
+        if not _v8_contract_is_verified(p):
+            p, did_repair, reason = _v9_repair_contract_from_saved_pick(p)
+            if did_repair:
+                picks[i] = p
+                repaired += 1
+            else:
+                blocked += 1
+                blocked_pitchers.append(str((p or {}).get("pitcher") or (p or {}).get("Pitcher") or "UNKNOWN") + f" [{reason}]")
+                continue
+        if not p.get("game_pk") or not p.get("pitcher_id"):
+            missing_ids += 1
+            continue
+        if not is_game_final(p["game_pk"]):
+            not_final += 1
+            continue
+        workload = get_actual_pitcher_workload(p["game_pk"], p["pitcher_id"])
+        actual = workload.get("actual") if workload else get_actual_pitcher_ks(p["game_pk"], p["pitcher_id"])
+        if actual is None:
+            missing_actual += 1
+            continue
+        p = _v9_finalize_k_grade(p, actual, workload=workload, source="MLB_AUTO_FINAL_V9")
+        picks[i] = p
+        if not p.get("graded"):
+            blocked += 1
+            blocked_pitchers.append(str(p.get("pitcher") or "UNKNOWN"))
+            continue
+        if p.get("graded_result") == "PUSH":
+            pushes += 1
+        if p.get("graded_result") == "NO_ACTION":
+            no_action += 1
+        key = _grade_result_key(p)
+        if key not in result_ids:
+            results.append(dict(p)); result_ids.add(key)
+        else:
+            for j, rr in enumerate(results):
+                if _grade_result_key(rr) == key:
+                    results[j] = dict(p); break
+        graded += 1
+    save_json(PICK_LOG, picks[-10000:])
+    save_json(RESULT_LOG, results[-10000:])
+    save_json(K_GRADING_V9_REPAIR_FILE, {"repaired": repaired, "blocked": blocked, "blocked_pitchers": blocked_pitchers[:50], "version": CHALLENGER_K_GRADING_V9_VERSION, "saved_at": now_iso()})
+    try:
+        build_k_v72_learning_profiles(results=results, save=True)
+        sync_graded_history_csv_from_result_log()
+    except Exception:
+        pass
+    try:
+        st.session_state["graded_history"] = _learning_lab_normalize_results_df(pd.DataFrame(results))
+    except Exception:
+        pass
+    return {"graded": graded, "pushes": pushes, "no_action": no_action, "blocked_unverified": blocked, "contract_repaired_v9": repaired, "blocked_pitchers": blocked_pitchers[:50], "saved_snapshots": len(picks), "missing_game_or_pitcher_id": missing_ids, "not_final": not_final, "missing_actual": missing_actual, "grading_contract_verified": graded, "grading_contract_missing": blocked, "results_before": before, "results_after": len(results), "pick_log_path": PICK_LOG, "result_log_path": RESULT_LOG, "version": CHALLENGER_K_GRADING_V9_VERSION}
+
+
+def _v9_grade_finished_games_from_manual_dataframe(manual_df, allow_overwrite=False):
+    diag = {"status": "NO_DATA", "manual_rows": 0, "matched": 0, "graded": 0, "pushes": 0, "blocked_unverified": 0, "contract_repaired_v9": 0, "unmatched_pitchers": [], "missing_actual_k": [], "version": CHALLENGER_K_GRADING_V9_VERSION}
+    if manual_df is None or getattr(manual_df, "empty", True):
+        return diag
+    colmap = _manual_result_colmap(manual_df)
+    diag["manual_rows"] = int(len(manual_df))
+    if "pitcher" not in colmap or "actual" not in colmap:
+        diag.update({"status": "MISSING_REQUIRED_COLUMNS", "required": "Pitcher + Actual K/KS", "detected_columns": list(manual_df.columns)})
+        return diag
+    picks = load_json(PICK_LOG, []) or []
+    results = load_json(RESULT_LOG, []) or []
+    if not isinstance(picks, list):
+        picks = []
+    if not isinstance(results, list):
+        results = []
+    result_ids = set(_grade_result_key(r) for r in results if isinstance(r, dict))
+    for _, row in manual_df.iterrows():
+        pitcher = row.get(colmap["pitcher"])
+        actual = _v9_num(row.get(colmap["actual"]), None)
+        if actual is None:
+            diag["missing_actual_k"].append(str(pitcher)); continue
+        date_value = row.get(colmap.get("date")) if colmap.get("date") else None
+        match = _latest_matching_pick_for_manual_grade(picks, pitcher, date_value=date_value, allow_overwrite=allow_overwrite)
+        if not match:
+            diag["unmatched_pitchers"].append(str(pitcher)); continue
+        idx, p = match
+        # Optional manual columns can repair the exact public contract if the app lost it.
+        manual_overlay = {}
+        low_cols = {str(c).lower().strip(): c for c in manual_df.columns}
+        for wanted, aliases in {
+            "grading_contract_projection": ["projection", "projected_k", "proj k", "k projection", "k_proj"],
+            "grading_contract_line": ["line", "strikeout line", "k line"],
+            "grading_contract_side": ["side", "pick", "lean", "decision"],
+            "grading_contract_confidence": ["confidence", "probability", "prob", "conf"],
+        }.items():
+            for a in aliases:
+                c = low_cols.get(a)
+                if c is not None and _v9_text(row.get(c)):
+                    manual_overlay[wanted] = row.get(c)
+                    break
+        if manual_overlay:
+            p = dict(p); p.update(manual_overlay)
+        if not _v8_contract_is_verified(p):
+            p, repaired, reason = _v9_repair_contract_from_saved_pick(p, repair_source="MANUAL_PUBLIC_CONTRACT_REPAIR_V9")
+            if repaired:
+                diag["contract_repaired_v9"] += 1
+            else:
+                diag["blocked_unverified"] += 1
+                continue
+        workload = {}
+        for target in ["actual_ip", "actual_bf", "actual_er", "actual_runs", "actual_hits", "actual_bb", "actual_pitches", "actual_hr"]:
+            col = colmap.get(target)
+            if not col:
+                continue
+            val = row.get(col)
+            val = _parse_manual_ip(val) if target == "actual_ip" else _v9_num(val, None)
+            if val is not None:
+                workload[target] = val
+        p = _v9_finalize_k_grade(p, actual, workload=workload, source="MANUAL_ACTUAL_IMPORT_V9")
+        picks[idx] = p
+        diag["matched"] += 1
+        diag["graded"] += 1
+        if p.get("graded_result") == "PUSH":
+            diag["pushes"] += 1
+        key = _grade_result_key(p)
+        if key not in result_ids:
+            results.append(dict(p)); result_ids.add(key)
+        elif allow_overwrite:
+            for j, rr in enumerate(results):
+                if _grade_result_key(rr) == key:
+                    results[j] = dict(p); break
+    save_json(PICK_LOG, picks[-10000:])
+    save_json(RESULT_LOG, results[-10000:])
+    try:
+        build_k_v72_learning_profiles(results=results, save=True)
+        sync_graded_history_csv_from_result_log()
+    except Exception:
+        pass
+    diag.update({"status": "OK", "results_after": len(results), "pick_log_path": PICK_LOG, "result_log_path": RESULT_LOG})
+    return diag
+
+
+def _v9_save_all_grading_snapshots(board=None):
+    diag = {"version": CHALLENGER_FULL_REPAIR_VERSION}
+    diag["K"] = _v9_save_k_public_grading_snapshot(board)
+    try:
+        diag["Undefeated Beta"] = save_undefeated_beta_snapshot(board, stage_override="V9_CANONICAL_PREGAME") if "save_undefeated_beta_snapshot" in globals() else {"saved": 0, "message": "Unavailable"}
+    except Exception as exc:
+        diag["Undefeated Beta"] = {"saved": 0, "error": str(exc)[:180]}
+    try:
+        po_df = _beta_projection_rows(board, "OUTS") if "_beta_projection_rows" in globals() else pd.DataFrame()
+        ok, msg = _beta_save_official_board(po_df, "OUTS") if "_beta_save_official_board" in globals() else (False, "Unavailable")
+        diag["Pitching Outs"] = {"saved": int(len(po_df)) if ok and isinstance(po_df, pd.DataFrame) else 0, "ok": bool(ok), "message": msg}
+    except Exception as exc:
+        diag["Pitching Outs"] = {"saved": 0, "error": str(exc)[:180]}
+    try:
+        fi_df = build_first_inning_k_board(board) if "build_first_inning_k_board" in globals() else pd.DataFrame()
+        ok, msg = _beta_save_official_board(fi_df, "FI_K") if "_beta_save_official_board" in globals() else (False, "Unavailable")
+        diag["First Inning Strikeouts"] = {"saved": int(len(fi_df)) if ok and isinstance(fi_df, pd.DataFrame) else 0, "ok": bool(ok), "message": msg}
+    except Exception as exc:
+        diag["First Inning Strikeouts"] = {"saved": 0, "error": str(exc)[:180]}
+    try:
+        ml_df = ml_build_board(board) if "ml_build_board" in globals() else pd.DataFrame()
+        diag["Moneyline"] = _ow_save_moneyline_board(ml_df) if "_ow_save_moneyline_board" in globals() and isinstance(ml_df, pd.DataFrame) and not ml_df.empty else {"saved": 0, "message": "No ML rows"}
+    except Exception as exc:
+        diag["Moneyline"] = {"saved": 0, "error": str(exc)[:180]}
+    return diag
+
+
+# Rebind current save/grade entry points used by existing UI.
+_v7_save_all_grading_snapshots = _v9_save_all_grading_snapshots
+_v8_save_all_grading_snapshots = _v9_save_all_grading_snapshots
+grade_finished_games_with_diagnostics = _v9_grade_finished_games_with_diagnostics
+grade_finished_games_from_manual_dataframe = _v9_grade_finished_games_from_manual_dataframe
+
+# -----------------------------------------------------------------------------
+# ML run-flow overlay: explanation/grading only, no canonical-side changes.
+# -----------------------------------------------------------------------------
+CHALLENGER_ML_RUNFLOW_V9_VERSION = "CHALLENGER_ML_RUNFLOW_TAGS_V9_2026_09_04"
+_ML_RUNFLOW_V9_SEED = [
+    {"date":"2026-09-03","away":"TB","home":"TEX","away_runs":0,"home_runs":6,"f5":"TEX","full":"TEX","tags":["Clean Team Control Win","One-Sided Opponent Suppression"],"winner_note":"TEX clean control / suppression"},
+    {"date":"2026-09-03","away":"CWS","home":"HOU","away_runs":2,"home_runs":6,"f5":"HOU","full":"HOU","tags":["Clean Team Control Win","Early Starter-Collapse Edge"],"winner_note":"HOU early offense protected"},
+    {"date":"2026-09-03","away":"SF","home":"PIT","away_runs":2,"home_runs":5,"f5":"PIT","full":"PIT","tags":["Clean Team Control Win","Traffic Without Run Conversion"],"winner_note":"PIT low-volume control"},
+    {"date":"2026-09-03","away":"BOS","home":"BAL","away_runs":6,"home_runs":5,"f5":"BAL","full":"BOS","tags":["Late Bullpen Cascade Risk","Comeback/Closeout Failure"],"winner_note":"BOS late flip / BAL closeout failure"},
+    {"date":"2026-09-03","away":"STL","home":"LAD","away_runs":8,"home_runs":6,"f5":"LAD","full":"STL","tags":["Late Bullpen Cascade Risk","Comeback/Closeout Failure","False High-Score Suppression"],"winner_note":"STL extra-inning late chaos"},
+    {"date":"2026-09-03","away":"MIA","home":"KC","away_runs":3,"home_runs":7,"f5":"","full":"KC","tags":["Late Bullpen Cascade Risk","Lead-Hold Stress"],"winner_note":"KC late separation"},
+    {"date":"2026-09-03","away":"MIL","home":"CHC","away_runs":1,"home_runs":2,"f5":"CHC","full":"CHC","tags":["False High-Score Suppression","Traffic Without Run Conversion"],"winner_note":"CHC/MIL false high-score suppression"},
+    {"date":"2026-09-03","away":"ATH","home":"SEA","away_runs":6,"home_runs":4,"f5":"SEA","full":"ATH","tags":["Lead-Hold Stress","Late Bullpen Cascade Risk"],"winner_note":"ATH two-sided traffic hold"},
+]
+try:
+    existing = globals().get("_CH_ML_TRACKING_SEED", [])
+    if isinstance(existing, list):
+        seen = {(str(x.get("date")), _chml_norm_team(x.get("away")), _chml_norm_team(x.get("home"))) for x in existing if isinstance(x, dict)}
+        for g in _ML_RUNFLOW_V9_SEED:
+            key = (str(g.get("date")), _chml_norm_team(g.get("away")), _chml_norm_team(g.get("home")))
+            if key not in seen:
+                existing.append(dict(g)); seen.add(key)
+except Exception:
+    pass
+
+
+def _mlv9_target_date(row):
+    try:
+        return _chml_target_date(row) if "_chml_target_date" in globals() else None
+    except Exception:
+        return None
+
+
+def _mlv9_prior_games(row):
+    target = _mlv9_target_date(row)
+    games = []
+    for g in _ML_RUNFLOW_V9_SEED:
+        try:
+            d = pd.to_datetime(g.get("date")).date()
+        except Exception:
+            continue
+        if target is None or d < target:
+            games.append(g)
+    return games
+
+
+def _mlv9_team_runflow_profile(team, games):
+    team = _chml_norm_team(team) if "_chml_norm_team" in globals() else str(team or "").upper()
+    prof = {"n": 0, "clean": 0, "starter_collapse": 0, "late_cascade": 0, "false_high": 0, "traffic_no_cash": 0, "lead_stress": 0, "closeout_fail": 0, "opp_suppression": 0}
+    for g in games or []:
+        away = _chml_norm_team(g.get("away")) if "_chml_norm_team" in globals() else str(g.get("away") or "").upper()
+        home = _chml_norm_team(g.get("home")) if "_chml_norm_team" in globals() else str(g.get("home") or "").upper()
+        if team not in {away, home}:
+            continue
+        prof["n"] += 1
+        tags = set(str(x) for x in (g.get("tags") or []))
+        winner = _chml_norm_team(g.get("full")) if "_chml_norm_team" in globals() else str(g.get("full") or "").upper()
+        f5 = _chml_norm_team(g.get("f5")) if "_chml_norm_team" in globals() else str(g.get("f5") or "").upper()
+        if winner == team and "Clean Team Control Win" in tags:
+            prof["clean"] += 1
+        if winner == team and "Early Starter-Collapse Edge" in tags:
+            prof["starter_collapse"] += 1
+        if "Late Bullpen Cascade Risk" in tags:
+            prof["late_cascade"] += 1
+        if "False High-Score Suppression" in tags:
+            prof["false_high"] += 1
+        if "Traffic Without Run Conversion" in tags:
+            prof["traffic_no_cash"] += 1
+        if "Lead-Hold Stress" in tags:
+            prof["lead_stress"] += 1
+        if f5 == team and winner != team and f5 not in {"", "TIE"}:
+            prof["closeout_fail"] += 1
+        if winner == team and "One-Sided Opponent Suppression" in tags:
+            prof["opp_suppression"] += 1
+    return prof
+
+
+def _mlv9_runflow_overlay(row):
+    r = dict(row or {})
+    matchup = str(r.get("Matchup") or "")
+    if " @ " not in matchup:
+        return {}
+    away, home = [x.strip().upper() for x in matchup.split(" @ ", 1)]
+    games = _mlv9_prior_games(r)
+    ap = _mlv9_team_runflow_profile(away, games)
+    hp = _mlv9_team_runflow_profile(home, games)
+    hi = _v9_num(r.get("ML V8 High Run 10+ %"), 0.0) or 0.0
+    sh = _v9_num(r.get("ML V8 Shootout %"), 0.0) or 0.0
+    bo = _v9_num(r.get("ML V8 Blowout 4+ %"), 0.0) or 0.0
+    low = _v9_num(r.get("ML V8 Low Score <=6 %"), 0.0) or 0.0
+    projected_total = (_v9_num(r.get("ML VNext Away Runs"), _v9_num(r.get("Away Projected Runs"), 4.2)) or 4.2) + (_v9_num(r.get("ML VNext Home Runs"), _v9_num(r.get("Home Projected Runs"), 4.2)) or 4.2)
+    tags = []
+    if bo >= 40:
+        tags.append("Clean Team Control / Blowout Watch")
+    if hi >= 44 and sh < 24:
+        tags.append("One-Sided Opponent Suppression Watch")
+    if hi >= 31 and (low >= 28 or projected_total <= 8.2):
+        tags.append("False High-Score Suppression Watch")
+    if abs((_v9_num(r.get("ML VNext Away Runs"), 0) or 0) - (_v9_num(r.get("ML VNext Home Runs"), 0) or 0)) <= 0.35 and hi >= 31:
+        tags.append("Traffic Without Run Conversion Watch")
+    if ap["closeout_fail"] or hp["closeout_fail"] or ap["late_cascade"] or hp["late_cascade"]:
+        tags.append("Late Bullpen Cascade / Closeout Watch")
+    if ap["lead_stress"] or hp["lead_stress"]:
+        tags.append("Lead-Hold Stress Watch")
+    if not tags:
+        tags.append("Normal Run-Flow")
+    # Tiny support score only; never changes canonical ML side.
+    away_bonus = 0.25*ap["clean"] + 0.20*ap["opp_suppression"] + 0.15*ap["starter_collapse"] - 0.25*ap["closeout_fail"] - 0.15*ap["lead_stress"]
+    home_bonus = 0.25*hp["clean"] + 0.20*hp["opp_suppression"] + 0.15*hp["starter_collapse"] - 0.25*hp["closeout_fail"] - 0.15*hp["lead_stress"]
+    support = max(-1.25, min(1.25, away_bonus - home_bonus))
+    return {
+        "ML Run-Flow Version": CHALLENGER_ML_RUNFLOW_V9_VERSION,
+        "ML Run-Flow Tags": "; ".join(dict.fromkeys(tags)),
+        "ML Run-Flow Support Pts": round(float(support), 2),
+        "ML Away Run-Flow Profile": ap,
+        "ML Home Run-Flow Profile": hp,
+        "ML Run-Flow Policy": "TAGS_AND_SUPPORT_ONLY_CANONICAL_ML_SIDE_UNCHANGED",
+    }
+
+
+_MLV9_PREV_BUILD = globals().get("ml_build_board")
+if callable(_MLV9_PREV_BUILD):
+    def ml_build_board(board):
+        df = _MLV9_PREV_BUILD(board)
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        out = df.copy()
+        for idx, rr in out.iterrows():
+            try:
+                for k, v in _mlv9_runflow_overlay(rr.to_dict()).items():
+                    out.at[idx, k] = v
+            except Exception as exc:
+                out.at[idx, "ML Run-Flow Version"] = CHALLENGER_ML_RUNFLOW_V9_VERSION
+                out.at[idx, "ML Run-Flow Error"] = str(exc)[:120]
+        return out
+
+
+_MLV9_PREV_CARD = globals().get("_ml18_row_card")
+if callable(_MLV9_PREV_CARD):
+    def _ml18_row_card(row):
+        r = row.to_dict() if isinstance(row, pd.Series) else dict(row or {})
+        html = _MLV9_PREV_CARD(r)
+        tags = _v9_text(r.get("ML Run-Flow Tags"))
+        pts = _v9_num(r.get("ML Run-Flow Support Pts"), None)
+        if tags and "RUN-FLOW TAGS" not in html:
+            safe_tags = _mlui_safe(tags) if "_mlui_safe" in globals() else tags
+            chip = f"<div style='font-size:8px;color:#9eb2cb;margin-top:4px'>RUN-FLOW TAGS: {safe_tags}"
+            if pts is not None:
+                chip += f" · support {pts:+.2f}"
+            chip += " · canonical ML unchanged</div>"
+            html = html.replace("</div>", chip + "</div>", 1)
+        return html
+
+try:
+    st.caption("✅ Full repair active · K grading contract V9 fallback freeze/grade · hand-split K audit · false-UNDER ceiling safety · ML run-flow tags · canonical K/ML math preserved.")
 except Exception:
     pass
 
