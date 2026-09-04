@@ -1,0 +1,109 @@
+name: Prepare Challenger V1 from Undefeated V1.10.4
+
+on:
+  push:
+    branches:
+      - challenger-v1-postgrade-20260819
+    paths:
+      - '.github/workflows/prepare_challenger_v1.yml'
+      - 'challenger_sync_trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Challenger branch
+        uses: actions/checkout@v4
+        with:
+          ref: challenger-v1-postgrade-20260819
+          fetch-depth: 0
+
+      - name: Clone exact Undefeated V1.10.4 control source
+        run: |
+          rm -rf /tmp/undefeated-control
+          git clone --quiet https://github.com/hernandezjh235-sudo/app.py.git /tmp/undefeated-control
+          git -C /tmp/undefeated-control checkout --quiet ab5dd2d5cc68f64f99d76a3065f1ac1d429ea134
+          echo "Control source: $(git -C /tmp/undefeated-control rev-parse HEAD)"
+
+      - name: Copy protected control source and data bootstrap
+        run: |
+          cp /tmp/undefeated-control/app.py ./app.py
+          cp /tmp/undefeated-control/bootstrap_v1102.py ./bootstrap_v1102.py
+          cp /tmp/undefeated-control/bootstrap_v1103.py ./bootstrap_v1103.py
+          cp /tmp/undefeated-control/bootstrap_v1104.py ./bootstrap_v1104.py
+          cp /tmp/undefeated-control/merge_v269_safe_update.py ./merge_v269_safe_update.py
+          cp /tmp/undefeated-control/requirements.txt ./requirements.txt
+
+          mkdir -p .github/v1102_payload .github/v1103_payload learning_data
+          cp -R /tmp/undefeated-control/.github/v1102_payload/. .github/v1102_payload/
+          cp -R /tmp/undefeated-control/.github/v1103_payload/. .github/v1103_payload/
+
+          # Keep the proven historical/support files that are already versioned with the control.
+          for f in graded_history.csv Bullpen.csv TeamOffense.csv; do
+            if [ -f "/tmp/undefeated-control/learning_data/$f" ]; then
+              cp "/tmp/undefeated-control/learning_data/$f" "learning_data/$f"
+            fi
+          done
+
+      - name: Materialize exact V1.10.4 app and Savant data
+        run: |
+          python bootstrap_v1104.py
+          python -m py_compile app.py merge_v269_safe_update.py
+
+      - name: Install Challenger live-data preflight
+        run: |
+          cat > challenger_preflight.py <<'PY'
+          from pathlib import Path
+          import json
+
+          ROOT = Path(__file__).resolve().parent
+
+          # Challenger starts from the untouched Undefeated V1.10.4 generated app,
+          # but refreshes the live Savant batter-vs-hand layer without reapplying
+          # the Undefeated patch chain on every boot.
+          try:
+              from merge_v269_safe_update import SavantDataService
+              service = SavantDataService(cache_dir=ROOT / "learning_data")
+              result = service.refresh(force=False)
+              print("Challenger Savant preflight:", json.dumps({
+                  "status": result.get("status"),
+                  "refresh": result.get("refresh"),
+                  "rows": result.get("row_count"),
+                  "source": result.get("source"),
+                  "error": result.get("error"),
+              }, default=str))
+          except Exception as exc:
+              print(f"Challenger Savant preflight warning: {type(exc).__name__}: {exc}")
+          PY
+
+          cat > Procfile <<'EOF'
+          web: python challenger_preflight.py && python -m py_compile app.py merge_v269_safe_update.py && streamlit run app.py --server.port=8501 --server.address=0.0.0.0 --server.headless=true
+          EOF
+
+      - name: Record immutable control provenance
+        run: |
+          cat > CHALLENGER_CONTROL_PROVENANCE.txt <<'EOF'
+          Challenger base control: Undefeated V1.10.4
+          Source repository: hernandezjh235-sudo/app.py
+          Source commit: ab5dd2d5cc68f64f99d76a3065f1ac1d429ea134
+          Source meaning: Activate V1.10.4 live Savant batter bridge
+          Policy: Undefeated production repository remains untouched. Challenger changes are additive and graded separately.
+          EOF
+
+      - name: Commit prepared Challenger control
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py Procfile requirements.txt merge_v269_safe_update.py challenger_preflight.py CHALLENGER_CONTROL_PROVENANCE.txt \
+                  bootstrap_v1102.py bootstrap_v1103.py bootstrap_v1104.py \
+                  .github/v1102_payload .github/v1103_payload learning_data
+          if git diff --cached --quiet; then
+            echo "No preparation changes to commit."
+          else
+            git commit -m "Build Challenger from untouched Undefeated V1.10.4 control"
+            git push origin HEAD:challenger-v1-postgrade-20260819
+          fi
