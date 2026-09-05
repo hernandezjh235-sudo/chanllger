@@ -144443,6 +144443,402 @@ try:
 except Exception:
     pass
 
+
+
+# =============================================================================
+# CHALLENGER K V10 — TEAM K PRESSURE + SIDE-SAFETY GATE
+# 2026-09-05
+#
+# Why this exists:
+# - Sept. 4 grading showed too many false UNDERs, especially Ryan Johnson vs a
+#   high-K Pittsburgh lineup and Logan Gilbert vs a high-K/ceiling environment.
+# - The fix is NOT a global K boost. Raw K projection and raw side stay frozen.
+# - V10 only changes public/playability action: official Discord slate should
+#   PASS/TRACK fragile sides instead of forcing every projection into a bet.
+# - It also adds a thin-OVER conversion gate so fixing false UNDERs does not make
+#   false OVERs worse.
+# =============================================================================
+CHALLENGER_K_V10_SIDE_SAFETY_VERSION = "CHALLENGER_K_V10_TEAM_K_PRESSURE_SIDE_SAFETY_2026_09_05"
+
+
+def _chv10_text(v):
+    s = str(v or "").strip()
+    return "" if s.upper() in {"", "NAN", "NONE", "NULL", "<NA>", "—", "-"} else s
+
+
+def _chv10_num(v, default=None):
+    try:
+        s = _chv10_text(v)
+        if not s:
+            return default
+        import re as _re
+        m = _re.search(r"[-+]?\d+(?:\.\d+)?", s.replace(",", ""))
+        if not m:
+            return default
+        x = float(m.group(0))
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _chv10_pct(v, default=None):
+    x = _chv10_num(v, default)
+    if x is None:
+        return default
+    try:
+        x = float(x)
+        return x * 100.0 if abs(x) <= 1.0 else x
+    except Exception:
+        return default
+
+
+def _chv10_pick(row, keys, default=None):
+    row = row or {}
+    for k in keys:
+        try:
+            v = row.get(k)
+        except Exception:
+            v = None
+        if _chv10_text(v):
+            return v
+    return default
+
+
+def _chv10_raw_side(row, proj=None, line=None):
+    # Prefer already-preserved raw side fields. Only fall back to projection vs line.
+    s = _chv10_text(_chv10_pick(row, [
+        "K V10 Raw Side", "K V9 Raw Side", "K Raw Lean Side", "Model Lean",
+        "Line-Aware Smart Decision", "CK V2 Final Side", "Challenger K VNext Side",
+        "UB Final Side", "Undefeated Beta Side", "Decision",
+    ], "")).upper().replace("_", " ")
+    if "OVER" in s or s == "O":
+        return "OVER"
+    if "UNDER" in s or s == "U":
+        return "UNDER"
+    if proj is not None and line is not None:
+        return "OVER" if float(proj) > float(line) else "UNDER" if float(proj) < float(line) else "PASS"
+    return ""
+
+
+def _chv10_side_safety_profile(row):
+    row = row or {}
+    proj = _chv10_num(_chv10_pick(row, [
+        "K PROJ", "Challenger K VNext Projection", "CK V2 K Final Projection",
+        "Line-Aware Smart Final K Projection", "APP97 True K Projection",
+        "Canonical Final K Projection", "Final Resolved Projection", "Projection", "projection",
+    ], None), None)
+    line = _chv10_num(_chv10_pick(row, ["UD/Line", "Line", "Canonical Line", "Underdog Line", "Strikeout Line", "line"], None), None)
+    raw_side = _chv10_raw_side(row, proj, line)
+    edge = None if proj is None or line is None else round(float(proj) - float(line), 3)
+
+    hand = _chv10_text(_chv10_pick(row, ["K V9 Hand Window", "Pitcher Hand", "Hand", "Throws", "Pitcher Throws"], "")).upper()
+    if hand.startswith("L"):
+        hand = "LHP"
+    elif hand.startswith("R"):
+        hand = "RHP"
+    else:
+        hand = "RHP/LHP"
+
+    # Hand-specific recent/season opponent K is the primary opponent signal.
+    opp_hand_vals = []
+    for key in [
+        "K V9 Opp L5 vs Hand %", "K V9 Opp L10 vs Hand %", "K V9 Opp L15 vs Hand %", "K V9 Opp Season vs Hand %",
+        f"Opp L5 K% vs {hand} Official", f"Opp L10 K% vs {hand} Official", f"Opp K% vs {hand} Official",
+        "Team K% L5 vs Hand", "Team K% L10 vs Hand", "Team K% Season vs Hand", "Opponent K% vs Pitcher Hand",
+    ]:
+        val = _chv10_pct(row.get(key), None)
+        if val is not None:
+            opp_hand_vals.append(float(val))
+    lineup_vals = []
+    for key in [
+        "K V9 Lineup Order K%", "UB Lineup Exposure K%", "Lineup Exposure K%", "Savant Raw Order-Weighted K%",
+        "APP88 Batter Lineup K%", "Lineup Trace Avg K%", "Opponent K% Used", "opp_k",
+    ]:
+        val = _chv10_pct(row.get(key), None)
+        if val is not None:
+            lineup_vals.append(float(val))
+    overall_vals = []
+    for key in ["K V9 Opp Overall L5 %", "Team Batter K% L5 Overall Official", "Team Batter K% L10 Overall Official", "L5", "L10"]:
+        val = _chv10_pct(row.get(key), None)
+        if val is not None:
+            overall_vals.append(float(val))
+
+    opp_hand_max = max(opp_hand_vals) if opp_hand_vals else None
+    lineup_k = max(lineup_vals) if lineup_vals else None
+    overall_recent = max(overall_vals) if overall_vals else None
+    pressure_pool = [v for v in [opp_hand_max, lineup_k, overall_recent] if v is not None]
+    opp_pressure = max(pressure_pool) if pressure_pool else None
+
+    pitcher_k = _chv10_pct(_chv10_pick(row, [
+        "K V9 Pitcher K%", "UB Pitcher K% Used", "Pitcher K% Used", "APP97 Raw MLB Season Pitcher K%",
+        "APP97 Live Pitcher K%", "Pitcher K%", "Official Savant K%", "pitcher_k",
+    ], None), None)
+    whiff = _chv10_pct(_chv10_pick(row, ["UB Whiff% Used", "Official Savant Whiff%", "Savant Custom Whiff%", "Whiff%", "whiff_pct"], None), None)
+    csw = _chv10_pct(_chv10_pick(row, ["UB CSW% Used", "Official Savant CSW%", "Savant Custom CSW%", "CSW%", "CSW %", "csw_pct"], None), None)
+    putaway = _chv10_pct(_chv10_pick(row, ["UB PutAway% Used", "PutAway%", "Put Away %", "putaway"], None), None)
+    arsenal = _chv10_num(_chv10_pick(row, ["Pitch Arsenal Matchup Score", "Arsenal Matchup Score", "Arsenal", "Arsenal Score", "APP100 Arsenal Score"], None), None)
+    ip = _chv10_num(_chv10_pick(row, ["Projected IP", "IP PROJ", "IP Projection", "Proj IP", "UB IP P50"], None), None)
+    bf = _chv10_num(_chv10_pick(row, ["Projected BF", "Exp BF", "Proj BF", "UB BF P50", "APP97 Reconciled Expected BF", "expected_bf"], None), None)
+    p75 = _chv10_num(_chv10_pick(row, ["CK V2 K P75", "UB K P75", "UB Under Ceiling P75 K"], None), None)
+    p90 = _chv10_num(_chv10_pick(row, ["CK V2 K P90", "UB K P90", "UB Under Ceiling P90 K"], None), None)
+    ceiling = _chv10_num(_chv10_pick(row, ["Ceiling", "K Ceiling", "K Ceiling Projection"], None), None)
+    high_k_count = _chv10_num(_chv10_pick(row, [
+        "UB Lineup High-K 25% Count", "Lineup Trace High-K", "Lineup Trace High-K Count", "high_k_count", "high-K",
+    ], None), None)
+    low_k_count = _chv10_num(_chv10_pick(row, ["UB Lineup Low-K 17% Count", "Lineup Trace Low-K", "low_k_count", "low-K"], None), None)
+
+    reasons = []
+    score = 0.0
+    action = "PLAY"
+    raw_label = raw_side or ""
+    classification = "CLEAR"
+
+    if raw_side == "UNDER" and edge is not None:
+        if -0.40 <= edge < 0:
+            score += 2.0; reasons.append(f"thin_under_edge_{edge:+.2f}")
+        elif -0.75 <= edge < -0.40:
+            score += 1.25; reasons.append(f"moderate_under_edge_{edge:+.2f}")
+        elif -1.15 <= edge < -0.75:
+            score += 0.75; reasons.append(f"deep_but_reachable_under_edge_{edge:+.2f}")
+        if opp_pressure is not None:
+            if opp_pressure >= 25.0:
+                score += 2.25; reasons.append(f"opponent_k_pressure_{opp_pressure:.1f}%")
+            elif opp_pressure >= 23.5:
+                score += 1.25; reasons.append(f"opponent_k_watch_{opp_pressure:.1f}%")
+        if high_k_count is not None:
+            if high_k_count >= 4:
+                score += 1.75; reasons.append(f"lineup_high_k_bats_{int(high_k_count)}")
+            elif high_k_count >= 3:
+                score += 0.75; reasons.append(f"lineup_high_k_bats_{int(high_k_count)}")
+        if pitcher_k is not None:
+            if pitcher_k >= 25.0:
+                score += 2.0; reasons.append(f"pitcher_k_ceiling_{pitcher_k:.1f}%")
+            elif pitcher_k >= 22.5:
+                score += 1.0; reasons.append(f"pitcher_k_viable_{pitcher_k:.1f}%")
+        if ((whiff is not None and whiff >= 28.0) or (csw is not None and csw >= 29.0) or (putaway is not None and putaway >= 23.0) or (arsenal is not None and arsenal >= 55.0)):
+            score += 1.0; reasons.append("swing_miss_or_arsenal_support")
+        if line is not None and ((ceiling is not None and ceiling >= float(line) + 1.25) or (p75 is not None and p75 > float(line)) or (p90 is not None and p90 >= float(line) + 0.75)):
+            score += 1.25; reasons.append("distribution_ceiling_can_clear_line")
+        if (ip is not None and ip >= 4.6) or (bf is not None and bf >= 19.0):
+            score += 1.0; reasons.append("workload_can_reach_line")
+
+        low_line_high_k = bool(line is not None and float(line) <= 3.5 and edge >= -0.75 and (opp_pressure is not None and opp_pressure >= 23.8) and ((ip is not None and ip >= 4.5) or (bf is not None and bf >= 18.0)))
+        medium_line_elite_escape = bool(line is not None and float(line) >= 5.5 and edge >= -1.15 and (opp_pressure is not None and opp_pressure >= 23.5) and ((pitcher_k is not None and pitcher_k >= 24.0) or (ceiling is not None and ceiling >= float(line) + 1.5) or (whiff is not None and whiff >= 28.0)))
+        if low_line_high_k:
+            score += 2.0; reasons.append("LOW_LINE_UNDER_VS_HIGH_K_TEAM_PASS")
+        if medium_line_elite_escape:
+            score += 2.0; reasons.append("MID_HIGH_LINE_UNDER_K_CEILING_ESCAPE_PASS")
+        if low_line_high_k or medium_line_elite_escape or score >= 6.0:
+            action = "PASS"; classification = "FALSE_UNDER_PRESSURE_PASS"
+        elif score >= 4.0:
+            action = "TRACK"; classification = "FALSE_UNDER_PRESSURE_TRACK"
+
+    elif raw_side == "OVER" and edge is not None:
+        over_score = 0.0
+        if 0 <= edge < 0.25:
+            over_score += 3.0; reasons.append(f"ultra_thin_over_edge_{edge:+.2f}")
+        elif 0.25 <= edge < 0.60:
+            over_score += 1.5; reasons.append(f"thin_over_edge_{edge:+.2f}")
+        if line is not None and float(line) >= 5.5 and edge < 0.75:
+            over_score += 1.25; reasons.append("hard_line_requires_extra_conversion")
+        if opp_pressure is not None and opp_pressure <= 22.0:
+            over_score += 1.0; reasons.append(f"opponent_contact_pressure_{opp_pressure:.1f}%")
+        if pitcher_k is not None and pitcher_k < 22.0 and edge < 0.75:
+            over_score += 1.0; reasons.append(f"pitcher_k_not_strong_{pitcher_k:.1f}%")
+        if (ip is not None and ip < 5.0 and line is not None and float(line) >= 4.5):
+            over_score += 1.0; reasons.append("workload_below_over_need")
+        if over_score >= 3.0:
+            action = "PASS"; classification = "FALSE_OVER_CONVERSION_PASS"; score = over_score
+        elif over_score >= 2.0:
+            action = "TRACK"; classification = "FALSE_OVER_CONVERSION_TRACK"; score = over_score
+
+    return {
+        "version": CHALLENGER_K_V10_SIDE_SAFETY_VERSION,
+        "projection": proj,
+        "line": line,
+        "edge": edge,
+        "raw_side": raw_side,
+        "action": action,
+        "classification": classification,
+        "score": round(score, 2),
+        "reason": "; ".join(dict.fromkeys(reasons)) if reasons else "CLEAR",
+        "hand_window": hand,
+        "opp_hand_max": None if opp_hand_max is None else round(opp_hand_max, 1),
+        "lineup_k": None if lineup_k is None else round(lineup_k, 1),
+        "overall_recent": None if overall_recent is None else round(overall_recent, 1),
+        "opp_pressure": None if opp_pressure is None else round(opp_pressure, 1),
+        "pitcher_k": None if pitcher_k is None else round(pitcher_k, 1),
+        "high_k_count": None if high_k_count is None else int(high_k_count),
+        "low_k_count": None if low_k_count is None else int(low_k_count),
+    }
+
+
+def _chv10_apply_action_to_row(row):
+    if not isinstance(row, dict):
+        return row
+    prof = _chv10_side_safety_profile(row)
+    row["K V10 Version"] = prof["version"]
+    row["K V10 Policy"] = "RAW_PROJECTION_FROZEN_PUBLIC_PLAYABILITY_ONLY"
+    row["K V10 Raw Side"] = prof["raw_side"]
+    row["K V10 Official Action"] = prof["action"]
+    row["K V10 Risk Class"] = prof["classification"]
+    row["K V10 Risk Score"] = prof["score"]
+    row["K V10 Reason"] = prof["reason"]
+    row["K V10 Hand Window"] = prof["hand_window"]
+    row["K V10 Opp K Pressure %"] = prof["opp_pressure"]
+    row["K V10 Opp Hand Max %"] = prof["opp_hand_max"]
+    row["K V10 Lineup K %"] = prof["lineup_k"]
+    row["K V10 Overall Recent K %"] = prof["overall_recent"]
+    row["K V10 Pitcher K %"] = prof["pitcher_k"]
+    row["K V10 High-K Bat Count"] = prof["high_k_count"]
+    if prof["action"] in {"PASS", "TRACK"}:
+        raw = prof["raw_side"] or _chv10_raw_side(row, prof.get("projection"), prof.get("line")) or "LEAN"
+        safe_decision = ("PASS — " if prof["action"] == "PASS" else "TRACK — ") + raw
+        row["K V10 Safe Decision"] = safe_decision
+        row["Do Not Bet Reason"] = (str(row.get("Do Not Bet Reason") or "") + ("; " if row.get("Do Not Bet Reason") else "") + prof["classification"] + ": " + prof["reason"]).strip("; ")
+        # Public/freeze-facing side becomes PASS/TRACK while raw side is preserved.
+        if prof["action"] == "PASS":
+            for k in ["Public Canonical Side", "Public Decision Side", "Final Decision Side", "UB Final Decision", "Final Resolved Side", "pick_side", "Canonical Side"]:
+                row[k] = "PASS"
+            for k in ["Official Card Tier", "Official Selector Tier", "Best Play Tier", "Undefeated Beta Playability", "K V8 Action Tier", "K V6 Action Tier"]:
+                row[k] = "PASS"
+            row["Decision"] = safe_decision
+            row["Final Decision State"] = "PASS"
+        else:
+            for k in ["Official Card Tier", "Official Selector Tier", "Best Play Tier", "Undefeated Beta Playability", "K V8 Action Tier", "K V6 Action Tier"]:
+                if str(row.get(k) or "").upper() not in {"PASS"}:
+                    row[k] = "TRACK"
+            row["Decision"] = safe_decision
+            row["Final Decision State"] = "TRACK"
+        # Cap public confidence so these do not look official.
+        for ck in ["Confidence %", "Final Decision Confidence %", "K V8 Calibrated Confidence %", "K V6 Calibrated Confidence %", "UB Final Probability %", "Challenger K VNext Probability %"]:
+            val = _chv10_num(row.get(ck), None)
+            if val is not None:
+                row[ck] = round(min(float(val), 52.0 if prof["action"] == "PASS" else 55.0), 1)
+    else:
+        row.setdefault("K V10 Safe Decision", prof["raw_side"])
+    return row
+
+
+def _chv10_apply_df(df):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        rows = []
+        for _, rr in df.iterrows():
+            rows.append(_chv10_apply_action_to_row(rr.to_dict()))
+        return pd.DataFrame(rows)
+    except Exception as exc:
+        try:
+            st.session_state["challenger_k_v10_apply_error"] = str(exc)[:220]
+        except Exception:
+            pass
+        return df
+
+
+_CHV10_PREV_BUILD_KPROJ_TABLE = globals().get("build_kproj_table")
+if callable(_CHV10_PREV_BUILD_KPROJ_TABLE):
+    def build_kproj_table(board):
+        return _chv10_apply_df(_CHV10_PREV_BUILD_KPROJ_TABLE(board))
+
+
+_CHV10_PREV_KPROJ_DECISION = globals().get("kproj_decision")
+if callable(_CHV10_PREV_KPROJ_DECISION):
+    def kproj_decision(p):
+        d = dict(_CHV10_PREV_KPROJ_DECISION(p) or {})
+        merged = dict(p or {})
+        for k, v in d.items():
+            merged.setdefault(k, v)
+        prof = _chv10_side_safety_profile(merged)
+        d["k_v10_action"] = prof["action"]
+        d["k_v10_risk_class"] = prof["classification"]
+        d["k_v10_reason"] = prof["reason"]
+        d["k_v10_raw_side"] = prof["raw_side"]
+        if prof["action"] in {"PASS", "TRACK"}:
+            raw = prof["raw_side"] or d.get("lean_side") or "LEAN"
+            d["side"] = "PASS"
+            d["lean_side"] = raw
+            d["decision"] = "🚫 PASS — " + raw if prof["action"] == "PASS" else "⚠️ TRACK — " + raw
+            try:
+                d["confidence"] = min(float(d.get("confidence") or 0.55), 0.52 if prof["action"] == "PASS" else 0.55)
+            except Exception:
+                d["confidence"] = 0.52 if prof["action"] == "PASS" else 0.55
+            note = str(d.get("note") or "")
+            d["note"] = (note + " | " if note else "") + f"K V10 {prof['classification']}: {prof['reason']}"
+            d["tier"] = "PASS" if prof["action"] == "PASS" else "TRACK"
+        return d
+
+
+def _chv10_copy_paste_slate(df, include_thin=False, force_all_players_ou=False):
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return ""
+        d = _chv10_apply_df(df.copy())
+        if "Line Source" in d.columns and not force_all_players_ou:
+            d = d[d["Line Source"].astype(str).str.upper().eq("UNDERDOG")].copy()
+        if d.empty:
+            return ""
+        if "UD/Line" not in d.columns:
+            d["UD/Line"] = d.get("Line")
+        d["UD/Line"] = pd.to_numeric(d["UD/Line"], errors="coerce")
+        d = d[d["UD/Line"].notna()].copy()
+        if "_owp_one_final_row_per_pitcher" in globals():
+            try:
+                d = _owp_one_final_row_per_pitcher(d)
+            except Exception:
+                pass
+        lines = []
+        for matchup, group in d.groupby("Matchup", sort=False):
+            block = []
+            for _, rr in group.iterrows():
+                row = rr.to_dict()
+                proj = _chv10_num(_chv10_pick(row, ["K PROJ", "Final K Projection", "Challenger K VNext Projection", "Projection"], None), None)
+                line = _chv10_num(row.get("UD/Line"), None)
+                if proj is None or line is None:
+                    continue
+                raw = _chv10_raw_side(row, proj, line)
+                if raw not in {"OVER", "UNDER"}:
+                    continue
+                action = str(row.get("K V10 Official Action") or "PLAY").upper()
+                reason = str(row.get("K V10 Risk Class") or "")
+                ip = _chv10_num(_chv10_pick(row, ["IP Floor", "IP PROJ", "Projected IP", "IP Projection", "Proj IP"], None), None)
+                ip_text = "—" if ip is None else f"{ip:.2f}"
+                prob = _chv10_num(_chv10_pick(row, ["Confidence %", "Final Decision Confidence %", "K Sim Current Side Prob %"], None), None)
+                if prob is not None and abs(prob) <= 1:
+                    prob *= 100.0
+                prob_text = "" if prob is None else f" — {prob:.0f}%"
+                if action in {"PASS", "TRACK"}:
+                    if not force_all_players_ou and not include_thin:
+                        continue
+                    label = "PASS" if action == "PASS" else "TRACK"
+                    block.append(f"• {row.get('Pitcher')} — {label} ({raw} {line:.1f}) — {proj:.2f} K{prob_text} — IP {ip_text} — {reason}")
+                    continue
+                if not include_thin:
+                    edge = abs(float(proj) - float(line))
+                    if prob is not None and prob < 59.0:
+                        continue
+                    if edge < 0.60:
+                        continue
+                block.append(f"• {row.get('Pitcher')} — {raw} {line:.1f} — {proj:.2f} K{prob_text} — IP {ip_text}")
+            if block:
+                lines.append(str(matchup)); lines.extend(block); lines.append("")
+        return "\n".join(lines).strip()
+    except Exception as e:
+        return f"Slate builder unavailable: {e}"
+
+
+_CHV10_PREV_BUILD_COPY_PASTE_K_SLATE = globals().get("build_copy_paste_k_slate")
+def build_copy_paste_k_slate(df, show_pass_notes=False, force_all_players_ou=False):
+    # Best slate: recommended plays only. All-projections slate: raw direction remains visible,
+    # but V10 PASS/TRACK is printed explicitly so it is not mistaken for a bet.
+    return _chv10_copy_paste_slate(df, include_thin=bool(show_pass_notes or force_all_players_ou), force_all_players_ou=bool(force_all_players_ou))
+
+try:
+    st.caption("✅ Challenger K V10 active · team K pressure vs hand + false-UNDER/false-OVER side-safety · raw projection frozen · public Discord action safer.")
+except Exception:
+    pass
+
+
 tab_kproj, tab_beta_outs, tab_first_inning_k, tab_beta_ip_debug, tab_moneyline, tab_loss_lab, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
     "K PROJ / UPSIDE",
